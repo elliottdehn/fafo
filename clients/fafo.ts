@@ -115,10 +115,13 @@ export class FafoSocket {
 
   private constructor(private ws: WebSocket) {}
 
-  static open(base: string, token?: string): Promise<FafoSocket> {
-    const url = base.replace(/^http/, "ws") + "/ws" + (token ? `?token=${token}` : "");
+  static open(base: string, token?: string, pinTo?: string): Promise<FafoSocket> {
+    const url = base.replace(/^http/, "ws") + "/ws" + (pinTo ? `?for=${pinTo}` : "");
+    // The token rides the subprotocol header, never the URL (query strings
+    // end up in access logs). Server selects "fafo" back.
+    const protocols = token ? ["fafo", `fafo-token.${token}`] : ["fafo"];
     return new Promise((resolve, reject) => {
-      const ws = new WebSocket(url);
+      const ws = new WebSocket(url, protocols);
       const sock = new FafoSocket(ws);
       ws.onopen = () => resolve(sock);
       ws.onerror = () => reject(new Error("websocket failed to open"));

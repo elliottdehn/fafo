@@ -47,9 +47,13 @@ established socket pay raw network RTT (measured in production: 41ms
 frames vs ~100ms+ per HTTP request, and vs seconds when routing is cold).
 
 ```
-GET /ws?token=<API_TOKEN>&for=<object>
+GET /ws?for=<object>
+Sec-WebSocket-Protocol: fafo, fafo-token.<API_TOKEN>
 ```
 
+Auth rides the subprotocol header (the one header browsers CAN set on a
+WebSocket) or a normal `Authorization: Bearer` — NEVER the URL; query
+strings end up in access logs. The server selects `fafo` back.
 `for` pins the socket to that object's owner instance — set it to the
 object (or tenant) this connection will mostly touch, or frames for it pay
 an inter-instance hairpin. One socket, many transactions, pipelined:
@@ -69,7 +73,7 @@ Replies can arrive out of order (frames execute concurrently) — correlate
 by `id`. `clients/fafo.ts` ships `FafoSocket` doing exactly this:
 
 ```ts
-const conn = await new Fafo(url, token).connect();
+const conn = await FafoSocket.open(url, token, "my-hot-object");
 await conn.txn([{ object: "alice", sql: "..." }]);
 ```
 

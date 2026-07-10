@@ -98,19 +98,38 @@ struct WsFrame {
 
 async fn ws_handler(
     State(node): State<Node>,
-    axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
+    headers: axum::http::HeaderMap,
     ws: axum::extract::ws::WebSocketUpgrade,
 ) -> Response {
-    if let Some(token) = &node.api_token
-        && q.get("token") != Some(token)
-    {
-        return ApiError {
-            status: StatusCode::UNAUTHORIZED,
-            message: "missing or invalid ?token=".into(),
+    // Never in the URL — query strings live forever in access logs. Accept
+    // the token via Authorization (clients that can set headers) or the
+    // subprotocol smuggle `fafo-token.<TOKEN>` (the one header browsers CAN
+    // set on a WebSocket). The server selects plain "fafo" back.
+    if let Some(token) = &node.api_token {
+        let bearer_ok = headers
+            .get(axum::http::header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.strip_prefix("Bearer "))
+            .is_some_and(|t| t == token);
+        let subproto_ok = headers
+            .get(axum::http::header::SEC_WEBSOCKET_PROTOCOL)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|protos| {
+                protos
+                    .split(',')
+                    .map(str::trim)
+                    .any(|p| p.strip_prefix("fafo-token.") == Some(token))
+            });
+        if !bearer_ok && !subproto_ok {
+            return ApiError {
+                status: StatusCode::UNAUTHORIZED,
+                message: "authenticate via Authorization: Bearer or the fafo-token.<TOKEN> subprotocol".into(),
+            }
+            .into_response();
         }
-        .into_response();
     }
-    ws.on_upgrade(move |socket| ws_conn(node, socket))
+    ws.protocols(["fafo"])
+        .on_upgrade(move |socket| ws_conn(node, socket))
 }
 
 async fn ws_conn(node: Node, socket: axum::extract::ws::WebSocket) {
