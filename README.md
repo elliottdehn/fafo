@@ -1,5 +1,8 @@
 # fafo
 
+If you need a little database that you can just hammer hard and never goes
+down and costs nothing, fafo is it.
+
 Fuck around and find out: a miniature Durable-Objects-shaped database that
 learns its own sharding and doesn't hinge on any single process or thread.
 
