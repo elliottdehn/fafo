@@ -126,8 +126,12 @@ db.txn(["alice", "bob"], [
   your side; on timeout you don't know if it committed. For money-like
   writes, add a client-supplied id column with a UNIQUE constraint and
   treat the constraint violation on retry as success.
-- **Keep objects small** (roughly: one entity's rows). Durability is
-  snapshot-per-commit — a 100 MB object pays 100 MB per write txn.
+- **Objects can be entity-sized or tenant-sized.** Small objects ship whole
+  snapshots; past 64 KB they ship page deltas, so a multi-MB
+  database-per-tenant object pays for what changed, not what it weighs.
+  Cold objects activate off-loop (no head-of-line blocking of other
+  tenants), and repeat visits to a worker reuse a local cache plus the
+  delta chain — only a tenant's FIRST arrival at a worker pays full size.
 - **High write throughput**: send `optimistic: true` and let boats coalesce
   (measured: ~240x at object-storage latency). Barrier with one pessimistic
   txn when you need a durability checkpoint.

@@ -229,6 +229,34 @@ impl BlobStore for R2BlobStore {
         Ok(keys)
     }
 
+    async fn get_range(&self, key: &str, offset: u64, len: u64) -> anyhow::Result<Option<Vec<u8>>> {
+        let path = self.path_for(key);
+        let range = format!("bytes={offset}-{}", offset + len - 1);
+        self.with_retries(|| {
+            let path = path.clone();
+            let range = range.clone();
+            async move {
+                let resp = self
+                    .request(
+                        reqwest::Method::GET,
+                        &path,
+                        &[],
+                        Vec::new(),
+                        &[("range", range.as_str())],
+                    )
+                    .await?;
+                match resp.status().as_u16() {
+                    200 | 206 => Ok(Some(Some(resp.bytes().await?.to_vec()))),
+                    404 => Ok(Some(None)),
+                    416 => Ok(Some(Some(Vec::new()))), // range beyond EOF
+                    s if s >= 500 => Ok(None),
+                    s => anyhow::bail!("R2 RANGE {key}: {s}: {}", resp.text().await?),
+                }
+            }
+        })
+        .await
+    }
+
     async fn create(&self, key: &str, bytes: &[u8]) -> anyhow::Result<bool> {
         let path = self.path_for(key);
         self.with_retries(|| {

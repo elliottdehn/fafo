@@ -49,6 +49,15 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
+    // Size budgets from the container (cgroup memory limit, env overrides).
+    let limits = fafo::limits::Limits::detect();
+    println!(
+        "limits: memory {} MiB, disk budget {} MiB, boat cap {} MiB",
+        limits.memory_bytes >> 20,
+        limits.disk_budget >> 20,
+        limits.max_boat_bytes >> 20
+    );
+
     let node = cluster::start(NodeConfig {
         store: blob_store_from_env(&data_dir)?,
         live_dir: format!("{data_dir}/live/p{port}").into(),
@@ -59,6 +68,11 @@ async fn main() -> anyhow::Result<()> {
         hysteresis,
         secret,
         api_token: std::env::var("API_TOKEN").ok(),
+        max_unshipped: match std::env::var("MAX_UNSHIPPED_MB") {
+            Ok(mb) => mb.parse::<u64>()? * 1024 * 1024,
+            Err(_) => limits.default_max_unshipped(),
+        },
+        limits,
     })
     .await?;
 

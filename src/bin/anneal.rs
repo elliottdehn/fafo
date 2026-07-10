@@ -58,6 +58,8 @@ async fn boot(root: &std::path::Path, logical: usize, hyst: u64, tag: &str) -> N
         hysteresis: hyst,
         secret: "anneal".into(),
         api_token: None,
+        max_unshipped: cluster::DEFAULT_MAX_UNSHIPPED,
+        limits: fafo::limits::Limits::detect(),
     })
     .await
     .unwrap()

@@ -503,7 +503,7 @@ const rows = await db.query(<span class="a">"alice"</span>, <span class="r">"SEL
     <div class="sec-eyebrow reveal" style="color:var(--amber)">Fine print, in large type</div>
     <h2 class="reveal">When you should not use ScaleWarm.</h2>
     <ul>
-      <li class="reveal"><b>Big objects.</b> Durability is snapshot-per-commit: a 100&nbsp;MB object pays 100&nbsp;MB per write transaction. Keep objects entity-sized. (Delta shipping is on the roadmap; today this is the rule.)</li>
+      <li class="reveal"><b>Very cold, very large objects.</b> Writes ship page deltas — a multi-megabyte tenant database pays for what changed, not what it weighs — but <em>waking or migrating</em> a large object still transfers its full size. Physics keeps that one.</li>
       <li class="reveal"><b>Fleet-wide analytics.</b> There is no global SQL engine. "Average balance across all accounts" means fanning out over objects. Ship changes to a warehouse for that.</li>
       <li class="reveal"><b>One supernova object.</b> Each object has exactly one writer at a time — that's where the guarantees come from. Optimistic batching takes a single hot object to tens of thousands of writes per second; past one core's serial ceiling, you need redesign, not more nodes.</li>
       <li class="reveal"><b>Sub-millisecond commits.</b> The commit point is a blob write. On local disk that's fast; against remote object storage it's a network round trip. Physics is undefeated.</li>

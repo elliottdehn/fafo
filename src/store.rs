@@ -23,6 +23,18 @@ pub trait BlobStore: Send + Sync {
     /// primitive — lease claims race through it. On R2/S3 it maps to a PUT
     /// with `If-None-Match: *`.
     async fn create(&self, key: &str, bytes: &[u8]) -> anyhow::Result<bool>;
+
+    /// Read `len` bytes at `offset`. Used to peek a snapshot's SQLite
+    /// change counter (4 bytes) without downloading the file — the cheap
+    /// staleness check behind delta-aware activation. Default falls back to
+    /// a full get; R2 overrides with a Range request.
+    async fn get_range(&self, key: &str, offset: u64, len: u64) -> anyhow::Result<Option<Vec<u8>>> {
+        Ok(self.get(key).await?.map(|bytes| {
+            let start = (offset as usize).min(bytes.len());
+            let end = ((offset + len) as usize).min(bytes.len());
+            bytes[start..end].to_vec()
+        }))
+    }
 }
 
 pub struct FsBlobStore {
@@ -84,6 +96,26 @@ impl BlobStore for FsBlobStore {
         keys.retain(|k| k.starts_with(prefix));
         keys.sort();
         Ok(keys)
+    }
+
+    async fn get_range(&self, key: &str, offset: u64, len: u64) -> anyhow::Result<Option<Vec<u8>>> {
+        use std::io::{Read, Seek, SeekFrom};
+        let mut file = match std::fs::File::open(self.path_for(key)?) {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+        file.seek(SeekFrom::Start(offset))?;
+        let mut buf = vec![0u8; len as usize];
+        let mut read = 0;
+        while read < buf.len() {
+            match file.read(&mut buf[read..])? {
+                0 => break,
+                n => read += n,
+            }
+        }
+        buf.truncate(read);
+        Ok(Some(buf))
     }
 
     async fn create(&self, key: &str, bytes: &[u8]) -> anyhow::Result<bool> {

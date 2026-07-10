@@ -59,6 +59,8 @@ async fn boot(root: &std::path::Path, blobs: &str, tag: &str) -> Node {
         hysteresis: 200,
         secret: "bench".into(),
         api_token: None,
+        max_unshipped: cluster::DEFAULT_MAX_UNSHIPPED,
+        limits: fafo::limits::Limits::detect(),
     })
     .await
     .unwrap()
@@ -116,20 +118,24 @@ async fn main() -> anyhow::Result<()> {
         let tag = if optimistic { "opt" } else { "pess" };
         let node = boot(&root, tag, tag).await;
         let objects: Vec<String> = (0..n_objects).map(|i| format!("hot{i}")).collect();
+        let seed = env_or("SEED_KB", 0);
         for o in &objects {
-            cluster::submit(
-                &node,
-                vec![o.clone()],
-                vec![Op {
+            let mut ops = vec![Op {
+                object: o.clone(),
+                sql: "CREATE TABLE t (n INTEGER, b TEXT)".into(),
+                params: vec![],
+            }];
+            if seed > 0 {
+                // Pre-grow the object so snapshots would be expensive.
+                ops.push(Op {
                     object: o.clone(),
-                    sql: "CREATE TABLE t (n INTEGER)".into(),
-                    params: vec![],
-                }],
-                false,
-                false,
-            )
-            .await
-            .unwrap();
+                    sql: "INSERT INTO t (n, b) VALUES (0, ?1)".into(),
+                    params: vec![serde_json::json!("x".repeat(seed * 1024))],
+                });
+            }
+            cluster::submit(&node, vec![o.clone()], ops, false, false)
+                .await
+                .unwrap();
         }
 
         let before = node.stats().await;
@@ -137,6 +143,7 @@ async fn main() -> anyhow::Result<()> {
         node.shutdown().await; // flushes the final boat
         let after = node.stats().await;
         let ships = after.ships - before.ships;
+        let mb_shipped = (after.bytes_shipped - before.bytes_shipped) as f64 / 1e6;
 
         // Correctness: everything acked must be durable.
         let verify = boot(&root, tag, &format!("{tag}-v")).await;
@@ -147,7 +154,7 @@ async fn main() -> anyhow::Result<()> {
                 vec![o.clone()],
                 vec![Op {
                     object: o.clone(),
-                    sql: "SELECT COUNT(*) AS c FROM t".into(),
+                    sql: "SELECT COUNT(*) AS c FROM t WHERE n = 1".into(),
                     params: vec![],
                 }],
                 true,
@@ -162,11 +169,12 @@ async fn main() -> anyhow::Result<()> {
         assert_eq!(total as usize, txns, "all acked writes durable");
 
         println!(
-            "{:>11}: {:>8.0} txn/s   {:>5} boats   {:>6.1} txns/boat   all {} writes durable ✓",
+            "{:>11}: {:>8.0} txn/s   {:>5} boats   {:>6.1} txns/boat   {:>8.1} MB shipped   all {} writes durable ✓",
             if optimistic { "optimistic" } else { "pessimistic" },
             tps,
             ships,
             txns as f64 / ships as f64,
+            mb_shipped,
             txns
         );
     }

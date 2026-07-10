@@ -30,7 +30,8 @@ use crate::api::ApiError;
 use crate::cluster::{
     Node, Op, OpResult, TakeError, TransferMeta, TxnResponse, VisitInfo, checkpoint_key,
 };
-use crate::object::{LiveObject, activate, evict, object_key};
+use crate::delta::{self, COMPACT_CHAIN, COMPACT_FRACTION_DENOM, DELTA_MIN_BYTES, Manifest};
+use crate::object::{LiveObject, evict, fetch_image, materialize, object_key, purge};
 use crate::store::BlobStore;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -69,6 +70,9 @@ pub enum WorkerMsg {
         object: String,
         meta: TransferMeta,
     },
+    /// Disk pressure: deactivate idle clean objects (their files become
+    /// commuter cache, which the ledger may then reclaim).
+    Shed,
     /// Internal: a spawned take task finished.
     Taken {
         txn: u64,
@@ -80,6 +84,13 @@ pub enum WorkerMsg {
     ShipDone {
         objects: Vec<String>,
         ok: bool,
+    },
+    /// Internal: a spawned activation fetch finished. Blob I/O for cold
+    /// objects happens off-loop so one cold tenant can't stall the others.
+    Activated {
+        txn: u64,
+        object: String,
+        result: Result<(Vec<u8>, u32), String>,
     },
     /// Flush the final boat, then stop.
     Shutdown {
@@ -114,6 +125,7 @@ struct Parked {
     /// How many participants (in sorted order) we hold queue heads for.
     acquired: usize,
     taking: bool,
+    activating: bool,
     crossed: bool,
 }
 
@@ -121,6 +133,16 @@ struct Meta {
     arrived_at: u64,
     return_to: Option<usize>,
     visit: Option<VisitInfo>,
+}
+
+type Waiter = (oneshot::Sender<Result<TxnResponse, ApiError>>, TxnResponse);
+
+/// A locally-committed txn awaiting durability, for boat grouping.
+struct AppliedTxn {
+    participants: Vec<String>,
+    /// Present for pessimistic (and demoted-optimistic) txns: acked when
+    /// this txn's boat lands.
+    waiter: Option<Waiter>,
 }
 
 struct Worker {
@@ -138,13 +160,24 @@ struct Worker {
     parked: HashMap<u64, Parked>,
     next_txn: u64,
     txns_executed: u64,
-    /// Boat state. Objects with locally-committed, not-yet-shipped writes.
-    dirty: HashSet<String>,
+    /// Boat state: objects with locally-committed, not-yet-shipped writes,
+    /// with the size recorded when they first became dirty.
+    dirty: HashMap<String, u64>,
+    /// Approximate bytes of unshipped state; the backpressure watermark.
+    /// Below max_unshipped nothing changes; above it, optimistic txns are
+    /// quietly demoted to boat-riders, which paces producers to ship speed.
+    dirty_bytes: u64,
+    /// Applied-but-unshipped txns, in order. Boats are cut along
+    /// txn-connected components of these, so one txn's participants can
+    /// never straddle two commit records (atomic durability), while the
+    /// byte cap keeps a single boat within the container's RAM budget.
+    pending_txns: Vec<AppliedTxn>,
+    /// Page-hash manifests for large objects (delta shipping). Built on
+    /// activation or first large ship; dropped on evict.
+    manifests: HashMap<String, Manifest>,
     /// Objects in the currently shipping boat (at most one boat in flight;
     /// the next launches the moment it lands, if anything is dirty).
     inflight: Option<HashSet<String>>,
-    /// Pessimistic txns applied locally, acked when their boat lands.
-    boat_waiters: Vec<(oneshot::Sender<Result<TxnResponse, ApiError>>, TxnResponse)>,
     /// Set while draining for shutdown; answered when the last boat lands.
     closing: Option<oneshot::Sender<()>>,
     done: bool,
@@ -175,9 +208,11 @@ pub fn spawn(node: Node, id: usize, live_dir: PathBuf) -> anyhow::Result<mpsc::U
         parked: HashMap::new(),
         next_txn: 0,
         txns_executed: 0,
-        dirty: HashSet::new(),
+        dirty: HashMap::new(),
+        dirty_bytes: 0,
+        pending_txns: Vec::new(),
+        manifests: HashMap::new(),
         inflight: None,
-        boat_waiters: Vec::new(),
         closing: None,
         done: false,
     };
@@ -222,6 +257,7 @@ impl Worker {
                         resp,
                         acquired: 0,
                         taking: false,
+                        activating: false,
                         crossed: false,
                     },
                 );
@@ -252,6 +288,27 @@ impl Worker {
                 // A parked txn may have a take in flight for this object;
                 // its retry loop will resolve back to us and short-circuit.
             }
+            WorkerMsg::Shed => {
+                let mut shed_any = false;
+                let ids: Vec<String> = self.objects.keys().cloned().collect();
+                for id in ids {
+                    // Only idle, clean, unqueued objects may deactivate:
+                    // their file equals durably shipped state.
+                    if self.unshipped(&id) || self.queues.contains_key(&id) {
+                        continue;
+                    }
+                    if let Some(obj) = self.objects.remove(&id) {
+                        let path = obj.live_path.clone();
+                        drop(obj);
+                        self.manifests.remove(&id);
+                        self.node.disk.lock().unwrap().set_cache(path, self.id);
+                        shed_any = true;
+                    }
+                }
+                if shed_any {
+                    self.node.enforce_disk();
+                }
+            }
             WorkerMsg::Taken {
                 txn,
                 object,
@@ -259,6 +316,11 @@ impl Worker {
                 result,
             } => self.on_taken(txn, object, from, result).await,
             WorkerMsg::ShipDone { objects, ok } => self.on_ship_done(objects, ok).await,
+            WorkerMsg::Activated {
+                txn,
+                object,
+                result,
+            } => self.on_activated(txn, object, result).await,
             WorkerMsg::Shutdown { resp } => {
                 self.closing = Some(resp);
                 self.maybe_launch();
@@ -272,7 +334,7 @@ impl Worker {
 
     fn maybe_finish_closing(&mut self) {
         if self.inflight.is_none()
-            && self.dirty.is_empty()
+            && self.pending_txns.is_empty()
             && let Some(done) = self.closing.take()
         {
             let _ = done.send(());
@@ -284,41 +346,170 @@ impl Worker {
     /// No timer: ships leave as often as possible, so batch size adapts to
     /// load — one txn per boat when quiet, everything that accumulated
     /// during the last round trip when busy.
+    ///
+    /// Each dirty object ships either a full snapshot or a page delta
+    /// against its manifest — snapshots for small objects and for
+    /// compaction (long chains or big diffs), deltas otherwise.
     fn maybe_launch(&mut self) {
-        if self.inflight.is_some() || self.dirty.is_empty() {
+        if self.inflight.is_some() || self.pending_txns.is_empty() {
             return;
         }
-        // Snapshot synchronously: we're between applies, a txn boundary.
-        let objects: Vec<String> = self.dirty.drain().collect();
-        let mut snapshots = Vec::with_capacity(objects.len());
-        let mut snap_err = false;
-        for id in &objects {
-            match std::fs::read(&self.objects.get(id).expect("dirty object is live").live_path) {
-                Ok(bytes) => snapshots.push(bytes),
-                Err(_) => {
-                    snap_err = true;
-                    break;
+        // Cut the boat along txn-connected components: a txn's participants
+        // must ship under one commit record (atomic durability), but
+        // independent components can wait for the next boat when this one
+        // hits the byte cap — bounding one shipment's RAM to the budget.
+        let pending = std::mem::take(&mut self.pending_txns);
+        let mut parent: Vec<usize> = (0..pending.len()).collect();
+        fn find(parent: &mut Vec<usize>, i: usize) -> usize {
+            if parent[i] != i {
+                let root = find(parent, parent[i]);
+                parent[i] = root;
+            }
+            parent[i]
+        }
+        let mut first_txn_with: HashMap<&str, usize> = HashMap::new();
+        for (i, txn) in pending.iter().enumerate() {
+            for object in &txn.participants {
+                match first_txn_with.get(object.as_str()) {
+                    Some(&j) => {
+                        let (a, b) = (find(&mut parent, i), find(&mut parent, j));
+                        parent[a] = b;
+                    }
+                    None => {
+                        first_txn_with.insert(object, i);
+                    }
                 }
             }
+        }
+        // Components in first-appearance order, with their byte weight.
+        let mut order: Vec<usize> = Vec::new();
+        let mut comp_txns: HashMap<usize, Vec<usize>> = HashMap::new();
+        for i in 0..pending.len() {
+            let root = find(&mut parent, i);
+            comp_txns.entry(root).or_insert_with(|| {
+                order.push(root);
+                Vec::new()
+            });
+            comp_txns.get_mut(&root).unwrap().push(i);
+        }
+        let mut selected: Vec<usize> = Vec::new(); // txn indices for this boat
+        let mut boat_objects: HashSet<String> = HashSet::new();
+        let mut boat_bytes = 0u64;
+        let mut leftover: Vec<usize> = Vec::new();
+        for root in order {
+            let txns = &comp_txns[&root];
+            let comp_objects: HashSet<&String> =
+                txns.iter().flat_map(|&i| &pending[i].participants).collect();
+            let comp_bytes: u64 = comp_objects
+                .iter()
+                .map(|o| self.dirty.get(*o).copied().unwrap_or(0))
+                .sum();
+            // Always take at least one component, else nothing ever ships.
+            if !selected.is_empty() && boat_bytes + comp_bytes > self.node.limits.max_boat_bytes {
+                leftover.extend(txns.iter().copied());
+                continue;
+            }
+            boat_bytes += comp_bytes;
+            boat_objects.extend(comp_objects.into_iter().cloned());
+            selected.extend(txns.iter().copied());
+        }
+        // Reassemble: leftover txns (order-preserved) stay pending; the
+        // boat takes its objects out of dirty and its waiters along.
+        let mut pending: Vec<Option<AppliedTxn>> = pending.into_iter().map(Some).collect();
+        let mut waiters: Vec<Waiter> = Vec::new();
+        for &i in &selected {
+            if let Some(w) = pending[i].take().and_then(|t| t.waiter) {
+                waiters.push(w);
+            }
+        }
+        let mut keep: Vec<usize> = leftover;
+        keep.sort_unstable();
+        for i in keep {
+            if let Some(t) = pending[i].take() {
+                self.pending_txns.push(t);
+            }
+        }
+        let objects: Vec<String> = boat_objects.into_iter().collect();
+        for id in &objects {
+            if let Some(bytes) = self.dirty.remove(id) {
+                self.dirty_bytes = self.dirty_bytes.saturating_sub(bytes);
+            }
+        }
+        let mut items = Vec::with_capacity(objects.len());
+        let mut snap_err = false;
+        for id in &objects {
+            let bytes =
+                match std::fs::read(&self.objects.get(id).expect("dirty object is live").live_path)
+                {
+                    Ok(b) => b,
+                    Err(_) => {
+                        snap_err = true;
+                        break;
+                    }
+                };
+            let payload = if (bytes.len() as u64) < DELTA_MIN_BYTES {
+                ShipPayload::Snapshot {
+                    gc_deltas: self.manifests.contains_key(id),
+                    bytes,
+                }
+            } else {
+                match self.manifests.get_mut(id) {
+                    Some(m) => {
+                        let d = delta::diff(m, &bytes);
+                        let delta_size: usize = d.pages.iter().map(|(_, p)| p.len()).sum();
+                        if m.chain_len + 1 > COMPACT_CHAIN
+                            || delta_size as u64 > bytes.len() as u64 / COMPACT_FRACTION_DENOM
+                        {
+                            m.chain_len = 0;
+                            ShipPayload::Snapshot {
+                                gc_deltas: true,
+                                bytes,
+                            }
+                        } else {
+                            m.chain_len += 1;
+                            ShipPayload::Delta {
+                                counter: d.counter,
+                                bytes: delta::encode(&d),
+                            }
+                        }
+                    }
+                    None => {
+                        // First large ship: baseline with a snapshot.
+                        self.manifests.insert(id.clone(), Manifest::of(&bytes, 0));
+                        ShipPayload::Snapshot {
+                            gc_deltas: false,
+                            bytes,
+                        }
+                    }
+                }
+            };
+            items.push(ShipItem {
+                object: id.clone(),
+                payload,
+            });
         }
         if snap_err {
             // Local disk failure: revert to last durable, fail the waiters.
             for id in &objects {
-                evict(&mut self.objects, id);
+                purge(&mut self.objects, id);
+                self.node
+                    .disk
+                    .lock()
+                    .unwrap()
+                    .remove(&self.live_dir.join(format!("{id}.db")));
                 self.meta.remove(id);
+                self.manifests.remove(id);
             }
-            for (resp, _) in self.boat_waiters.drain(..) {
+            for (resp, _) in waiters {
                 let _ = resp.send(Err(ApiError::internal("snapshot failed; state reverted")));
             }
             return;
         }
-        let waiters = std::mem::take(&mut self.boat_waiters);
-        self.inflight = Some(objects.iter().cloned().collect());
+        self.inflight = Some(objects.into_iter().collect());
         tokio::spawn(ship_task(
             self.node.clone(),
             self.self_tx.clone(),
-            objects,
-            snapshots,
+            items,
             waiters,
         ));
     }
@@ -337,10 +528,24 @@ impl Worker {
                 objects.len()
             );
             for id in &objects {
-                evict(&mut self.objects, id);
+                purge(&mut self.objects, id);
                 self.meta.remove(id);
-                self.dirty.remove(id);
+                self.manifests.remove(id);
+                if let Some(bytes) = self.dirty.remove(id) {
+                    self.dirty_bytes = self.dirty_bytes.saturating_sub(bytes);
+                }
+                self.node
+                    .disk
+                    .lock()
+                    .unwrap()
+                    .remove(&self.live_dir.join(format!("{id}.db")));
             }
+            // Their unshipped txns died with the boat: drop pending entries
+            // touching reverted objects (their waiters were already failed
+            // by ship_task if pessimistic; optimistic acks are the contract).
+            let reverted: HashSet<&String> = objects.iter().collect();
+            self.pending_txns
+                .retain(|t| !t.participants.iter().any(|p| reverted.contains(p)));
         }
         // Next boat first, so takes/returns below see accurate dirty state.
         self.maybe_launch();
@@ -348,7 +553,7 @@ impl Worker {
         for id in &objects {
             if self.queues.contains_key(id) {
                 ready.extend(self.service_front(id).await);
-            } else if !self.dirty.contains(id) {
+            } else if !self.dirty.contains_key(id) {
                 self.maybe_return_home(id).await;
             }
         }
@@ -367,7 +572,10 @@ impl Worker {
     }
 
     /// Acquire participants in sorted order. Returns true when the txn
-    /// holds the head of every participant's queue and may run.
+    /// holds the head of every participant's queue, all of them live, and
+    /// may run. Two async detours park the txn without blocking the loop:
+    /// a Take (remote owner) and an Activation (owned but cold — the blob
+    /// fetch runs in a spawned task so other objects keep being served).
     fn advance(&mut self, txn: u64) -> bool {
         loop {
             let Some(p) = self.parked.get_mut(&txn) else {
@@ -381,15 +589,40 @@ impl Worker {
                 self.node.routing.read().unwrap().owner_of(&object) == self.id;
             let p = self.parked.get_mut(&txn).unwrap();
             if is_owner {
-                let queue = self.queues.entry(object).or_default();
+                let queue = self.queues.entry(object.clone()).or_default();
                 if !queue.iter().any(|e| matches!(e, Entry::Txn(t) if *t == txn)) {
                     queue.push_back(Entry::Txn(txn));
                 }
-                if matches!(queue.front(), Some(Entry::Txn(t)) if *t == txn) {
-                    p.acquired += 1;
-                    continue;
+                if !matches!(queue.front(), Some(Entry::Txn(t)) if *t == txn) {
+                    return false; // waiting for the head; re-driven on pops
                 }
-                return false; // waiting for the head; re-driven on pops
+                if !self.objects.contains_key(&object) {
+                    // Head held, object cold: fetch off-loop. The held head
+                    // keeps takes and later txns queued behind us.
+                    if !p.activating {
+                        p.activating = true;
+                        let node = self.node.clone();
+                        let reply = self.self_tx.clone();
+                        let live_path = self.live_dir.join(format!("{object}.db"));
+                        tokio::spawn(async move {
+                            // Each in-flight fetch holds a full image in
+                            // RAM; the permit caps how many at once.
+                            let _permit =
+                                node.activation_permits.clone().acquire_owned().await;
+                            let result = fetch_image(&node.store, &object, &live_path)
+                                .await
+                                .map_err(|e| e.to_string());
+                            let _ = reply.send(WorkerMsg::Activated {
+                                txn,
+                                object,
+                                result,
+                            });
+                        });
+                    }
+                    return false; // waiting for Activated
+                }
+                p.acquired += 1;
+                continue;
             }
             if !p.taking {
                 p.taking = true;
@@ -407,6 +640,41 @@ impl Worker {
         }
     }
 
+    async fn on_activated(
+        &mut self,
+        txn: u64,
+        object: String,
+        result: Result<(Vec<u8>, u32), String>,
+    ) {
+        if let Some(p) = self.parked.get_mut(&txn) {
+            p.activating = false;
+        }
+        let outcome = result.and_then(|(image, chain_total)| {
+            if self.owns(&object) && !self.objects.contains_key(&object) {
+                materialize(&mut self.objects, &object, &self.live_dir, &image)
+                    .map_err(|e| e.to_string())?;
+                if image.len() as u64 >= DELTA_MIN_BYTES {
+                    self.manifests
+                        .insert(object.clone(), Manifest::of(&image, chain_total));
+                }
+                self.node.disk.lock().unwrap().set_live(
+                    self.live_dir.join(format!("{object}.db")),
+                    image.len() as u64,
+                    self.id,
+                );
+                self.node.enforce_disk();
+            }
+            Ok(())
+        });
+        match outcome {
+            Ok(()) => self.pump(vec![txn]).await,
+            Err(e) => {
+                let ready = self.fail_txn(txn, format!("activation failed: {e}")).await;
+                self.pump(ready).await;
+            }
+        }
+    }
+
     async fn on_taken(&mut self, txn: u64, object: String, from: usize, result: TakenResult) {
         let Some(p) = self.parked.get_mut(&txn) else {
             return;
@@ -415,11 +683,11 @@ impl Worker {
         match result {
             TakenResult::Got(meta) => {
                 self.admit(&object, meta, from != self.id).await;
-                // The txn now holds the fresh object outright.
+                // The txn now holds the fresh object's queue head outright;
+                // advance() will activate it (from commuter cache if this
+                // object has lived here before).
                 self.queues
                     .insert(object, VecDeque::from([Entry::Txn(txn)]));
-                let p = self.parked.get_mut(&txn).unwrap();
-                p.acquired += 1;
                 self.pump(vec![txn]).await;
             }
             TakenResult::AlreadyLocal => self.pump(vec![txn]).await,
@@ -478,7 +746,7 @@ impl Worker {
     /// Unshipped local state? Then the blob store is stale for this object
     /// and ownership must not move until the boat lands.
     fn unshipped(&self, object: &str) -> bool {
-        self.dirty.contains(object)
+        self.dirty.contains_key(object)
             || self
                 .inflight
                 .as_ref()
@@ -532,6 +800,13 @@ impl Worker {
     /// durably claimed twice.
     async fn release(&mut self, object: &str, new_owner: Option<usize>) -> TransferMeta {
         evict(&mut self.objects, object);
+        self.manifests.remove(object);
+        // The kept file is now commuter cache: ledger may reclaim it.
+        self.node
+            .disk
+            .lock()
+            .unwrap()
+            .set_cache(self.live_dir.join(format!("{object}.db")), self.id);
         let m = self.meta.remove(object);
         self.owned.remove(object);
         let now = self.now();
@@ -577,8 +852,9 @@ impl Worker {
             return vec![];
         };
         let mut ready = Vec::new();
-        // Release held queue heads (the first `acquired` participants).
-        for object in p.participants.iter().take(p.acquired) {
+        // Release every queue entry this txn holds — acquired heads plus
+        // the frontier entry it may be parked on (activation/head wait).
+        for object in p.participants.iter() {
             if let Some(queue) = self.queues.get_mut(object) {
                 queue.retain(|e| !matches!(e, Entry::Txn(t) if *t == txn));
                 if queue.is_empty() {
@@ -626,15 +902,36 @@ impl Worker {
                     let _ = p.resp.send(Ok(response));
                 } else {
                     for object in &p.participants {
-                        self.dirty.insert(object.clone());
+                        if !self.dirty.contains_key(object) {
+                            let bytes = self
+                                .objects
+                                .get(object)
+                                .and_then(|o| std::fs::metadata(&o.live_path).ok())
+                                .map(|m| m.len())
+                                .unwrap_or(0);
+                            self.dirty.insert(object.clone(), bytes);
+                            self.dirty_bytes += bytes;
+                            self.node
+                                .disk
+                                .lock()
+                                .unwrap()
+                                .touch(&self.live_dir.join(format!("{object}.db")), bytes);
+                        }
                     }
-                    if p.optimistic {
-                        // Acked on local commit; ships with the next boat.
+                    // Backpressure only when genuinely needed: below the
+                    // watermark, optimistic acks immediately. Above it,
+                    // optimistic rides the boat like everyone else, which
+                    // paces producers to ship speed until the backlog drains.
+                    let waiter = if p.optimistic && self.dirty_bytes <= self.node.max_unshipped {
                         let _ = p.resp.send(Ok(response));
+                        None
                     } else {
-                        // Barrier: acked when the boat lands.
-                        self.boat_waiters.push((p.resp, response));
-                    }
+                        Some((p.resp, response))
+                    };
+                    self.pending_txns.push(AppliedTxn {
+                        participants: p.participants.clone(),
+                        waiter,
+                    });
                 }
             }
         }
@@ -693,9 +990,8 @@ impl Worker {
         ops: &[Op],
         read_only: bool,
     ) -> Result<Vec<OpResult>, ApiError> {
-        for id in participants {
-            activate(&mut self.objects, id, &self.node.store, &self.live_dir).await?;
-        }
+        // Participants are guaranteed live: advance() activates cold
+        // objects (off-loop) before a txn is allowed to run.
         fn conn_of<'a>(
             objects: &'a HashMap<String, LiveObject>,
             id: &str,
@@ -756,8 +1052,16 @@ impl Worker {
         }
         if let Some(e) = commit_err {
             for id in participants {
-                evict(&mut self.objects, id);
-                self.dirty.remove(id);
+                purge(&mut self.objects, id);
+                self.manifests.remove(id);
+                if let Some(bytes) = self.dirty.remove(id) {
+                    self.dirty_bytes = self.dirty_bytes.saturating_sub(bytes);
+                }
+                self.node
+                    .disk
+                    .lock()
+                    .unwrap()
+                    .remove(&self.live_dir.join(format!("{id}.db")));
             }
             return Err(ApiError::internal(format!("local commit failed: {e}")));
         }
@@ -766,26 +1070,69 @@ impl Worker {
     }
 }
 
-/// Ship one boat: stage every object's snapshot, write ONE commit record
-/// covering the whole batch (the commit point — every transaction in the
-/// boat becomes durable with this single blob write), then promote.
-/// Recovery already handles multi-object records, so a crash mid-promote is
-/// rolled forward exactly as before.
+pub enum ShipPayload {
+    Snapshot {
+        bytes: Vec<u8>,
+        /// True when this snapshot compacts an existing delta chain: after
+        /// promotion, deltas at or below its change counter get deleted.
+        /// (Skipping the GC is always safe — activation ignores them.)
+        gc_deltas: bool,
+    },
+    Delta {
+        counter: u32,
+        bytes: Vec<u8>,
+    },
+}
+
+pub struct ShipItem {
+    pub object: String,
+    pub payload: ShipPayload,
+}
+
+impl ShipItem {
+    fn staging_key(&self, staging_id: &str) -> String {
+        match &self.payload {
+            ShipPayload::Snapshot { .. } => format!("staging/{staging_id}/{}.snap", self.object),
+            ShipPayload::Delta { counter, .. } => {
+                format!("staging/{staging_id}/{}.delta.{counter:010}", self.object)
+            }
+        }
+    }
+
+    fn bytes(&self) -> &[u8] {
+        match &self.payload {
+            ShipPayload::Snapshot { bytes, .. } => bytes,
+            ShipPayload::Delta { bytes, .. } => bytes,
+        }
+    }
+}
+
+/// Ship one boat: stage every item (snapshots for small/compacting objects,
+/// page deltas for large ones), write ONE commit record covering the whole
+/// batch — the commit point — then promote. Recovery replays promotion from
+/// the staged blobs, so a crash mid-promote is rolled forward.
 async fn ship_task(
     node: Node,
     reply: mpsc::UnboundedSender<WorkerMsg>,
-    objects: Vec<String>,
-    snapshots: Vec<Vec<u8>>,
+    items: Vec<ShipItem>,
     waiters: Vec<(oneshot::Sender<Result<TxnResponse, ApiError>>, TxnResponse)>,
 ) {
     let staging_id = uuid::Uuid::new_v4().to_string();
+    let objects: Vec<String> = items.iter().map(|i| i.object.clone()).collect();
+    let payload_bytes: u64 = items.iter().map(|i| i.bytes().len() as u64).sum();
     let mut err: Option<String> = None;
 
-    for (id, bytes) in objects.iter().zip(&snapshots) {
-        if let Err(e) = node.store.put(&staging_key(&staging_id, id), bytes).await {
-            err = Some(e.to_string());
-            break;
-        }
+    // Stage in parallel: boats with many objects pay one RTT, not one each.
+    let staging_keys: Vec<String> = items.iter().map(|i| i.staging_key(&staging_id)).collect();
+    let staged = futures::future::join_all(
+        items
+            .iter()
+            .zip(&staging_keys)
+            .map(|(item, key)| node.store.put(key, item.bytes())),
+    )
+    .await;
+    if let Some(e) = staged.into_iter().find_map(|r| r.err()) {
+        err = Some(e.to_string());
     }
 
     // Fencing, last line of defense: refuse the commit point if the lease
@@ -810,25 +1157,55 @@ async fn ship_task(
             // Committed. Promotion is pure roll-forward: on failure the
             // record and staging stay behind and recover() finishes at boot.
             let mut promoted = true;
-            for (id, bytes) in objects.iter().zip(&snapshots) {
-                if node.store.put(&object_key(id), bytes).await.is_err() {
+            for item in &items {
+                let (key, bytes) = match &item.payload {
+                    ShipPayload::Snapshot { bytes, .. } => (object_key(&item.object), bytes),
+                    ShipPayload::Delta { counter, bytes } => {
+                        (delta::delta_key(&item.object, *counter), bytes)
+                    }
+                };
+                if node.store.put(&key, bytes).await.is_err() {
                     promoted = false;
                 }
             }
             if promoted {
-                for id in &objects {
-                    let _ = node.store.delete(&staging_key(&staging_id, id)).await;
+                for item in &items {
+                    let _ = node.store.delete(&item.staging_key(&staging_id)).await;
                 }
                 let _ = node.store.delete(&txn_key(&staging_id)).await;
+                // Compaction GC: superseded deltas are already ignored by
+                // activation (counter <= base); deleting them is hygiene.
+                for item in &items {
+                    if let ShipPayload::Snapshot {
+                        bytes,
+                        gc_deltas: true,
+                    } = &item.payload
+                    {
+                        let base_counter = delta::change_counter(bytes);
+                        if let Ok(keys) = node.store.list(&delta::delta_prefix(&item.object)).await
+                        {
+                            for key in keys {
+                                if delta::parse_delta_counter(&key, &item.object)
+                                    .is_some_and(|c| c <= base_counter)
+                                {
+                                    let _ = node.store.delete(&key).await;
+                                }
+                            }
+                        }
+                    }
+                }
             }
+            node.stats
+                .bytes_shipped
+                .fetch_add(payload_bytes, Ordering::Relaxed);
             for (resp, response) in waiters {
                 let _ = resp.send(Ok(response));
             }
             let _ = reply.send(WorkerMsg::ShipDone { objects, ok: true });
         }
         Some(e) => {
-            for id in &objects {
-                let _ = node.store.delete(&staging_key(&staging_id, id)).await;
+            for item in &items {
+                let _ = node.store.delete(&item.staging_key(&staging_id)).await;
             }
             for (resp, _) in waiters {
                 let _ = resp.send(Err(ApiError::internal(format!("commit failed: {e}"))));
@@ -952,12 +1329,23 @@ struct TxnRecord {
     objects: Vec<String>,
 }
 
-fn staging_key(staging_id: &str, object_id: &str) -> String {
-    format!("staging/{staging_id}/{object_id}.db")
-}
-
 fn txn_key(staging_id: &str) -> String {
     format!("txns/{staging_id}.json")
+}
+
+/// Promote one staged blob to its final home, keyed by its suffix:
+/// `<object>.snap` -> the base snapshot, `<object>.delta.<counter>` -> a
+/// chain entry.
+async fn promote_staged(store: &dyn BlobStore, staged_key: &str, bytes: &[u8]) -> anyhow::Result<()> {
+    let name = staged_key.rsplit('/').next().unwrap_or_default();
+    if let Some(object) = name.strip_suffix(".snap") {
+        store.put(&object_key(object), bytes).await?;
+    } else if let Some((object, counter)) = name.rsplit_once(".delta.") {
+        store
+            .put(&format!("objects/{object}.d.{counter}"), bytes)
+            .await?;
+    }
+    Ok(())
 }
 
 /// Startup recovery. Roll forward any transaction whose commit record exists
@@ -973,10 +1361,9 @@ pub async fn recover(store: &dyn BlobStore) -> anyhow::Result<()> {
             store.delete(&key).await?;
             continue;
         };
-        for id in &record.objects {
-            let staged = staging_key(&record.txn_id, id);
-            if let Some(snapshot) = store.get(&staged).await? {
-                store.put(&object_key(id), &snapshot).await?;
+        for staged in store.list(&format!("staging/{}/", record.txn_id)).await? {
+            if let Some(blob) = store.get(&staged).await? {
+                promote_staged(store, &staged, &blob).await?;
             }
             store.delete(&staged).await?;
         }
@@ -1059,21 +1446,31 @@ mod tests {
         let store: Arc<dyn BlobStore> =
             Arc::new(FsBlobStore::new(dir.path().join("blobs")).unwrap());
 
-        store.put("staging/t1/alice.db", b"NEW").await.unwrap();
+        // A committed boat that never promoted: one snapshot, one delta.
+        store.put("staging/t1/alice.snap", b"NEW").await.unwrap();
+        store
+            .put("staging/t1/carol.delta.0000000007", b"DELTA7")
+            .await
+            .unwrap();
         let record = serde_json::to_vec(&TxnRecord {
             txn_id: "t1".into(),
-            objects: vec!["alice".into()],
+            objects: vec!["alice".into(), "carol".into()],
         })
         .unwrap();
         store.put("txns/t1.json", &record).await.unwrap();
-        store.put("staging/t2/bob.db", b"JUNK").await.unwrap();
+        // ...and staging from a boat that never reached its commit point.
+        store.put("staging/t2/bob.snap", b"JUNK").await.unwrap();
 
         recover(store.as_ref()).await.unwrap();
 
         assert_eq!(store.get("objects/alice.db").await.unwrap().unwrap(), b"NEW");
+        assert_eq!(
+            store.get("objects/carol.d.0000000007").await.unwrap().unwrap(),
+            b"DELTA7"
+        );
         assert!(store.get("txns/t1.json").await.unwrap().is_none());
-        assert!(store.get("staging/t1/alice.db").await.unwrap().is_none());
-        assert!(store.get("staging/t2/bob.db").await.unwrap().is_none());
+        assert!(store.get("staging/t1/alice.snap").await.unwrap().is_none());
+        assert!(store.get("staging/t2/bob.snap").await.unwrap().is_none());
         assert!(store.get("objects/bob.db").await.unwrap().is_none());
     }
 }

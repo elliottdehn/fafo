@@ -45,6 +45,28 @@ cargo test                       # atomicity, serializability, cross-node, recov
 | `API_TOKEN` | unset (open) | bearer token required on the public API |
 | `HYST` | `200` | hysteresis tenure; `0` disables |
 
+## Fitting the container (resource governor)
+
+Budgets are detected at boot from the cgroup memory limit (which Cloudflare
+sets per instance type) and scale automatically — `lite` (256 MiB / 2 GB)
+through `standard-4` (12 GiB / 20 GB) run the same image with no
+per-instance-type configuration. Env overrides: `MEMORY_MB`, `DISK_MB`.
+
+- **Disk ledger**: every local working file is accounted against a budget
+  (60% of disk). Over budget, commuter-cache files are deleted LRU-first
+  (always safe); if live files alone still exceed it, the heaviest worker
+  sheds idle clean objects — they become cache, then reclaimable. Shedded
+  objects reactivate transparently on next touch.
+- **Boat byte cap** (memory/8, clamped 16 MiB–1 GiB): a backlog bigger than
+  the cap splits into consecutive boats along transaction-connected
+  components — one transaction's participants never straddle two commit
+  records, so atomic durability survives the split. Bounds one shipment's
+  RAM to the budget.
+- **Activation permits** (2–4): concurrent cold-object fetches each hold a
+  full image in RAM; the semaphore caps how many at once.
+- **SQLite page cache** capped at 256 KB per connection (the 2 MB default
+  times hundreds of live tenants would quietly eat a small instance).
+
 ## Deploying to Cloudflare Containers
 
 Containers have no direct container-to-container networking, so inter-node
@@ -148,13 +170,48 @@ came back from the checkpoints, not from scratch.
   claimed after one probe. Health-check liveness is right for stopped
   worlds, too eager for network partitions (needs TTLs + clocks).
 
+## Large objects (db-per-tenant)
+
+Objects past 64 KB ship **page deltas** instead of snapshots: the worker
+keeps a page-hash manifest per live object, and each boat carries only the
+pages that changed. Versioning rides SQLite's own header change counter, so
+deltas need no manifest files — activation loads the base and applies only
+newer deltas, which also makes compaction (snapshot + chain reset, forced
+by long chains or big diffs) crash-safe by construction: superseded deltas
+are ignored, then lazily GC'd. Measured: 500 writes against a 5 MB object
+shipped 0.1 MB total — snapshots would have shipped 50 MB.
+
+This is what makes `object = a whole tenant's database` viable: real
+per-tenant schema and isolation, cross-tenant transactions when billing
+needs them, placement learned per tenant.
+
+Two more mechanics take the sting out of cold large objects:
+
+- **Off-loop activation**: fetching a cold object happens in a spawned task
+  while the transaction parks (same machinery as takes), so one cold 1 GB
+  tenant never stalls the other tenants on its worker.
+- **Commuter cache**: evictions for ownership transfer keep the local file
+  (transfers are flush-gated, so it equals durably shipped state). On
+  return, a 4-byte ranged read of the base's change counter decides whether
+  the delta chain bridges the gap — if yes, only the deltas since the last
+  stay are fetched and the base download is skipped entirely. The
+  hysteresis ping-pong pattern becomes nearly free for large objects
+  (verified: a full take-away-and-return round trip costs at most one full
+  download — the arrival, never the return).
+
+Remaining physics: the FIRST arrival of a large object at a worker
+transfers its full size, and each object still has one serial writer.
+
 ## Honest limitations
 
 - Cross-node take retries are bounded, not starvation-free; pathological
   contention on one object pair can thrash. It also anneals away, which is
   the point.
-- Snapshot-per-commit is O(db size) — right for small objects; big ones
-  want WAL-delta shipping + compaction (Litestream's design).
+- A large object's FIRST arrival at a worker transfers its full size
+  (repeat visits ride the commuter cache + delta chain).
 - The R2 store's list parser assumes fafo's restricted key charset.
 - `LOGICAL_WORKERS` is fixed at cluster creation; resharding is a manual
   migration.
+- Backpressure (MAX_UNSHIPPED_MB, default 256) only engages above the
+  watermark: optimistic acks demote to durable-ack pacing until the backlog
+  drains. Below it, zero effect.
