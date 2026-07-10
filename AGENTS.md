@@ -77,6 +77,42 @@ const conn = await FafoSocket.open(url, token, "my-hot-object");
 await conn.txn([{ object: "alice", sql: "..." }]);
 ```
 
+### Long-poll frames: waiting on the database
+
+A poll is a read-only query whose reply is held until its condition holds.
+Two flavors, one field apart:
+
+```jsonc
+// Condition variable (no baseline): replies when the result is non-empty.
+// SQL is the condition language — WHERE, NOT EXISTS, aggregates, thresholds.
+{ "id": 2, "poll": { "object": "chan",
+    "sql": "SELECT * FROM msgs WHERE id > ?1 ORDER BY id LIMIT 100",
+    "params": [4021] } }
+
+// Change detection (baseline = hash from the previous reply): replies when
+// the result differs. "" bootstraps with an immediate snapshot + hash.
+{ "id": 3, "poll": { "object": "presence",
+    "sql": "SELECT u FROM p ORDER BY u", "baseline": "9f2c81aa03d1e644" } }
+
+// <- reply, whenever the condition holds (may be immediate)
+{ "id": 2, "result": { "txn_id": "w17-poll-0", "results": [{ "rows": [...] }],
+                       "hash": "b1d0..." } }
+
+// Abandon an outstanding poll (also automatic on socket close)
+{ "id": 2, "cancel": true }
+```
+
+The subscription is your loop: poll, process, move your cursor (it lives in
+your own query params) or feed the hash back, poll again. Nothing is ever
+missed: the initial check runs at the object's serialization point, so a
+write cannot slip between "empty" and "parked". Add `"durable": true` to
+have the condition judged only against durably-shipped state.
+
+If a poll fails with a "re-poll" error (the object migrated, optimistic
+state reverted, or the node is shutting down), just poll again — that IS
+the recovery protocol. Polls are answered by the object's owner: pin the
+socket with `?for=` (HTTP `/objects/{id}/poll` routes correctly already).
+
 ## HTTP API (debugging & scripts)
 
 Same transactions, one request each. Base URL: `http://127.0.0.1:8787`.
@@ -124,6 +160,17 @@ curl -s localhost:8787/objects/alice/exec -H 'content-type: application/json' -d
     {"sql": "CREATE TABLE IF NOT EXISTS account (balance INTEGER NOT NULL CHECK (balance >= 0))"},
     {"sql": "INSERT INTO account (balance) VALUES (?1)", "params": [100]}
   ]}'
+```
+
+### POST /objects/{id}/poll — long-poll
+
+Same body as `query` plus optional `durable` and `baseline`; the response
+hangs until the condition holds (see the WebSocket section for semantics).
+
+```sh
+curl -sX POST $F/objects/chan/poll -H 'content-type: application/json' \
+  -d '{"sql":"SELECT * FROM msgs WHERE id > ?1 ORDER BY id","params":[0]}'
+# -> blocks until a message exists, then {"rows":[...],"hash":"..."}
 ```
 
 ### POST /objects/{id}/query — read-only
@@ -175,6 +222,22 @@ db.txn(["alice", "bob"], [
 - **High write throughput**: send `optimistic: true` and let boats coalesce
   (measured: ~240x at object-storage latency). Barrier with one pessimistic
   txn when you need a durability checkpoint.
+- **Pub/sub**: a channel is an object with a `msgs` table
+  (`id INTEGER PRIMARY KEY AUTOINCREMENT`). Publishers INSERT (optimistic
+  for firehoses); consumers run the poll cursor loop —
+  `WHERE id > ?cursor ORDER BY id LIMIT 100`, bump the cursor per reply.
+  At-least-once falls out of the loop; the cursor makes it exactly-once.
+  Retention is a `DELETE` on your schedule; replay is a smaller cursor.
+- **Transactional outbox**: publish and state-change in ONE cross-object
+  txn (`{objects: ["orders", "orders-events"], ops: [...]}`) — subscribers
+  can never observe the message without the state change or vice versa.
+- **Live views** (presence lists, scoreboards): change-detection poll on
+  the view query itself. Bootstrap with `baseline: ""`, then feed each
+  reply's hash back. Writes that don't change the result don't wake you;
+  deletes do (the hash shrinks with the result).
+- **Condition wait**: poll `SELECT 1 WHERE NOT EXISTS (...)` or any
+  aggregate — "wake me when the queue drains" is
+  `SELECT 1 WHERE (SELECT COUNT(*) FROM jobs WHERE done = 0) = 0`.
 
 ## Deploying to Cloudflare
 

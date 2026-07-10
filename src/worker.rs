@@ -52,6 +52,10 @@ pub enum WorkerMsg {
         participants: Vec<String>,
         ops: Vec<Op>,
         read_only: bool,
+        /// Present when this (read-only, single-object) txn is a long-poll:
+        /// if its condition doesn't hold at the serialization point, it
+        /// parks instead of replying and is re-checked after every write.
+        poll: Option<PollOpts>,
         /// Optimistic txns are acked after local apply and ship in the next
         /// boat; pessimistic txns hold their ack until the boat is durable
         /// (and thereby act as flush barriers for everything before them).
@@ -69,6 +73,12 @@ pub enum WorkerMsg {
     Adopt {
         object: String,
         meta: TransferMeta,
+    },
+    /// Abandon one parked poll (client went away or gave up).
+    CancelPoll {
+        object: String,
+        conn: u64,
+        frame: u64,
     },
     /// Disk pressure: deactivate idle clean objects (their files become
     /// commuter cache, which the ledger may then reclaim).
@@ -97,8 +107,35 @@ pub enum WorkerMsg {
         resp: oneshot::Sender<()>,
     },
     Stats {
-        resp: oneshot::Sender<(u64, usize)>,
+        resp: oneshot::Sender<(u64, usize, usize)>,
     },
+}
+
+/// How a long-poll decides it is ready to reply.
+///
+/// Without `baseline`: reply when the result is non-empty — a condition
+/// variable over SQL (`NOT EXISTS`, aggregates, thresholds all work).
+/// With `baseline` (the hash from a previous reply): reply when the result
+/// hash differs — change detection, Consul-blocking-query style, costing
+/// the server one hash instead of a retained result set.
+pub struct PollOpts {
+    pub durable: bool,
+    pub baseline: Option<String>,
+    /// Identifies the subscription for cancellation: connection + frame id.
+    pub conn: u64,
+    pub frame: u64,
+}
+
+/// A parked long-poll: a read-only query waiting for its condition to hold.
+/// Just SQL text and a reply slot — no retained results, no diff state.
+struct PendingPoll {
+    conn: u64,
+    frame: u64,
+    sql: String,
+    params: Vec<Value>,
+    durable: bool,
+    baseline: Option<String>,
+    resp: oneshot::Sender<Result<TxnResponse, ApiError>>,
 }
 
 pub enum TakenResult {
@@ -121,6 +158,7 @@ struct Parked {
     ops: Vec<Op>,
     read_only: bool,
     optimistic: bool,
+    poll: Option<PollOpts>,
     resp: oneshot::Sender<Result<TxnResponse, ApiError>>,
     /// How many participants (in sorted order) we hold queue heads for.
     acquired: usize,
@@ -178,6 +216,9 @@ struct Worker {
     /// Objects in the currently shipping boat (at most one boat in flight;
     /// the next launches the moment it lands, if anything is dirty).
     inflight: Option<HashSet<String>>,
+    /// Parked long-polls per object, re-checked after every write txn
+    /// (durable ones at boat launch, riding the waiter list to landing).
+    polls: HashMap<String, Vec<PendingPoll>>,
     /// Set while draining for shutdown; answered when the last boat lands.
     closing: Option<oneshot::Sender<()>>,
     done: bool,
@@ -213,6 +254,7 @@ pub fn spawn(node: Node, id: usize, live_dir: PathBuf) -> anyhow::Result<mpsc::U
         pending_txns: Vec::new(),
         manifests: HashMap::new(),
         inflight: None,
+        polls: HashMap::new(),
         closing: None,
         done: false,
     };
@@ -242,6 +284,7 @@ impl Worker {
                 participants,
                 ops,
                 read_only,
+                poll,
                 optimistic,
                 resp,
             } => {
@@ -254,6 +297,7 @@ impl Worker {
                         ops,
                         read_only,
                         optimistic,
+                        poll,
                         resp,
                         acquired: 0,
                         taking: false,
@@ -321,13 +365,26 @@ impl Worker {
                 object,
                 result,
             } => self.on_activated(txn, object, result).await,
+            WorkerMsg::CancelPoll {
+                object,
+                conn,
+                frame,
+            } => {
+                if let Some(list) = self.polls.get_mut(&object) {
+                    list.retain(|p| !(p.conn == conn && p.frame == frame));
+                    if list.is_empty() {
+                        self.polls.remove(&object);
+                    }
+                }
+            }
             WorkerMsg::Shutdown { resp } => {
                 self.closing = Some(resp);
                 self.maybe_launch();
                 self.maybe_finish_closing();
             }
             WorkerMsg::Stats { resp } => {
-                let _ = resp.send((self.txns_executed, self.owned.len()));
+                let parked_polls = self.polls.values().map(Vec::len).sum();
+                let _ = resp.send((self.txns_executed, self.owned.len(), parked_polls));
             }
         }
     }
@@ -337,6 +394,10 @@ impl Worker {
             && self.pending_txns.is_empty()
             && let Some(done) = self.closing.take()
         {
+            let objects: Vec<String> = self.polls.keys().cloned().collect();
+            for object in objects {
+                self.fail_polls(&object, "worker shutting down; re-poll");
+            }
             let _ = done.send(());
             self.done = true;
         }
@@ -491,6 +552,7 @@ impl Worker {
         if snap_err {
             // Local disk failure: revert to last durable, fail the waiters.
             for id in &objects {
+                self.fail_polls(id, "state reverted; re-poll");
                 purge(&mut self.objects, id);
                 self.node
                     .disk
@@ -505,6 +567,12 @@ impl Worker {
             }
             return;
         }
+        // Durable polls are judged against exactly the state this boat
+        // carries — checked here at launch, acked at the commit record by
+        // joining the waiter list pessimistic txns already ride.
+        for id in &objects {
+            waiters.extend(self.take_fired_polls(id, true));
+        }
         self.inflight = Some(objects.into_iter().collect());
         tokio::spawn(ship_task(
             self.node.clone(),
@@ -518,6 +586,16 @@ impl Worker {
         self.inflight = None;
         if ok {
             self.node.stats.ships.fetch_add(1, Ordering::Relaxed);
+            // Durable polls registered mid-flight missed this boat's launch
+            // check. If the object is clean right now, live state IS the
+            // just-landed durable state — judge them against it.
+            for id in &objects {
+                if !self.dirty.contains_key(id) {
+                    for (resp, fired) in self.take_fired_polls(id, true) {
+                        let _ = resp.send(Ok(fired));
+                    }
+                }
+            }
         } else {
             // The boat sank before its commit point: revert every affected
             // object to the last durable state. Optimistic acks inside the
@@ -528,6 +606,10 @@ impl Worker {
                 objects.len()
             );
             for id in &objects {
+                // Parked polls judged optimistic state that just
+                // un-happened; fail them loudly so clients re-poll against
+                // one consistent history.
+                self.fail_polls(id, "state reverted; re-poll");
                 purge(&mut self.objects, id);
                 self.meta.remove(id);
                 self.manifests.remove(id);
@@ -746,6 +828,72 @@ impl Worker {
         self.checkpoint().await;
     }
 
+    /// Re-check this object's parked polls (one durability class per pass).
+    /// Fired polls are removed and returned with their computed reply — the
+    /// caller either sends now (non-durable, or post-landing) or hands them
+    /// to the departing boat's waiter list (durable, at launch). Polls whose
+    /// client vanished are dropped here: lazy cleanup, no unsubscribe
+    /// protocol needed.
+    fn take_fired_polls(&mut self, object: &str, durable_pass: bool) -> Vec<Waiter> {
+        let Some(list) = self.polls.remove(object) else {
+            return Vec::new();
+        };
+        let Some(obj) = self.objects.get(object) else {
+            // Not live (shed): polls keep waiting — the next write
+            // reactivates the object and re-checks.
+            self.polls.insert(object.to_string(), list);
+            return Vec::new();
+        };
+        let mut fired = Vec::new();
+        let mut keep = Vec::new();
+        for (i, p) in list.into_iter().enumerate() {
+            if p.resp.is_closed() {
+                continue;
+            }
+            if p.durable != durable_pass {
+                keep.push(p);
+                continue;
+            }
+            match run_op(&obj.conn, &p.sql, &p.params) {
+                Ok(result) => {
+                    let results = vec![result];
+                    let hash = poll_hash(&results);
+                    if poll_ready(&p.baseline, &results, &hash) {
+                        fired.push((
+                            p.resp,
+                            TxnResponse {
+                                txn_id: format!("w{}-poll-{}", self.id, i),
+                                results,
+                                hash: Some(hash),
+                            },
+                        ));
+                    } else {
+                        keep.push(p);
+                    }
+                }
+                // The schema changed under the query (e.g. DROP TABLE):
+                // surface it rather than parking a poll that can never run.
+                Err(e) => {
+                    let _ = p.resp.send(Err(ApiError::bad_request(e)));
+                }
+            }
+        }
+        if !keep.is_empty() {
+            self.polls.insert(object.to_string(), keep);
+        }
+        fired
+    }
+
+    /// This object's parked polls cannot be honored here anymore
+    /// (migration, revert, shutdown): fail them all so clients re-poll.
+    fn fail_polls(&mut self, object: &str, reason: &str) {
+        if let Some(list) = self.polls.remove(object) {
+            for p in list {
+                let _ = p.resp.send(Err(ApiError::internal(reason.to_string())));
+            }
+        }
+    }
+
     /// Unshipped local state? Then the blob store is stale for this object
     /// and ownership must not move until the boat lands.
     fn unshipped(&self, object: &str) -> bool {
@@ -802,6 +950,10 @@ impl Worker {
     /// writes its checkpoint BEFORE the receiver adds, so no object is ever
     /// durably claimed twice.
     async fn release(&mut self, object: &str, new_owner: Option<usize>) -> TransferMeta {
+        // Re-checks come from the worker that applies writes, and that is
+        // about to be someone else: parked polls can't follow. Re-polling
+        // is already the client's loop, so this is just an error.
+        self.fail_polls(object, "object migrated; re-poll");
         evict(&mut self.objects, object);
         self.manifests.remove(object);
         // The kept file is now commuter cache: ledger may reclaim it.
@@ -900,9 +1052,44 @@ impl Worker {
                 let response = TxnResponse {
                     txn_id: format!("w{}-{}", self.id, txn),
                     results,
+                    hash: None,
                 };
                 if p.read_only {
-                    let _ = p.resp.send(Ok(response));
+                    match p.poll {
+                        // The poll's query just ran at the serialization
+                        // point (queue head, object live): if it doesn't
+                        // fire now, parking here is gapless — every later
+                        // write re-checks it.
+                        Some(po) => {
+                            let object = p.participants[0].clone();
+                            let hash = poll_hash(&response.results);
+                            // A durable poll's condition may only be judged
+                            // against durable state; with unshipped writes,
+                            // discard this run and wait for the boat (its
+                            // launch re-checks against exactly what ships).
+                            if !(po.durable && self.unshipped(&object))
+                                && poll_ready(&po.baseline, &response.results, &hash)
+                            {
+                                let mut response = response;
+                                response.hash = Some(hash);
+                                let _ = p.resp.send(Ok(response));
+                            } else {
+                                let op = &p.ops[0];
+                                self.polls.entry(object).or_default().push(PendingPoll {
+                                    conn: po.conn,
+                                    frame: po.frame,
+                                    sql: op.sql.clone(),
+                                    params: op.params.clone(),
+                                    durable: po.durable,
+                                    baseline: po.baseline,
+                                    resp: p.resp,
+                                });
+                            }
+                        }
+                        None => {
+                            let _ = p.resp.send(Ok(response));
+                        }
+                    }
                 } else {
                     for object in &p.participants {
                         if !self.dirty.contains_key(object) {
@@ -935,6 +1122,11 @@ impl Worker {
                         participants: p.participants.clone(),
                         waiter,
                     });
+                    for object in &p.participants {
+                        for (resp, fired) in self.take_fired_polls(object, false) {
+                            let _ = resp.send(Ok(fired));
+                        }
+                    }
                 }
             }
         }
@@ -1055,6 +1247,7 @@ impl Worker {
         }
         if let Some(e) = commit_err {
             for id in participants {
+                self.fail_polls(id, "state reverted; re-poll");
                 purge(&mut self.objects, id);
                 self.manifests.remove(id);
                 if let Some(bytes) = self.dirty.remove(id) {
@@ -1486,6 +1679,32 @@ fn run_op(conn: &rusqlite::Connection, sql: &str, params: &[Value]) -> Result<Op
             .execute(rusqlite::params_from_iter(params))
             .map_err(|e| e.to_string())?;
         Ok(OpResult::Affected { rows_affected: n })
+    }
+}
+
+/// FNV-1a over the serialized results: the change-detection fingerprint a
+/// client feeds back as `baseline`. Compared only against hashes we minted,
+/// so the exact function is an implementation detail — but keep it stable
+/// across processes (no per-process seeding) so a re-poll after failover
+/// still short-circuits when nothing changed.
+fn poll_hash(results: &[OpResult]) -> String {
+    let bytes = serde_json::to_vec(results).unwrap_or_default();
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in bytes {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    format!("{h:016x}")
+}
+
+/// Does a poll reply now? `baseline` present: when the result changed.
+/// Absent: when the result is non-empty (condition-variable semantics).
+fn poll_ready(baseline: &Option<String>, results: &[OpResult], hash: &str) -> bool {
+    match baseline {
+        Some(b) => b != hash,
+        None => results
+            .first()
+            .is_some_and(|r| matches!(r, OpResult::Rows { rows } if !rows.is_empty())),
     }
 }
 

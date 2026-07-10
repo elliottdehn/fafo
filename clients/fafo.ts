@@ -25,6 +25,26 @@ export type OpResult = { rows: Record<string, unknown>[] } | { rows_affected: nu
 export interface TxnResponse {
   txn_id: string;
   results: OpResult[];
+  /** Poll replies only: feed back as `baseline` for change detection. */
+  hash?: string;
+}
+
+export interface PollOpts {
+  params?: Param[];
+  /** Judge the condition only against durable (shipped) state. */
+  durable?: boolean;
+  /**
+   * Change detection: the reply comes when the result hash differs from
+   * this. Pass "" to bootstrap (immediate snapshot + hash), then feed each
+   * reply's hash back in. Omit entirely for condition-variable semantics
+   * (reply when the result is non-empty).
+   */
+  baseline?: string;
+}
+
+export interface PollResult {
+  rows: Record<string, unknown>[];
+  hash: string;
 }
 
 export class FafoError extends Error {
@@ -85,6 +105,29 @@ export class Fafo {
       { sql, params },
     );
     return out.rows ?? [];
+  }
+
+  /**
+   * Long-poll: resolves when the query's condition holds — non-empty
+   * results, or (with `baseline`) a result hash different from the last
+   * one seen. The subscription is your loop:
+   *
+   *   let cursor = 0;
+   *   for (;;) {
+   *     const { rows } = await db.poll("chan",
+   *       "SELECT * FROM msgs WHERE id > ?1 ORDER BY id", { params: [cursor] });
+   *     for (const m of rows) { handle(m); cursor = m.id as number; }
+   *   }
+   *
+   * On "re-poll" errors (migration, revert, shutdown), just loop again.
+   */
+  async poll(object: string, sql: string, opts?: PollOpts): Promise<PollResult> {
+    const out = await this.call<{ rows?: Record<string, unknown>[]; hash?: string }>(
+      "POST",
+      `/objects/${object}/poll`,
+      { sql, params: opts?.params ?? [], durable: opts?.durable ?? false, baseline: opts?.baseline },
+    );
+    return { rows: out.rows ?? [], hash: out.hash ?? "" };
   }
 
   async objects(): Promise<string[]> {
@@ -160,6 +203,35 @@ export class FafoSocket {
         }),
       );
     });
+  }
+
+  /**
+   * Long-poll as a frame on this socket (the production shape). Same
+   * semantics as Fafo.poll; pin the socket to the object's owner with
+   * FafoSocket.open(base, token, object) first.
+   */
+  poll(object: string, sql: string, opts?: PollOpts): { result: Promise<PollResult>; cancel: () => void } {
+    const id = this.next++;
+    const result = new Promise<TxnResponse>((resolve, reject) => {
+      this.pending.set(id, { resolve, reject });
+      this.ws.send(
+        JSON.stringify({
+          id,
+          poll: {
+            object,
+            sql,
+            params: opts?.params ?? [],
+            durable: opts?.durable ?? false,
+            baseline: opts?.baseline,
+          },
+        }),
+      );
+    }).then((r) => {
+      const first = r.results[0];
+      const rows = first && "rows" in first ? first.rows : [];
+      return { rows, hash: r.hash ?? "" };
+    });
+    return { result, cancel: () => this.ws.send(JSON.stringify({ id, cancel: true })) };
   }
 
   close(): void {

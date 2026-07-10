@@ -6,10 +6,13 @@
 //!                               declared up-front in `objects`
 //!   POST /objects/{id}/exec     single-object transaction (sugar over /txn)
 //!   POST /objects/{id}/query    read-only single statement
+//!   POST /objects/{id}/poll     long-poll: replies when the query's
+//!                               condition holds (non-empty, or hash
+//!                               differs from `baseline`)
 //!   GET  /objects               list object ids
 //!   GET  /stats                 this process's workers, txns, takes, returns
 
-use crate::cluster::{Node, Op, StatsSnapshot, TxnResponse, submit};
+use crate::cluster::{Node, Op, StatsSnapshot, TxnResponse, cancel_poll, submit, submit_poll};
 use axum::extract::{Path as UrlPath, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -64,6 +67,7 @@ pub fn router(node: Node) -> Router {
         .route("/objects", get(list_objects))
         .route("/objects/{id}/exec", post(exec_handler))
         .route("/objects/{id}/query", post(query_handler))
+        .route("/objects/{id}/poll", post(poll_handler))
         .route("/stats", get(stats_handler))
         .route_layer(axum::middleware::from_fn_with_state(
             node.clone(),
@@ -89,11 +93,33 @@ struct WsFrame {
     /// May be omitted: derived from the ops' objects.
     #[serde(default)]
     objects: Vec<String>,
+    #[serde(default)]
     ops: Vec<Op>,
     #[serde(default)]
     read_only: bool,
     #[serde(default)]
     optimistic: bool,
+    /// Long-poll: the reply is held until the query's condition holds.
+    #[serde(default)]
+    poll: Option<PollBody>,
+    /// Abandon the outstanding poll originally sent with this frame's id.
+    #[serde(default)]
+    cancel: bool,
+}
+
+#[derive(Deserialize)]
+struct PollBody {
+    object: String,
+    sql: String,
+    #[serde(default)]
+    params: Vec<serde_json::Value>,
+    /// Judge the condition only against durable (shipped) state.
+    #[serde(default)]
+    durable: bool,
+    /// Change detection: reply when the result hash differs from this
+    /// (from the previous reply). "" bootstraps with an immediate snapshot.
+    #[serde(default)]
+    baseline: Option<String>,
 }
 
 async fn ws_handler(
@@ -132,6 +158,13 @@ async fn ws_handler(
         .on_upgrade(move |socket| ws_conn(node, socket))
 }
 
+/// Connection ids disambiguate parked polls across sockets (and HTTP
+/// requests) for cancellation.
+fn next_conn_id() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
 async fn ws_conn(node: Node, socket: axum::extract::ws::WebSocket) {
     use axum::extract::ws::Message;
     use futures::{SinkExt, StreamExt};
@@ -146,6 +179,12 @@ async fn ws_conn(node: Node, socket: axum::extract::ws::WebSocket) {
             }
         }
     });
+    let conn = next_conn_id();
+    // frame id -> object, for polls parked right now on this connection.
+    // Cancel frames look up here; socket teardown cancels the rest so a
+    // dead client's polls don't linger until the object's next write.
+    let outstanding: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<u64, String>>> =
+        Default::default();
     while let Some(Ok(msg)) = stream.next().await {
         let Message::Text(text) = msg else {
             if matches!(msg, Message::Close(_)) {
@@ -155,29 +194,73 @@ async fn ws_conn(node: Node, socket: axum::extract::ws::WebSocket) {
         };
         let node = node.clone();
         let tx = tx.clone();
+        let outstanding = outstanding.clone();
         tokio::spawn(async move {
-            let reply = handle_ws_frame(&node, text.as_str()).await;
-            let _ = tx.send(reply);
+            if let Some(reply) = handle_ws_frame(&node, conn, &outstanding, text.as_str()).await {
+                let _ = tx.send(reply);
+            }
         });
+    }
+    for (frame, object) in outstanding.lock().unwrap().drain() {
+        cancel_poll(&node, &object, conn, frame);
     }
     drop(tx);
     let _ = writer.await;
 }
 
-async fn handle_ws_frame(node: &Node, text: &str) -> String {
+async fn handle_ws_frame(
+    node: &Node,
+    conn: u64,
+    outstanding: &std::sync::Mutex<std::collections::HashMap<u64, String>>,
+    text: &str,
+) -> Option<String> {
     let frame: WsFrame = match serde_json::from_str(text) {
         Ok(f) => f,
-        Err(e) => return json!({ "id": null, "error": format!("bad frame: {e}") }).to_string(),
+        Err(e) => {
+            return Some(json!({ "id": null, "error": format!("bad frame: {e}") }).to_string());
+        }
     };
+    if frame.cancel {
+        // The canceled poll's own task replies with its error; no ack here.
+        if let Some(object) = outstanding.lock().unwrap().remove(&frame.id) {
+            cancel_poll(node, &object, conn, frame.id);
+        }
+        return None;
+    }
+    if let Some(poll) = frame.poll {
+        outstanding
+            .lock()
+            .unwrap()
+            .insert(frame.id, poll.object.clone());
+        let out = submit_poll(
+            node,
+            poll.object,
+            poll.sql,
+            poll.params,
+            poll.durable,
+            poll.baseline,
+            conn,
+            frame.id,
+        )
+        .await;
+        outstanding.lock().unwrap().remove(&frame.id);
+        return Some(match out {
+            Ok(result) => json!({ "id": frame.id, "result": result }).to_string(),
+            Err(e) => json!({ "id": frame.id, "error": e.message, "status": e.status.as_u16() })
+                .to_string(),
+        });
+    }
     let mut objects = frame.objects;
     if objects.is_empty() {
         objects = frame.ops.iter().map(|op| op.object.clone()).collect();
     }
-    match submit(node, objects, frame.ops, frame.read_only, frame.optimistic).await {
-        Ok(result) => json!({ "id": frame.id, "result": result }).to_string(),
-        Err(e) => json!({ "id": frame.id, "error": e.message, "status": e.status.as_u16() })
-            .to_string(),
-    }
+    Some(
+        match submit(node, objects, frame.ops, frame.read_only, frame.optimistic).await {
+            Ok(result) => json!({ "id": frame.id, "result": result }).to_string(),
+            Err(e) => json!({ "id": frame.id, "error": e.message, "status": e.status.as_u16() })
+                .to_string(),
+        },
+    )
 }
 
 /// Public API auth: if API_TOKEN is configured, require it as a bearer.
@@ -362,6 +445,48 @@ async fn query_handler(
         .pop()
         .ok_or_else(|| ApiError::internal("no result"))?;
     Ok(Json(serde_json::to_value(result)?))
+}
+
+#[derive(Deserialize)]
+struct PollRequest {
+    sql: String,
+    #[serde(default)]
+    params: Vec<Value>,
+    #[serde(default)]
+    durable: bool,
+    #[serde(default)]
+    baseline: Option<String>,
+}
+
+/// HTTP long-poll: the response is held open until the condition holds.
+/// If the client gives up (drops the request), the parked poll is swept
+/// lazily on the object's next write. The WS frame is the production path;
+/// this is the curl-able one.
+async fn poll_handler(
+    State(node): State<Node>,
+    UrlPath(id): UrlPath<String>,
+    Json(req): Json<PollRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let mut res = submit_poll(
+        &node,
+        id,
+        req.sql,
+        req.params,
+        req.durable,
+        req.baseline,
+        next_conn_id(),
+        0,
+    )
+    .await?;
+    let result = res
+        .results
+        .pop()
+        .ok_or_else(|| ApiError::internal("no result"))?;
+    let mut out = serde_json::to_value(result)?;
+    if let (Value::Object(map), Some(hash)) = (&mut out, res.hash) {
+        map.insert("hash".into(), Value::String(hash));
+    }
+    Ok(Json(out))
 }
 
 async fn stats_handler(State(node): State<Node>) -> Json<StatsSnapshot> {

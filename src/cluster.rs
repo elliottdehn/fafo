@@ -52,6 +52,10 @@ pub enum OpResult {
 pub struct TxnResponse {
     pub txn_id: String,
     pub results: Vec<OpResult>,
+    /// Long-poll replies only: hash of `results`, fed back as `baseline` in
+    /// the next poll for gapless change detection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hash: Option<String>,
 }
 
 /// Placement metadata that travels with an object during ownership transfer.
@@ -103,6 +107,8 @@ pub struct WorkerStat {
     pub worker: usize,
     pub txns: u64,
     pub owned_exceptions: usize,
+    /// Long-polls currently parked on this worker's objects.
+    pub parked_polls: usize,
 }
 
 // ------------------------------------------------------------------ routing
@@ -801,12 +807,13 @@ impl NodeInner {
         for (w, tx) in senders {
             let (rtx, rrx) = oneshot::channel();
             if tx.send(WorkerMsg::Stats { resp: rtx }).is_ok()
-                && let Ok((txns, owned_exceptions)) = rrx.await
+                && let Ok((txns, owned_exceptions, parked_polls)) = rrx.await
             {
                 per_worker.push(WorkerStat {
                     worker: w,
                     txns,
                     owned_exceptions,
+                    parked_polls,
                 });
             }
         }
@@ -906,6 +913,7 @@ pub async fn submit_routed(
             participants: ids,
             ops,
             read_only,
+            poll: None,
             optimistic,
             resp: rtx,
         })
@@ -933,6 +941,74 @@ pub async fn submit_routed(
             },
             other => other,
         }
+    }
+}
+
+/// Long-poll a read-only query on one object: the reply arrives when the
+/// condition holds — non-empty results, or (with `baseline`) a result hash
+/// different from the one the client last saw. The initial check rides the
+/// object's txn queue, so parking is gapless: no write can slip between
+/// "checked: empty" and "re-checked on every later write".
+///
+/// Polls are node-local (a parked reply slot can't ride the HTTP RPC): the
+/// caller must sit on the owning node. WS clients pin with /ws?for=; the
+/// edge router sends /objects/{id}/* to the owning instance already.
+#[allow(clippy::too_many_arguments)]
+pub async fn submit_poll(
+    node: &Node,
+    object: String,
+    sql: String,
+    params: Vec<Value>,
+    durable: bool,
+    baseline: Option<String>,
+    conn: u64,
+    frame: u64,
+) -> Result<TxnResponse, ApiError> {
+    if !crate::object::valid_id(&object) {
+        return Err(ApiError::bad_request(format!(
+            "invalid object id: {object:?}"
+        )));
+    }
+    let target = node.routing.read().unwrap().owner_of(&object);
+    let Some(tx) = local_sender(node, target) else {
+        return Err(ApiError::bad_request(format!(
+            "this node does not own {object:?} — poll the owning instance (WS: /ws?for={object})"
+        )));
+    };
+    node.clock.fetch_add(1, Ordering::Relaxed);
+    let (rtx, rrx) = oneshot::channel();
+    tx.send(WorkerMsg::Submit {
+        participants: vec![object.clone()],
+        ops: vec![Op {
+            object,
+            sql,
+            params,
+        }],
+        read_only: true,
+        poll: Some(worker::PollOpts {
+            durable,
+            baseline,
+            conn,
+            frame,
+        }),
+        optimistic: false,
+        resp: rtx,
+    })
+    .map_err(|_| ApiError::internal("worker is gone"))?;
+    rrx.await
+        .map_err(|_| ApiError::internal("poll canceled"))?
+}
+
+/// Abandon a parked poll. Fire-and-forget: a missing worker means the poll
+/// is already gone, and an already-fired poll is a no-op.
+pub fn cancel_poll(node: &Node, object: &str, conn: u64, frame: u64) {
+    let target = node.routing.read().unwrap().owner_of(object);
+    if let Some(tx) = local_sender(node, target) {
+        let _ = tx.send(WorkerMsg::CancelPoll {
+            object: object.to_string(),
+            conn,
+            frame,
+        });
     }
 }
 
@@ -1749,5 +1825,614 @@ mod tests {
         assert_eq!(all, (0..8).collect::<Vec<_>>(), "no overlap, full coverage");
         node_a.shutdown().await;
         node_b.shutdown().await;
+    }
+
+    // ================================================================ polls
+    //
+    // The long-poll battery. A poll is a read-only query whose reply is
+    // held until its condition holds: non-empty results, or (with a
+    // baseline) a result hash different from the last one seen.
+
+    async fn poll_q(
+        node: &Node,
+        object: &str,
+        sql: &str,
+        params: Vec<Value>,
+        durable: bool,
+        baseline: Option<&str>,
+    ) -> Result<TxnResponse, ApiError> {
+        submit_poll(
+            node,
+            object.to_string(),
+            sql.to_string(),
+            params,
+            durable,
+            baseline.map(str::to_string),
+            0,
+            0,
+        )
+        .await
+    }
+
+    fn poll_rows(res: &TxnResponse) -> Vec<Value> {
+        match res.results.first() {
+            Some(OpResult::Rows { rows }) => rows.clone(),
+            _ => Vec::new(),
+        }
+    }
+
+    async fn parked_polls(node: &Node) -> usize {
+        node.stats()
+            .await
+            .per_worker
+            .iter()
+            .map(|w| w.parked_polls)
+            .sum()
+    }
+
+    async fn make_channel(node: &Node, id: &str) {
+        exec(
+            node,
+            &[id],
+            &[(
+                id,
+                "CREATE TABLE msgs (id INTEGER PRIMARY KEY AUTOINCREMENT, body TEXT)",
+            )],
+        )
+        .await
+        .unwrap();
+    }
+
+    async fn publish(node: &Node, id: &str, body: &str, optimistic: bool) {
+        let sql = format!("INSERT INTO msgs (body) VALUES ('{body}')");
+        exec_mode(node, &[id], &[(id, sql.as_str())], optimistic)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn poll_returns_immediately_then_parks_then_fires() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = boot(dir.path(), 4, ClaimSpec::All, "a").await;
+        let chan = id_on_worker(1, 4, "chan");
+        make_channel(&node, &chan).await;
+        publish(&node, &chan, "hello", false).await;
+
+        // Condition already true: immediate reply.
+        let res = poll_q(&node, &chan, "SELECT * FROM msgs WHERE id > 0", vec![], false, None)
+            .await
+            .unwrap();
+        assert_eq!(poll_rows(&res).len(), 1);
+
+        // Condition false: parks. Prove it's parked (no reply in 100ms),
+        // then a publish fires it with exactly the new row.
+        let n2 = node.clone();
+        let c2 = chan.clone();
+        let mut parked = tokio::spawn(async move {
+            poll_q(&n2, &c2, "SELECT * FROM msgs WHERE id > ?1", vec![Value::from(1)], false, None).await
+        });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), &mut parked)
+                .await
+                .is_err(),
+            "poll should park while the condition is false"
+        );
+        assert_eq!(parked_polls(&node).await, 1);
+        publish(&node, &chan, "world", true).await;
+        let res = parked.await.unwrap().unwrap();
+        let rows = poll_rows(&res);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["id"], 2);
+        assert_eq!(rows[0]["body"], "world");
+        assert_eq!(parked_polls(&node).await, 0);
+        node.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn poll_cursor_loop_loses_no_wakeups_under_hammer() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = boot(dir.path(), 4, ClaimSpec::All, "a").await;
+        let chan = id_on_worker(2, 4, "hot");
+        make_channel(&node, &chan).await;
+
+        // 100 concurrent optimistic publishers racing one consumer running
+        // the documented cursor loop. Every message must arrive exactly
+        // once, in order — the registration-at-serialization-point
+        // guarantee means no wakeup is ever lost.
+        let mut writers = Vec::new();
+        for i in 0..100 {
+            let n = node.clone();
+            let c = chan.clone();
+            writers.push(tokio::spawn(async move {
+                publish(&n, &c, &format!("m{i}"), true).await;
+            }));
+        }
+        let mut seen: Vec<i64> = Vec::new();
+        let mut cursor = 0i64;
+        while seen.len() < 100 {
+            let res = poll_q(
+                &node,
+                &chan,
+                "SELECT id FROM msgs WHERE id > ?1 ORDER BY id",
+                vec![Value::from(cursor)],
+                false,
+                None,
+            )
+            .await
+            .unwrap();
+            for row in poll_rows(&res) {
+                let id = row["id"].as_i64().unwrap();
+                seen.push(id);
+                cursor = id;
+            }
+        }
+        for w in writers {
+            w.await.unwrap();
+        }
+        assert_eq!(seen, (1..=100).collect::<Vec<i64>>(), "no gaps, no dupes, in order");
+        node.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn change_detection_bootstraps_sees_deletes_ignores_noops() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = boot(dir.path(), 4, ClaimSpec::All, "a").await;
+        let pres = id_on_worker(1, 4, "presence");
+        exec(
+            &node,
+            &[&pres],
+            &[
+                (&pres, "CREATE TABLE p (u TEXT PRIMARY KEY)"),
+                (&pres, "INSERT INTO p VALUES ('alice'), ('bob')"),
+            ],
+        )
+        .await
+        .unwrap();
+        let view = "SELECT u FROM p ORDER BY u";
+
+        // Empty baseline never matches: immediate bootstrap snapshot.
+        let res = poll_q(&node, &pres, view, vec![], false, Some("")).await.unwrap();
+        assert_eq!(poll_rows(&res).len(), 2);
+        let h1 = res.hash.clone().unwrap();
+
+        // Same baseline: parks. A write that does NOT change the result
+        // must not fire it; a DELETE (shrinking the result!) must.
+        let n2 = node.clone();
+        let p2 = pres.clone();
+        let v2 = view.to_string();
+        let h1c = h1.clone();
+        let mut parked = tokio::spawn(async move {
+            poll_q(&n2, &p2, &v2, vec![], false, Some(&h1c)).await
+        });
+        exec_mode(&node, &[&pres], &[(&pres, "UPDATE p SET u = 'alice' WHERE u = 'alice'")], true)
+            .await
+            .unwrap();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), &mut parked)
+                .await
+                .is_err(),
+            "a write that leaves the result identical must not fire the poll"
+        );
+        exec_mode(&node, &[&pres], &[(&pres, "DELETE FROM p WHERE u = 'bob'")], true)
+            .await
+            .unwrap();
+        let res = parked.await.unwrap().unwrap();
+        assert_eq!(poll_rows(&res).len(), 1, "the leave is visible");
+        assert_ne!(res.hash.clone().unwrap(), h1);
+        node.shutdown().await;
+    }
+
+    /// Delays every blob write, so there's a window where state is applied
+    /// locally but not yet durable.
+    struct SlowStore(FsBlobStore, std::time::Duration);
+
+    #[async_trait::async_trait]
+    impl BlobStore for SlowStore {
+        async fn get(&self, key: &str) -> anyhow::Result<Option<Vec<u8>>> {
+            self.0.get(key).await
+        }
+        async fn put(&self, key: &str, bytes: &[u8]) -> anyhow::Result<()> {
+            tokio::time::sleep(self.1).await;
+            self.0.put(key, bytes).await
+        }
+        async fn delete(&self, key: &str) -> anyhow::Result<()> {
+            self.0.delete(key).await
+        }
+        async fn list(&self, prefix: &str) -> anyhow::Result<Vec<String>> {
+            self.0.list(prefix).await
+        }
+        async fn create(&self, key: &str, bytes: &[u8]) -> anyhow::Result<bool> {
+            self.0.create(key, bytes).await
+        }
+        async fn get_range(&self, key: &str, o: u64, l: u64) -> anyhow::Result<Option<Vec<u8>>> {
+            self.0.get_range(key, o, l).await
+        }
+    }
+
+    async fn boot_with_store(
+        root: &std::path::Path,
+        store: Arc<dyn BlobStore>,
+        logical: usize,
+    ) -> Node {
+        start(NodeConfig {
+            store,
+            live_dir: root.join("live"),
+            logical,
+            claim: ClaimSpec::All,
+            bind: "127.0.0.1:0".into(),
+            advertise: None,
+            hysteresis: 200,
+            secret: "test".into(),
+            api_token: None,
+            max_unshipped: DEFAULT_MAX_UNSHIPPED,
+            limits: crate::limits::Limits::detect(),
+            fence_ttl: std::time::Duration::from_secs(60),
+        })
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn durable_poll_fires_only_after_the_boat_lands() {
+        let dir = tempfile::tempdir().unwrap();
+        let store: Arc<dyn BlobStore> = Arc::new(SlowStore(
+            FsBlobStore::new(dir.path().join("blobs")).unwrap(),
+            std::time::Duration::from_millis(300),
+        ));
+        let node = boot_with_store(dir.path(), store, 4).await;
+        let chan = id_on_worker(1, 4, "chan");
+        make_channel(&node, &chan).await; // pessimistic: waits out boat 1
+
+        // Optimistic publish acks locally; its boat is now in flight for
+        // ~300ms. A non-durable poll sees the row instantly; a durable one
+        // must hold until the commit record is down.
+        publish(&node, &chan, "hello", true).await;
+        let res = poll_q(&node, &chan, "SELECT * FROM msgs", vec![], false, None)
+            .await
+            .unwrap();
+        assert_eq!(poll_rows(&res).len(), 1, "optimistic read sees applied state");
+
+        let started = std::time::Instant::now();
+        let n2 = node.clone();
+        let c2 = chan.clone();
+        let mut durable = tokio::spawn(async move {
+            poll_q(&n2, &c2, "SELECT * FROM msgs", vec![], true, None).await
+        });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), &mut durable)
+                .await
+                .is_err(),
+            "durable poll must not fire from undurable state"
+        );
+        let res = tokio::time::timeout(std::time::Duration::from_secs(5), durable)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(poll_rows(&res).len(), 1);
+        assert!(
+            started.elapsed() >= std::time::Duration::from_millis(200),
+            "reply only after the ship round trip"
+        );
+
+        // Quiescent object: durable state == live state, immediate reply.
+        let res = poll_q(&node, &chan, "SELECT * FROM msgs", vec![], true, None)
+            .await
+            .unwrap();
+        assert_eq!(poll_rows(&res).len(), 1);
+        node.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn parked_polls_fail_on_migration_and_repoll_succeeds() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = boot(dir.path(), 8, ClaimSpec::All, "a").await;
+        let chan = id_on_worker(1, 8, "chan");
+        let d1 = id_on_worker(6, 8, "d1");
+        let d2 = id_on_worker(6, 8, "d2");
+        make_channel(&node, &chan).await;
+        make_account(&node, &d1).await;
+        make_account(&node, &d2).await;
+
+        let n2 = node.clone();
+        let c2 = chan.clone();
+        let parked = tokio::spawn(async move {
+            poll_q(&n2, &c2, "SELECT * FROM msgs WHERE id > 99", vec![], false, None).await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(parked_polls(&node).await, 1);
+
+        // Plurality drags chan to worker 6: its parked poll must fail
+        // loudly, not dangle.
+        exec(
+            &node,
+            &[&chan, &d1, &d2],
+            &[(&chan, "INSERT INTO msgs (body) VALUES ('x')")],
+        )
+        .await
+        .unwrap();
+        let err = parked.await.unwrap().unwrap_err();
+        assert!(
+            err.message.contains("re-poll"),
+            "poll should say re-poll, got: {}",
+            err.message
+        );
+
+        // The documented client contract: just poll again. Retry through
+        // any further migrations (hysteresis may bounce the object home).
+        let res = loop {
+            match poll_q(&node, &chan, "SELECT * FROM msgs WHERE id > 0", vec![], false, None).await
+            {
+                Ok(res) => break res,
+                Err(e) if e.message.contains("re-poll") => continue,
+                Err(e) => panic!("unexpected: {}", e.message),
+            }
+        };
+        assert_eq!(poll_rows(&res).len(), 1);
+        node.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn parked_polls_survive_shedding() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = boot(dir.path(), 4, ClaimSpec::All, "a").await;
+        let chan = id_on_worker(1, 4, "chan");
+        make_channel(&node, &chan).await;
+
+        let n2 = node.clone();
+        let c2 = chan.clone();
+        let parked = tokio::spawn(async move {
+            poll_q(&n2, &c2, "SELECT * FROM msgs", vec![], false, None).await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(parked_polls(&node).await, 1);
+
+        // Deactivate the (clean, idle) object out from under the poll.
+        let owner = { node.routing.read().unwrap().owner_of(&chan) };
+        local_sender(&node, owner)
+            .unwrap()
+            .send(WorkerMsg::Shed)
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(parked_polls(&node).await, 1, "poll waits through eviction");
+
+        // The next write reactivates the object and the poll fires.
+        publish(&node, &chan, "back", false).await;
+        let res = parked.await.unwrap().unwrap();
+        assert_eq!(poll_rows(&res).len(), 1);
+        node.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn poll_rejects_writes_and_bad_objects() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = boot(dir.path(), 4, ClaimSpec::All, "a").await;
+        let chan = id_on_worker(1, 4, "chan");
+        make_channel(&node, &chan).await;
+
+        let err = poll_q(&node, &chan, "INSERT INTO msgs (body) VALUES ('sneaky')", vec![], false, None)
+            .await
+            .unwrap_err();
+        assert_eq!(err.status, axum::http::StatusCode::BAD_REQUEST);
+
+        let err = poll_q(&node, "_lease/nope", "SELECT 1", vec![], false, None)
+            .await
+            .unwrap_err();
+        assert_eq!(err.status, axum::http::StatusCode::BAD_REQUEST);
+        node.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn abandoned_and_canceled_polls_get_cleaned_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = boot(dir.path(), 4, ClaimSpec::All, "a").await;
+        let chan = id_on_worker(1, 4, "chan");
+        make_channel(&node, &chan).await;
+
+        // Abandoned: the client task dies (reply slot dropped). The park
+        // survives until the next write re-check sweeps it — no reply, no
+        // panic, no leak.
+        let n2 = node.clone();
+        let c2 = chan.clone();
+        let abandoned = tokio::spawn(async move {
+            poll_q(&n2, &c2, "SELECT * FROM msgs WHERE id > 99", vec![], false, None).await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        abandoned.abort();
+        let _ = abandoned.await;
+        assert_eq!(parked_polls(&node).await, 1, "swept lazily, not synchronously");
+        publish(&node, &chan, "sweep", false).await;
+        assert_eq!(parked_polls(&node).await, 0);
+
+        // Canceled: explicit cancel resolves the caller with an error.
+        let n3 = node.clone();
+        let c3 = chan.clone();
+        let canceled = tokio::spawn(async move {
+            submit_poll(
+                &n3,
+                c3,
+                "SELECT * FROM msgs WHERE id > 99".into(),
+                vec![],
+                false,
+                None,
+                7,
+                42,
+            )
+            .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        cancel_poll(&node, &chan, 7, 42);
+        let err = canceled.await.unwrap().unwrap_err();
+        assert!(err.message.contains("canceled"), "got: {}", err.message);
+        assert_eq!(parked_polls(&node).await, 0);
+        node.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn concurrent_polls_fire_independently() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = boot(dir.path(), 4, ClaimSpec::All, "a").await;
+        let acct = id_on_worker(1, 4, "acct");
+        make_account(&node, &acct).await; // balance 100
+
+        let n1 = node.clone();
+        let a1 = acct.clone();
+        let low = tokio::spawn(async move {
+            poll_q(&n1, &a1, "SELECT balance FROM account WHERE balance < 50", vec![], false, None).await
+        });
+        let n2 = node.clone();
+        let a2 = acct.clone();
+        let mut high = tokio::spawn(async move {
+            poll_q(&n2, &a2, "SELECT balance FROM account WHERE balance > 500", vec![], false, None).await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(parked_polls(&node).await, 2);
+
+        // Drop to 40: fires "low" only.
+        exec(&node, &[&acct], &[(&acct, "UPDATE account SET balance = 40")])
+            .await
+            .unwrap();
+        let res = low.await.unwrap().unwrap();
+        assert_eq!(poll_rows(&res)[0]["balance"], 40);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), &mut high)
+                .await
+                .is_err(),
+            "the other condition still doesn't hold"
+        );
+        exec(&node, &[&acct], &[(&acct, "UPDATE account SET balance = 900")])
+            .await
+            .unwrap();
+        let res = high.await.unwrap().unwrap();
+        assert_eq!(poll_rows(&res)[0]["balance"], 900);
+        node.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn transactional_outbox_wakes_the_subscriber_atomically() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = boot(dir.path(), 8, ClaimSpec::All, "a").await;
+        let alice = id_on_worker(1, 8, "alice");
+        let chan = id_on_worker(6, 8, "orders");
+        let anchor = id_on_worker(6, 8, "anchor");
+        make_account(&node, &alice).await;
+        make_account(&node, &anchor).await;
+        make_channel(&node, &chan).await;
+
+        let n2 = node.clone();
+        let c2 = chan.clone();
+        let sub = tokio::spawn(async move {
+            poll_q(&n2, &c2, "SELECT body FROM msgs WHERE id > 0", vec![], false, None).await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // One atomic txn: state change + publish. The anchor keeps the
+        // channel's worker in the plurality so the parked poll isn't
+        // migrated away mid-test.
+        exec(
+            &node,
+            &[&alice, &chan, &anchor],
+            &[
+                (&alice, "UPDATE account SET balance = balance - 60"),
+                (&chan, "INSERT INTO msgs (body) VALUES ('order:alice:60')"),
+            ],
+        )
+        .await
+        .unwrap();
+        let res = sub.await.unwrap().unwrap();
+        assert_eq!(poll_rows(&res)[0]["body"], "order:alice:60");
+        assert_eq!(balance(&node, &alice).await, 40);
+        node.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn poll_on_cold_object_activates_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = boot(dir.path(), 4, ClaimSpec::All, "a").await;
+        let chan = id_on_worker(1, 4, "chan");
+        make_channel(&node, &chan).await;
+        publish(&node, &chan, "persisted", false).await;
+        node.shutdown().await;
+
+        // Fresh node, empty local disk: the poll itself must pull the
+        // object out of the blob store.
+        let node2 = boot(dir.path(), 4, ClaimSpec::All, "b").await;
+        let res = poll_q(&node2, &chan, "SELECT body FROM msgs", vec![], false, None)
+            .await
+            .unwrap();
+        assert_eq!(poll_rows(&res)[0]["body"], "persisted");
+        node2.shutdown().await;
+    }
+
+    /// Store that can be told to start failing writes: sinks the boat.
+    struct FlakyStore(FsBlobStore, std::sync::atomic::AtomicBool);
+
+    #[async_trait::async_trait]
+    impl BlobStore for FlakyStore {
+        async fn get(&self, key: &str) -> anyhow::Result<Option<Vec<u8>>> {
+            self.0.get(key).await
+        }
+        async fn put(&self, key: &str, bytes: &[u8]) -> anyhow::Result<()> {
+            if self.1.load(Ordering::Relaxed) {
+                anyhow::bail!("injected put failure");
+            }
+            self.0.put(key, bytes).await
+        }
+        async fn delete(&self, key: &str) -> anyhow::Result<()> {
+            self.0.delete(key).await
+        }
+        async fn list(&self, prefix: &str) -> anyhow::Result<Vec<String>> {
+            self.0.list(prefix).await
+        }
+        async fn create(&self, key: &str, bytes: &[u8]) -> anyhow::Result<bool> {
+            if self.1.load(Ordering::Relaxed) {
+                anyhow::bail!("injected create failure");
+            }
+            self.0.create(key, bytes).await
+        }
+        async fn get_range(&self, key: &str, o: u64, l: u64) -> anyhow::Result<Option<Vec<u8>>> {
+            self.0.get_range(key, o, l).await
+        }
+    }
+
+    #[tokio::test]
+    async fn parked_polls_fail_when_the_boat_sinks() {
+        let dir = tempfile::tempdir().unwrap();
+        let flaky = Arc::new(FlakyStore(
+            FsBlobStore::new(dir.path().join("blobs")).unwrap(),
+            std::sync::atomic::AtomicBool::new(false),
+        ));
+        let store: Arc<dyn BlobStore> = flaky.clone();
+        let node = boot_with_store(dir.path(), store, 4).await;
+        let chan = id_on_worker(1, 4, "chan");
+        make_channel(&node, &chan).await;
+
+        let n2 = node.clone();
+        let c2 = chan.clone();
+        let parked = tokio::spawn(async move {
+            poll_q(&n2, &c2, "SELECT * FROM msgs WHERE id > 99", vec![], false, None).await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // The optimistic write acks, then its boat sinks: the object
+        // reverts to last-durable and the parked poll — which was judged
+        // against state that no longer exists — must fail, not dangle.
+        flaky.1.store(true, Ordering::Relaxed);
+        publish(&node, &chan, "doomed", true).await;
+        let err = tokio::time::timeout(std::time::Duration::from_secs(5), parked)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert!(err.message.contains("re-poll"), "got: {}", err.message);
+
+        // Heal the store; the channel reverts to durable state (no rows)
+        // and keeps working.
+        flaky.1.store(false, Ordering::Relaxed);
+        let res = poll_q(&node, &chan, "SELECT COUNT(*) AS c FROM msgs", vec![], false, Some(""))
+            .await
+            .unwrap();
+        assert_eq!(poll_rows(&res)[0]["c"], 0, "the doomed row un-happened");
+        node.shutdown().await;
     }
 }

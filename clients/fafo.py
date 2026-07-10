@@ -85,6 +85,34 @@ class Fafo:
         out = self._call("POST", f"/objects/{obj}/query", {"sql": sql, "params": params or []})
         return out.get("rows", [])
 
+    def poll(self, obj, sql, params=None, durable=False, baseline=None, timeout=300):
+        """Long-poll: returns (rows, hash) once the query's condition holds.
+
+        No baseline: replies when the result is non-empty (a condition
+        variable over SQL — NOT EXISTS, aggregates, thresholds all work).
+        baseline="" bootstraps change detection with an immediate snapshot;
+        feed each reply's hash back in to be woken only on change.
+
+        The subscription is your loop; on a "re-poll" error (migration,
+        revert, shutdown), just call again:
+
+            cursor = 0
+            while True:
+                rows, _ = db.poll("chan",
+                    "SELECT * FROM msgs WHERE id > ?1 ORDER BY id", [cursor])
+                for m in rows:
+                    handle(m); cursor = m["id"]
+        """
+        body = {"sql": sql, "params": params or [], "durable": durable}
+        if baseline is not None:
+            body["baseline"] = baseline
+        old_timeout, self.timeout = self.timeout, timeout
+        try:
+            out = self._call("POST", f"/objects/{obj}/poll", body)
+        finally:
+            self.timeout = old_timeout
+        return out.get("rows", []), out.get("hash", "")
+
     def objects(self):
         return self._call("GET", "/objects")["objects"]
 
