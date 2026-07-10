@@ -118,6 +118,16 @@ export default {
       );
     }
 
+    // WebSocket connections pin to an instance: ?for=<object> routes the
+    // socket to that object's owner so frames never hairpin.
+    if (url.pathname === "/ws") {
+      const hint = url.searchParams.get("for");
+      const name = hint
+        ? instanceFor(defaultWorker(hint, LOGICAL_WORKERS), fleet)
+        : `fafo-${Math.floor(Math.random() * fleet)}`;
+      return env.FAFO_NODE.getByName(name).fetch(request);
+    }
+
     // Everything else (/objects list, /stats, /healthz): spread randomly.
     const name = `fafo-${Math.floor(Math.random() * fleet)}`;
     return env.FAFO_NODE.getByName(name).fetch(request); // fetch() auto-starts
