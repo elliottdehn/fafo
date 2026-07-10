@@ -29,7 +29,7 @@ const LOGICAL_WORKERS = 64;
 
 export class FafoNode extends Container<Env> {
   defaultPort = 8080;
-  sleepAfter = "10m";
+  sleepAfter = "2h";
   enableInternet = true; // outbound HTTPS to R2
 
   constructor(ctx: DurableObjectState, env: Env) {
@@ -62,7 +62,6 @@ export default {
     const m = url.pathname.match(/^\/internal\/instance\/([\w-]+)(\/.*)$/);
     if (m) {
       const instance = env.FAFO_NODE.getByName(m[1]);
-      await instance.startAndWaitForPorts();
       url.pathname = m[2];
       return instance.fetch(new Request(url.toString(), request));
     }
@@ -70,8 +69,6 @@ export default {
     // Public API: pick any instance; fafo routes internally from there.
     const fleet = Number(env.FAFO_INSTANCES ?? "1");
     const name = `fafo-${Math.floor(Math.random() * fleet)}`;
-    const instance = env.FAFO_NODE.getByName(name);
-    await instance.startAndWaitForPorts();
-    return instance.fetch(request);
+    return env.FAFO_NODE.getByName(name).fetch(request); // fetch() auto-starts
   },
 };

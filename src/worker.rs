@@ -1168,8 +1168,19 @@ async fn ship_task(
 
     match err {
         None => {
-            // Committed. Promotion is pure roll-forward: on failure the
-            // record and staging stay behind and recover() finishes at boot.
+            // COMMITTED — the record landed, so ack the waiters NOW.
+            // Promotion and cleanup are pure roll-forward that recovery
+            // would redo anyway; making clients wait for them was measured
+            // at ~2.3s of the pessimistic ack against real R2. The internal
+            // ShipDone stays at the END: it unlocks takes and the next
+            // boat, both of which must see promoted state.
+            node.stats
+                .bytes_shipped
+                .fetch_add(payload_bytes, Ordering::Relaxed);
+            for (resp, response) in waiters {
+                let _ = resp.send(Ok(response));
+            }
+
             let mut promoted = true;
             for item in &items {
                 let (key, bytes) = match &item.payload {
@@ -1208,12 +1219,6 @@ async fn ship_task(
                         }
                     }
                 }
-            }
-            node.stats
-                .bytes_shipped
-                .fetch_add(payload_bytes, Ordering::Relaxed);
-            for (resp, response) in waiters {
-                let _ = resp.send(Ok(response));
             }
             let _ = reply.send(WorkerMsg::ShipDone { objects, ok: true });
         }
