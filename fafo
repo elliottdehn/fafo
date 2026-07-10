@@ -58,16 +58,11 @@ case "${1:-}" in
 
   fafo is up — this terminal is the database (Ctrl-C stops it cleanly).
 
-  try it from another terminal:
+  try it from another terminal (each command is one line — triple-click):
 
-    curl -X POST localhost:$PORT/objects/hello/exec \
-      -H 'content-type: application/json' \
-      -d '{"ops":[{"sql":"CREATE TABLE IF NOT EXISTS notes (body TEXT)"},
-                  {"sql":"INSERT INTO notes VALUES (?1)","params":["hello fafo"]}]}'
+    curl -XPOST localhost:$PORT/objects/hello/exec -H 'content-type: application/json' -d '{"ops":[{"sql":"CREATE TABLE IF NOT EXISTS notes (body TEXT)"},{"sql":"INSERT INTO notes VALUES (?1)","params":["hello fafo"]}]}'
 
-    curl -X POST localhost:$PORT/objects/hello/query \
-      -H 'content-type: application/json' \
-      -d '{"sql":"SELECT * FROM notes"}'
+    curl -XPOST localhost:$PORT/objects/hello/query -H 'content-type: application/json' -d '{"sql":"SELECT * FROM notes"}'
 
   that "hello" object is its own SQLite database; state survives restarts
   in $DATA. cross-object transactions, long-polls, WebSockets: AGENTS.md.
