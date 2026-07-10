@@ -38,11 +38,47 @@ survives stop/start/kill -9; `nuke` is the only thing that deletes data.
   often) are fast; the system learns co-access patterns and migrates
   objects to minimize coordination. You don't manage placement.
 
-## HTTP API
+## WebSocket: the production connection
 
-Base URL: `http://127.0.0.1:8787`. All bodies are JSON
-(`content-type: application/json`). Errors: `{"error": "..."}` with 4xx/5xx.
-If the server was started with `API_TOKEN`, send `Authorization: Bearer <token>`.
+Treat the WebSocket as your database connection; HTTP is for debugging,
+curl, and one-off scripts. The difference is not cosmetic: each HTTP
+request pays the full per-request platform path, while frames on an
+established socket pay raw network RTT (measured in production: 41ms
+frames vs ~100ms+ per HTTP request, and vs seconds when routing is cold).
+
+```
+GET /ws?token=<API_TOKEN>&for=<object>
+```
+
+`for` pins the socket to that object's owner instance — set it to the
+object (or tenant) this connection will mostly touch, or frames for it pay
+an inter-instance hairpin. One socket, many transactions, pipelined:
+
+```jsonc
+// -> frame            (id is yours, echoed back; objects may be omitted —
+//                      they're inferred from the ops)
+{ "id": 1, "ops": [{ "object": "alice", "sql": "UPDATE ...", "params": [1] }],
+  "optimistic": true, "read_only": false }
+// <- reply
+{ "id": 1, "result": { "txn_id": "w17-4", "results": [ ... ] } }
+// <- or
+{ "id": 1, "error": "op failed, transaction rolled back: ...", "status": 400 }
+```
+
+Replies can arrive out of order (frames execute concurrently) — correlate
+by `id`. `clients/fafo.ts` ships `FafoSocket` doing exactly this:
+
+```ts
+const conn = await new Fafo(url, token).connect();
+await conn.txn([{ object: "alice", sql: "..." }]);
+```
+
+## HTTP API (debugging & scripts)
+
+Same transactions, one request each. Base URL: `http://127.0.0.1:8787`.
+All bodies are JSON (`content-type: application/json`). Errors:
+`{"error": "..."}` with 4xx/5xx. If the server was started with
+`API_TOKEN`, send `Authorization: Bearer <token>`.
 
 ### POST /txn — atomic cross-object transaction
 
