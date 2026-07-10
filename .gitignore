@@ -2,3 +2,9 @@
 /data
 /data-cluster
 __pycache__/
+deploy/.secrets
+.wrangler/
+deploy/.wrangler/
+deploy/node_modules/
+deploy/.secrets
+deploy/.r2-creds

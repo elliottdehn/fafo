@@ -30,6 +30,6 @@
   "migrations": [{ "tag": "v1", "new_sqlite_classes": ["FafoNode"] }],
   "vars": {
     "FAFO_INSTANCES": "4",
-    "PUBLIC_URL": "https://fafo.example.workers.dev"
+    "PUBLIC_URL": "https://fafo.dehnbostele.workers.dev"
   }
 }
