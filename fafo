@@ -24,7 +24,10 @@ case "${1:-}" in
       echo "fafo already up on http://127.0.0.1:$PORT (pid $(cat "$PIDFILE"))"
       exit 0
     fi
-    cargo build --release --quiet
+    if [ ! -x ./target/release/fafo ]; then
+      echo "first run: building fafo (bundled SQLite compiles too — a few minutes)..."
+    fi
+    cargo build --release
     mkdir -p "$DATA"
     DATA_DIR=$DATA PORT=$PORT nohup ./target/release/fafo >> "$LOG" 2>&1 &
     echo $! > "$PIDFILE"
