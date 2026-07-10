@@ -268,9 +268,21 @@ the same protocol. Ranked last on purpose:
 
 ## Sequencing
 
-Phase 0 is next and is worth building regardless of ambition — it is the
-watch feature on its own merits (long-poll shape). Phases 1–2 are small (wills are ordinary
-txns on socket close; temp tables are mostly an update-hook check) and turn
-the demo from "database with notifications" into "realtime app backend."
-Phase 3 is the commercial unlock. Phase 4 waits until something real demands
-it.
+**Status: Phases 0–3 shipped** (45 Rust tests + live WS/HTTP verification
+for each). Notes from the build, where reality improved on the plan:
+
+- Phase 0 (long-poll): as designed; the change-detection `baseline` hash
+  covers live views without any diff engine.
+- Phase 1 (wills): as designed, plus wills execute under the grants frozen
+  at arm time — an expired token still keeps its already-authorized
+  promise.
+- Phase 2 (temp tables): detection ended up cleaner than the update-hook
+  idea — the SQLite header change counter (which delta shipping already
+  trusts) says whether a commit touched the main file. Bonus: no-op writes
+  ship nothing either.
+- Phase 3 (capabilities): verbs became granular — read / insert / update /
+  delete / ddl / poll ("write" = shorthand) — because append-to-a-log and
+  rewrite-history are different powers. Enforcement is SQLite's authorizer
+  at prepare time, so trigger cascades and CTEs can't smuggle verbs.
+
+Phase 4 (reactive transactions) waits until something real demands it.
