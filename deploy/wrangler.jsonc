@@ -1,0 +1,35 @@
+// fafo on Cloudflare Containers.
+//
+// Secrets (set with `wrangler secret put <NAME>`):
+//   CLUSTER_SECRET        shared secret for inter-node RPC
+//   API_TOKEN             bearer token for the public API
+//   R2_ACCOUNT_ID         account for <account>.r2.cloudflarestorage.com
+//   R2_BUCKET             bucket holding all fafo state
+//   R2_ACCESS_KEY_ID      R2 API token credentials
+//   R2_SECRET_ACCESS_KEY
+//
+// Vars:
+//   FAFO_INSTANCES        fleet size; each instance auto-claims
+//                         ceil(LOGICAL_WORKERS / FAFO_INSTANCES) workers
+//   PUBLIC_URL            the deployed Worker URL, e.g. https://fafo.example.workers.dev
+{
+  "name": "fafo",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-07-09",
+  "containers": [
+    {
+      "class_name": "FafoNode",
+      "image": "../Dockerfile",
+      "instance_type": "standard-1",
+      "max_instances": 4
+    }
+  ],
+  "durable_objects": {
+    "bindings": [{ "name": "FAFO_NODE", "class_name": "FafoNode" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["FafoNode"] }],
+  "vars": {
+    "FAFO_INSTANCES": "4",
+    "PUBLIC_URL": "https://fafo.example.workers.dev"
+  }
+}

@@ -1,0 +1,72 @@
+#!/bin/sh
+# fafo — run the local instance like infrastructure: start it, forget it.
+#
+#   ./fafo up        build if needed, start in background, wait until healthy
+#   ./fafo down      graceful stop (SIGTERM -> leases tombstoned)
+#   ./fafo status    liveness + placement stats
+#   ./fafo logs [n]  tail the log
+#   ./fafo nuke      stop and wipe all local state
+set -e
+cd "$(dirname "$0")"
+
+PORT=${FAFO_PORT:-8787}
+DATA=${FAFO_DATA:-./data}
+PIDFILE=$DATA/fafo.pid
+LOG=$DATA/fafo.log
+
+running() {
+  [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null
+}
+
+case "${1:-}" in
+  up)
+    if running; then
+      echo "fafo already up on http://127.0.0.1:$PORT (pid $(cat "$PIDFILE"))"
+      exit 0
+    fi
+    cargo build --release --quiet
+    mkdir -p "$DATA"
+    DATA_DIR=$DATA PORT=$PORT nohup ./target/release/fafo >> "$LOG" 2>&1 &
+    echo $! > "$PIDFILE"
+    i=0
+    while [ $i -lt 50 ]; do
+      if curl -sf "http://127.0.0.1:$PORT/healthz" > /dev/null 2>&1; then
+        echo "fafo up on http://127.0.0.1:$PORT (pid $(cat "$PIDFILE"), data in $DATA)"
+        exit 0
+      fi
+      i=$((i + 1))
+      sleep 0.1
+    done
+    echo "fafo failed to become healthy; last log lines:" >&2
+    tail -5 "$LOG" >&2
+    exit 1
+    ;;
+  down)
+    if running; then
+      kill "$(cat "$PIDFILE")" && rm -f "$PIDFILE" && echo "fafo stopped (state kept in $DATA)"
+    else
+      echo "fafo is not running"
+    fi
+    ;;
+  status)
+    if running; then
+      curl -s "http://127.0.0.1:$PORT/stats"
+      echo
+    else
+      echo "fafo is not running"
+      exit 1
+    fi
+    ;;
+  logs)
+    tail -n "${2:-50}" "$LOG"
+    ;;
+  nuke)
+    if running; then kill "$(cat "$PIDFILE")" 2>/dev/null || true; fi
+    rm -rf "$DATA"
+    echo "fafo stopped and all local state wiped"
+    ;;
+  *)
+    echo "usage: ./fafo {up|down|status|logs [n]|nuke}" >&2
+    exit 1
+    ;;
+esac
