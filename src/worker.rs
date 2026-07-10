@@ -51,6 +51,10 @@ pub enum WorkerMsg {
         participants: Vec<String>,
         ops: Vec<Op>,
         read_only: bool,
+        /// Optimistic txns are acked after local apply and ship in the next
+        /// boat; pessimistic txns hold their ack until the boat is durable
+        /// (and thereby act as flush barriers for everything before them).
+        optimistic: bool,
         resp: oneshot::Sender<Result<TxnResponse, ApiError>>,
     },
     /// Another worker wants this object. Queued in the object's FIFO like
@@ -71,6 +75,15 @@ pub enum WorkerMsg {
         object: String,
         from: usize,
         result: TakenResult,
+    },
+    /// Internal: the in-flight boat finished shipping.
+    ShipDone {
+        objects: Vec<String>,
+        ok: bool,
+    },
+    /// Flush the final boat, then stop.
+    Shutdown {
+        resp: oneshot::Sender<()>,
     },
     Stats {
         resp: oneshot::Sender<(u64, usize)>,
@@ -96,6 +109,7 @@ struct Parked {
     participants: Vec<String>,
     ops: Vec<Op>,
     read_only: bool,
+    optimistic: bool,
     resp: oneshot::Sender<Result<TxnResponse, ApiError>>,
     /// How many participants (in sorted order) we hold queue heads for.
     acquired: usize,
@@ -124,6 +138,16 @@ struct Worker {
     parked: HashMap<u64, Parked>,
     next_txn: u64,
     txns_executed: u64,
+    /// Boat state. Objects with locally-committed, not-yet-shipped writes.
+    dirty: HashSet<String>,
+    /// Objects in the currently shipping boat (at most one boat in flight;
+    /// the next launches the moment it lands, if anything is dirty).
+    inflight: Option<HashSet<String>>,
+    /// Pessimistic txns applied locally, acked when their boat lands.
+    boat_waiters: Vec<(oneshot::Sender<Result<TxnResponse, ApiError>>, TxnResponse)>,
+    /// Set while draining for shutdown; answered when the last boat lands.
+    closing: Option<oneshot::Sender<()>>,
+    done: bool,
 }
 
 pub fn spawn(node: Node, id: usize, live_dir: PathBuf) -> anyhow::Result<mpsc::UnboundedSender<WorkerMsg>> {
@@ -151,10 +175,18 @@ pub fn spawn(node: Node, id: usize, live_dir: PathBuf) -> anyhow::Result<mpsc::U
         parked: HashMap::new(),
         next_txn: 0,
         txns_executed: 0,
+        dirty: HashSet::new(),
+        inflight: None,
+        boat_waiters: Vec::new(),
+        closing: None,
+        done: false,
     };
     tokio::spawn(async move {
         while let Some(msg) = rx.recv().await {
             worker.handle(msg).await;
+            if worker.done {
+                break;
+            }
         }
     });
     Ok(tx)
@@ -175,6 +207,7 @@ impl Worker {
                 participants,
                 ops,
                 read_only,
+                optimistic,
                 resp,
             } => {
                 let txn = self.next_txn;
@@ -185,6 +218,7 @@ impl Worker {
                         participants,
                         ops,
                         read_only,
+                        optimistic,
                         resp,
                         acquired: 0,
                         taking: false,
@@ -224,10 +258,102 @@ impl Worker {
                 from,
                 result,
             } => self.on_taken(txn, object, from, result).await,
+            WorkerMsg::ShipDone { objects, ok } => self.on_ship_done(objects, ok).await,
+            WorkerMsg::Shutdown { resp } => {
+                self.closing = Some(resp);
+                self.maybe_launch();
+                self.maybe_finish_closing();
+            }
             WorkerMsg::Stats { resp } => {
                 let _ = resp.send((self.txns_executed, self.owned.len()));
             }
         }
+    }
+
+    fn maybe_finish_closing(&mut self) {
+        if self.inflight.is_none()
+            && self.dirty.is_empty()
+            && let Some(done) = self.closing.take()
+        {
+            let _ = done.send(());
+            self.done = true;
+        }
+    }
+
+    /// Launch a boat if nothing is in flight and there's dirty state.
+    /// No timer: ships leave as often as possible, so batch size adapts to
+    /// load — one txn per boat when quiet, everything that accumulated
+    /// during the last round trip when busy.
+    fn maybe_launch(&mut self) {
+        if self.inflight.is_some() || self.dirty.is_empty() {
+            return;
+        }
+        // Snapshot synchronously: we're between applies, a txn boundary.
+        let objects: Vec<String> = self.dirty.drain().collect();
+        let mut snapshots = Vec::with_capacity(objects.len());
+        let mut snap_err = false;
+        for id in &objects {
+            match std::fs::read(&self.objects.get(id).expect("dirty object is live").live_path) {
+                Ok(bytes) => snapshots.push(bytes),
+                Err(_) => {
+                    snap_err = true;
+                    break;
+                }
+            }
+        }
+        if snap_err {
+            // Local disk failure: revert to last durable, fail the waiters.
+            for id in &objects {
+                evict(&mut self.objects, id);
+                self.meta.remove(id);
+            }
+            for (resp, _) in self.boat_waiters.drain(..) {
+                let _ = resp.send(Err(ApiError::internal("snapshot failed; state reverted")));
+            }
+            return;
+        }
+        let waiters = std::mem::take(&mut self.boat_waiters);
+        self.inflight = Some(objects.iter().cloned().collect());
+        tokio::spawn(ship_task(
+            self.node.clone(),
+            self.self_tx.clone(),
+            objects,
+            snapshots,
+            waiters,
+        ));
+    }
+
+    async fn on_ship_done(&mut self, objects: Vec<String>, ok: bool) {
+        self.inflight = None;
+        if ok {
+            self.node.stats.ships.fetch_add(1, Ordering::Relaxed);
+        } else {
+            // The boat sank before its commit point: revert every affected
+            // object to the last durable state. Optimistic acks inside the
+            // boat are lost — that is the documented optimistic contract.
+            eprintln!(
+                "w{}: ship failed; reverting {} objects to last durable state",
+                self.id,
+                objects.len()
+            );
+            for id in &objects {
+                evict(&mut self.objects, id);
+                self.meta.remove(id);
+                self.dirty.remove(id);
+            }
+        }
+        // Next boat first, so takes/returns below see accurate dirty state.
+        self.maybe_launch();
+        let mut ready = Vec::new();
+        for id in &objects {
+            if self.queues.contains_key(id) {
+                ready.extend(self.service_front(id).await);
+            } else if !self.dirty.contains(id) {
+                self.maybe_return_home(id).await;
+            }
+        }
+        self.maybe_finish_closing();
+        self.pump(ready).await;
     }
 
     /// Drive txns forward until everything is parked or done.
@@ -349,6 +475,16 @@ impl Worker {
         self.checkpoint().await;
     }
 
+    /// Unshipped local state? Then the blob store is stale for this object
+    /// and ownership must not move until the boat lands.
+    fn unshipped(&self, object: &str) -> bool {
+        self.dirty.contains(object)
+            || self
+                .inflight
+                .as_ref()
+                .is_some_and(|boat| boat.contains(object))
+    }
+
     /// Serve whatever is at the head of an object's queue. Returns txn ids
     /// ready to be pumped.
     async fn service_front(&mut self, object: &str) -> Vec<u64> {
@@ -357,6 +493,11 @@ impl Worker {
         };
         match queue.front() {
             Some(Entry::Txn(t)) => vec![*t],
+            // A take must wait for the object's state to be durable — the
+            // receiver activates from the blob store. Boats ship as soon as
+            // anything is dirty, so this resolves within one or two
+            // ShipDones, which re-service this queue.
+            Some(Entry::Take { .. }) if self.unshipped(object) => vec![],
             Some(Entry::Take { .. }) => self.grant_front(object).await,
             None => vec![],
         }
@@ -471,14 +612,32 @@ impl Worker {
             });
         }
 
-        let result = self
-            .execute(&p.participants, &p.ops, p.read_only)
-            .await
-            .map(|results| TxnResponse {
-                txn_id: format!("w{}-{}", self.id, txn),
-                results,
-            });
-        let _ = p.resp.send(result);
+        // Apply locally; durability is the boat's job.
+        match self.apply(&p.participants, &p.ops, p.read_only).await {
+            Err(e) => {
+                let _ = p.resp.send(Err(e));
+            }
+            Ok(results) => {
+                let response = TxnResponse {
+                    txn_id: format!("w{}-{}", self.id, txn),
+                    results,
+                };
+                if p.read_only {
+                    let _ = p.resp.send(Ok(response));
+                } else {
+                    for object in &p.participants {
+                        self.dirty.insert(object.clone());
+                    }
+                    if p.optimistic {
+                        // Acked on local commit; ships with the next boat.
+                        let _ = p.resp.send(Ok(response));
+                    } else {
+                        // Barrier: acked when the boat lands.
+                        self.boat_waiters.push((p.resp, response));
+                    }
+                }
+            }
+        }
 
         let mut ready = Vec::new();
         for object in &p.participants {
@@ -494,12 +653,17 @@ impl Worker {
                 ready.extend(self.service_front(object).await);
             }
         }
+        self.maybe_launch();
         ready
     }
 
     /// Hysteresis: a displaced object with an idle queue goes home before
-    /// its clique next transacts.
+    /// its clique next transacts. Deferred while unshipped (the ShipDone
+    /// handler retries) — home would activate a stale blob otherwise.
     async fn maybe_return_home(&mut self, object: &str) {
+        if self.unshipped(object) {
+            return;
+        }
         let Some(home) = self.meta.get(object).and_then(|m| m.return_to) else {
             return;
         };
@@ -519,7 +683,11 @@ impl Worker {
 
     // ------------------------------------------------------------ execution
 
-    async fn execute(
+    /// Apply a transaction to local state only. All-or-nothing across the
+    /// participants (local SQLite txns), but durability is deferred to the
+    /// boat: run_and_complete marks participants dirty and maybe_launch
+    /// ships them.
+    async fn apply(
         &mut self,
         participants: &[String],
         ops: &[Op],
@@ -589,80 +757,84 @@ impl Worker {
         if let Some(e) = commit_err {
             for id in participants {
                 evict(&mut self.objects, id);
+                self.dirty.remove(id);
             }
             return Err(ApiError::internal(format!("local commit failed: {e}")));
         }
 
-        // Snapshot synchronously first: Connection is Send but not Sync, so
-        // no borrow of a connection may live across an await.
-        let staging_id = uuid::Uuid::new_v4().to_string();
-        let mut snapshots: Vec<Vec<u8>> = Vec::with_capacity(participants.len());
-        let mut stage_err: Option<anyhow::Error> = None;
-        for id in participants {
-            match std::fs::read(&self.objects.get(id).unwrap().live_path) {
-                Ok(bytes) => snapshots.push(bytes),
-                Err(e) => {
-                    stage_err = Some(e.into());
-                    break;
-                }
-            }
-        }
-        if stage_err.is_none() {
-            for (id, bytes) in participants.iter().zip(&snapshots) {
-                if let Err(e) = self.node.store.put(&staging_key(&staging_id, id), bytes).await {
-                    stage_err = Some(e);
-                    break;
-                }
-            }
-        }
-
-        // Fencing, last line of defense: if the lease guard has flagged us
-        // as superseded, refuse to pass the commit point. (The guard
-        // fail-stops the process; this catches the in-flight stragglers.)
-        if self.node.fenced.load(Ordering::SeqCst) {
-            for id in participants {
-                evict(&mut self.objects, id);
-            }
-            return Err(ApiError::internal("node is fenced; commit refused"));
-        }
-
-        // The commit point: one write of one blob.
-        if stage_err.is_none() {
-            let record = serde_json::to_vec(&TxnRecord {
-                txn_id: staging_id.clone(),
-                objects: participants.to_vec(),
-            })
-            .expect("record serializes");
-            if let Err(e) = self.node.store.put(&txn_key(&staging_id), &record).await {
-                stage_err = Some(e);
-            }
-        }
-        if let Some(e) = stage_err {
-            for id in participants {
-                evict(&mut self.objects, id);
-            }
-            for id in participants {
-                let _ = self.node.store.delete(&staging_key(&staging_id, id)).await;
-            }
-            return Err(ApiError::internal(format!("commit failed: {e}")));
-        }
-
-        // Committed. Promotion is pure roll-forward: on failure the record
-        // and staging stay behind and recover() finishes at next boot.
-        let mut promoted = true;
-        for (id, bytes) in participants.iter().zip(&snapshots) {
-            if self.node.store.put(&object_key(id), bytes).await.is_err() {
-                promoted = false;
-            }
-        }
-        if promoted {
-            for id in participants {
-                let _ = self.node.store.delete(&staging_key(&staging_id, id)).await;
-            }
-            let _ = self.node.store.delete(&txn_key(&staging_id)).await;
-        }
-
         Ok(results)
+    }
+}
+
+/// Ship one boat: stage every object's snapshot, write ONE commit record
+/// covering the whole batch (the commit point — every transaction in the
+/// boat becomes durable with this single blob write), then promote.
+/// Recovery already handles multi-object records, so a crash mid-promote is
+/// rolled forward exactly as before.
+async fn ship_task(
+    node: Node,
+    reply: mpsc::UnboundedSender<WorkerMsg>,
+    objects: Vec<String>,
+    snapshots: Vec<Vec<u8>>,
+    waiters: Vec<(oneshot::Sender<Result<TxnResponse, ApiError>>, TxnResponse)>,
+) {
+    let staging_id = uuid::Uuid::new_v4().to_string();
+    let mut err: Option<String> = None;
+
+    for (id, bytes) in objects.iter().zip(&snapshots) {
+        if let Err(e) = node.store.put(&staging_key(&staging_id, id), bytes).await {
+            err = Some(e.to_string());
+            break;
+        }
+    }
+
+    // Fencing, last line of defense: refuse the commit point if the lease
+    // guard has flagged us as superseded.
+    if err.is_none() && node.fenced.load(Ordering::SeqCst) {
+        err = Some("node is fenced; commit refused".into());
+    }
+
+    if err.is_none() {
+        let record = serde_json::to_vec(&TxnRecord {
+            txn_id: staging_id.clone(),
+            objects: objects.clone(),
+        })
+        .expect("record serializes");
+        if let Err(e) = node.store.put(&txn_key(&staging_id), &record).await {
+            err = Some(e.to_string());
+        }
+    }
+
+    match err {
+        None => {
+            // Committed. Promotion is pure roll-forward: on failure the
+            // record and staging stay behind and recover() finishes at boot.
+            let mut promoted = true;
+            for (id, bytes) in objects.iter().zip(&snapshots) {
+                if node.store.put(&object_key(id), bytes).await.is_err() {
+                    promoted = false;
+                }
+            }
+            if promoted {
+                for id in &objects {
+                    let _ = node.store.delete(&staging_key(&staging_id, id)).await;
+                }
+                let _ = node.store.delete(&txn_key(&staging_id)).await;
+            }
+            for (resp, response) in waiters {
+                let _ = resp.send(Ok(response));
+            }
+            let _ = reply.send(WorkerMsg::ShipDone { objects, ok: true });
+        }
+        Some(e) => {
+            for id in &objects {
+                let _ = node.store.delete(&staging_key(&staging_id, id)).await;
+            }
+            for (resp, _) in waiters {
+                let _ = resp.send(Err(ApiError::internal(format!("commit failed: {e}"))));
+            }
+            let _ = reply.send(WorkerMsg::ShipDone { objects, ok: false });
+        }
     }
 }
 

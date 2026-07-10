@@ -91,6 +91,8 @@ pub struct StatsSnapshot {
     pub cross_worker_txns: u64,
     pub takes: u64,
     pub returns: u64,
+    /// Boats shipped; txns/ships = group-commit amortization.
+    pub ships: u64,
     pub per_worker: Vec<WorkerStat>,
 }
 
@@ -222,6 +224,8 @@ pub struct Stats {
     pub cross_worker_txns: AtomicU64,
     pub takes: AtomicU64,
     pub returns: AtomicU64,
+    /// Boats shipped. txns/ships is the group-commit amortization factor.
+    pub ships: AtomicU64,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -488,11 +492,24 @@ impl NodeInner {
         v
     }
 
-    /// Graceful shutdown: stop serving, drop worker senders so worker tasks
-    /// drain and exit, and tombstone our leases so the next claimant doesn't
-    /// need a failed health check to take over. Checkpoints are already
-    /// current — they're written synchronously on every ownership change.
+    /// Graceful shutdown: flush every worker's final boat (unshipped
+    /// optimistic txns become durable), stop serving, and tombstone our
+    /// leases so the next claimant doesn't need a failed health check to
+    /// take over. Checkpoints are already current — they're written
+    /// synchronously on every ownership change.
     pub async fn shutdown(&self) {
+        let senders: Vec<mpsc::UnboundedSender<WorkerMsg>> =
+            { self.local.read().unwrap().values().cloned().collect() };
+        let mut flushed = Vec::new();
+        for tx in senders {
+            let (rtx, rrx) = oneshot::channel();
+            if tx.send(WorkerMsg::Shutdown { resp: rtx }).is_ok() {
+                flushed.push(rrx);
+            }
+        }
+        for f in flushed {
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(10), f).await;
+        }
         for task in self.tasks.lock().unwrap().drain(..) {
             task.abort();
         }
@@ -533,6 +550,7 @@ impl NodeInner {
             cross_worker_txns: self.stats.cross_worker_txns.load(Ordering::Relaxed),
             takes: self.stats.takes.load(Ordering::Relaxed),
             returns: self.stats.returns.load(Ordering::Relaxed),
+            ships: self.stats.ships.load(Ordering::Relaxed),
             per_worker,
         }
     }
@@ -558,6 +576,7 @@ pub async fn submit(
     objects: Vec<String>,
     ops: Vec<Op>,
     read_only: bool,
+    optimistic: bool,
 ) -> Result<TxnResponse, ApiError> {
     if objects.is_empty() {
         return Err(ApiError::bad_request("declare at least one object"));
@@ -580,7 +599,7 @@ pub async fn submit(
     }
     node.clock.fetch_add(1, Ordering::Relaxed);
     node.stats.total_txns.fetch_add(1, Ordering::Relaxed);
-    submit_routed(node, ids, ops, read_only).await
+    submit_routed(node, ids, ops, read_only, optimistic).await
 }
 
 /// Routing half of submit, callable from the RPC handler (already validated).
@@ -589,6 +608,7 @@ pub async fn submit_routed(
     ids: Vec<String>,
     ops: Vec<Op>,
     read_only: bool,
+    optimistic: bool,
 ) -> Result<TxnResponse, ApiError> {
     // Plurality owner wins; ties break toward the less-loaded worker
     // (pressure), then lowest id (determinism). Two-object cross txns are
@@ -613,6 +633,7 @@ pub async fn submit_routed(
             participants: ids,
             ops,
             read_only,
+            optimistic,
             resp: rtx,
         })
         .map_err(|_| ApiError::internal("worker is gone"))?;
@@ -626,12 +647,14 @@ pub async fn submit_routed(
                 ApiError::internal(format!("no live node holds logical worker {target}"))
             })?,
         };
-        match crate::rpc::forward_txn(node, &addr, ids.clone(), ops.clone(), read_only).await {
+        match crate::rpc::forward_txn(node, &addr, ids.clone(), ops.clone(), read_only, optimistic)
+            .await
+        {
             // Transport failure: the cached address may belong to a dead
             // world. Re-read the lease and retry once at the new holder.
             Err(e) if e.message.starts_with("rpc to") => match resolve_addr(node, target).await {
                 Some(fresh) if fresh != addr => {
-                    crate::rpc::forward_txn(node, &fresh, ids, ops, read_only).await
+                    crate::rpc::forward_txn(node, &fresh, ids, ops, read_only, optimistic).await
                 }
                 _ => Err(e),
             },
@@ -670,10 +693,11 @@ mod tests {
         .unwrap()
     }
 
-    async fn exec(
+    async fn exec_mode(
         node: &Node,
         objects: &[&str],
         ops: &[(&str, &str)],
+        optimistic: bool,
     ) -> Result<TxnResponse, ApiError> {
         submit(
             node,
@@ -686,8 +710,17 @@ mod tests {
                 })
                 .collect(),
             false,
+            optimistic,
         )
         .await
+    }
+
+    async fn exec(
+        node: &Node,
+        objects: &[&str],
+        ops: &[(&str, &str)],
+    ) -> Result<TxnResponse, ApiError> {
+        exec_mode(node, objects, ops, false).await
     }
 
     async fn balance(node: &Node, id: &str) -> i64 {
@@ -833,6 +866,89 @@ mod tests {
         assert_eq!(balance(&node_c, &alice).await, 40);
         assert_eq!(balance(&node_c, &bob).await, 160);
         node_c.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn optimistic_boats_coalesce_and_survive_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = boot(dir.path(), 4, ClaimSpec::All, "a").await;
+        let log = id_on_worker(1, 4, "log");
+        exec(&node, &[&log], &[(&log, "CREATE TABLE t (n INTEGER)")])
+            .await
+            .unwrap();
+
+        // 200 concurrent optimistic writes: acked on local apply, coalesced
+        // into boats sized by whatever accumulates during each ship RTT.
+        let mut handles = Vec::new();
+        for _ in 0..200 {
+            let node = node.clone();
+            let log = log.clone();
+            handles.push(tokio::spawn(async move {
+                exec_mode(&node, &[&log], &[(&log, "INSERT INTO t (n) VALUES (1)")], true)
+                    .await
+                    .unwrap();
+            }));
+        }
+        for h in handles {
+            h.await.unwrap();
+        }
+        // Pessimistic barrier: acked only when its boat (and therefore
+        // everything before it) is durable.
+        exec(&node, &[&log], &[(&log, "INSERT INTO t (n) VALUES (2)")])
+            .await
+            .unwrap();
+
+        let s = node.stats().await;
+        assert!(
+            s.ships < 201,
+            "boats should coalesce: {} ships for 201 writes",
+            s.ships
+        );
+
+        node.shutdown().await;
+
+        // Everything acked must be durable after a graceful stop.
+        let node2 = boot(dir.path(), 4, ClaimSpec::All, "b").await;
+        let res = exec(&node2, &[&log], &[(&log, "SELECT COUNT(*) AS c FROM t")])
+            .await
+            .unwrap();
+        let v = serde_json::to_value(&res.results).unwrap();
+        assert_eq!(v[0]["rows"][0]["c"], 201);
+        node2.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn takes_wait_for_unshipped_boats() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = boot(dir.path(), 4, ClaimSpec::All, "a").await;
+        let a = id_on_worker(0, 4, "obja");
+        let b = id_on_worker(3, 4, "objb");
+        exec(&node, &[&a], &[(&a, "CREATE TABLE t (n INTEGER)")])
+            .await
+            .unwrap();
+        exec(&node, &[&b], &[(&b, "CREATE TABLE t (n INTEGER)")])
+            .await
+            .unwrap();
+
+        // Optimistic write to `a`, immediately followed by a cross-worker
+        // txn that migrates `a` to b's worker. The take must wait for the
+        // boat, or the new owner would activate a stale snapshot.
+        exec_mode(&node, &[&a], &[(&a, "INSERT INTO t (n) VALUES (41)")], true)
+            .await
+            .unwrap();
+        let res = exec(
+            &node,
+            &[&a, &b],
+            &[
+                (&a, "SELECT COUNT(*) AS c FROM t"),
+                (&b, "INSERT INTO t (n) VALUES (1)"),
+            ],
+        )
+        .await
+        .unwrap();
+        let v = serde_json::to_value(&res.results).unwrap();
+        assert_eq!(v[0]["rows"][0]["c"], 1, "optimistic write visible after take");
+        node.shutdown().await;
     }
 
     #[tokio::test]

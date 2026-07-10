@@ -24,6 +24,8 @@ pub enum Request {
         objects: Vec<String>,
         ops: Vec<Op>,
         read_only: bool,
+        #[serde(default)]
+        optimistic: bool,
     },
     Take {
         worker: usize,
@@ -105,6 +107,7 @@ pub async fn forward_txn(
     objects: Vec<String>,
     ops: Vec<Op>,
     read_only: bool,
+    optimistic: bool,
 ) -> Result<TxnResponse, ApiError> {
     match call(
         node,
@@ -113,6 +116,7 @@ pub async fn forward_txn(
             objects,
             ops,
             read_only,
+            optimistic,
         },
     )
     .await

@@ -129,8 +129,9 @@ async fn rpc_handler(
             objects,
             ops,
             read_only,
+            optimistic,
         } => RpcResp::Txn(
-            crate::cluster::submit_routed(&node, objects, ops, read_only)
+            crate::cluster::submit_routed(&node, objects, ops, read_only, optimistic)
                 .await
                 .map_err(crate::rpc::WireError::from),
         ),
@@ -179,13 +180,20 @@ async fn rpc_handler(
 struct TxnRequest {
     objects: Vec<String>,
     ops: Vec<Op>,
+    /// Ack after local apply; durability rides the next boat. A crash in
+    /// the shipping window loses the txn (with everything after it,
+    /// consistently). Default false = ack only when durable.
+    #[serde(default)]
+    optimistic: bool,
 }
 
 async fn txn_handler(
     State(node): State<Node>,
     Json(req): Json<TxnRequest>,
 ) -> Result<Json<TxnResponse>, ApiError> {
-    Ok(Json(submit(&node, req.objects, req.ops, false).await?))
+    Ok(Json(
+        submit(&node, req.objects, req.ops, false, req.optimistic).await?,
+    ))
 }
 
 #[derive(Deserialize)]
@@ -198,8 +206,12 @@ struct Statement {
 #[derive(Deserialize)]
 #[serde(untagged)]
 enum ExecBody {
+    Many {
+        ops: Vec<Statement>,
+        #[serde(default)]
+        optimistic: bool,
+    },
     Single(Statement),
-    Many { ops: Vec<Statement> },
 }
 
 async fn exec_handler(
@@ -207,9 +219,9 @@ async fn exec_handler(
     UrlPath(id): UrlPath<String>,
     Json(body): Json<ExecBody>,
 ) -> Result<Json<TxnResponse>, ApiError> {
-    let stmts = match body {
-        ExecBody::Single(s) => vec![s],
-        ExecBody::Many { ops } => ops,
+    let (stmts, optimistic) = match body {
+        ExecBody::Single(s) => (vec![s], false),
+        ExecBody::Many { ops, optimistic } => (ops, optimistic),
     };
     let ops = stmts
         .into_iter()
@@ -219,7 +231,7 @@ async fn exec_handler(
             params: s.params,
         })
         .collect();
-    Ok(Json(submit(&node, vec![id], ops, false).await?))
+    Ok(Json(submit(&node, vec![id], ops, false, optimistic).await?))
 }
 
 async fn query_handler(
@@ -232,7 +244,7 @@ async fn query_handler(
         sql: stmt.sql,
         params: stmt.params,
     }];
-    let mut res = submit(&node, vec![id], ops, true).await?;
+    let mut res = submit(&node, vec![id], ops, true, false).await?;
     let result = res
         .results
         .pop()

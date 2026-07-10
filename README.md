@@ -96,11 +96,20 @@ store. Period.
   acquired in sorted object order (local participant = queue position,
   remote = a Take, itself queued FIFO at the owner). Ordered acquisition =
   deadlock-free; FIFO queues = fair.
-- **Commit** (unchanged since v1): per-object SQLite txns → snapshot → stage
-  → **one blob write of `txns/<id>.json` is the commit point** → promote.
-  Process-agnostic by construction, so cross-process atomic commit needed
-  zero new code. Crash after the record: rolled forward at boot; before:
-  swept. `recover()` is idempotent — concurrent booters are harmless.
+- **Commit**: transactions apply to local SQLite immediately and durability
+  ships in **boats** — everything dirty coalesces into one staged snapshot
+  set plus **one blob write of `txns/<id>.json`, the commit point for the
+  whole batch**. Boats sail continuously (no timer): batch size adapts to
+  load. Pessimistic txns (default) ack when their boat lands and act as
+  barriers; `optimistic: true` acks on local apply and risks only the
+  current boat — a crash rewinds the world to the last shipped boat,
+  consistently (prefix consistency). Measured with 25ms simulated blob
+  latency: 297 txn/s pessimistic vs 71,619 txn/s optimistic (~240x), boats
+  of ~330 txns, every acked write durable. Crash after the record: rolled
+  forward at boot; before: swept. `recover()` is idempotent.
+- **Ownership moves only when clean**: takes and hysteresis returns wait
+  for the object's boat to land, so a new owner never activates a stale
+  snapshot.
 - **Topology**: processes claim logical workers by creating
   `_lease/w<i>/e<epoch>.json` — `BlobStore::create` (create-if-absent,
   `If-None-Match: *` on R2) is the system's only consensus primitive. Dead

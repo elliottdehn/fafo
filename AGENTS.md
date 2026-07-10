@@ -60,6 +60,17 @@ Every op's `object` must appear in `objects`, or the request is rejected.
 Results are per-op, in request order: `{"rows": [...]}` for statements that
 return rows (SELECT, RETURNING), `{"rows_affected": n}` otherwise.
 
+Optional: `"optimistic": true`. Optimistic transactions are acked as soon
+as they apply locally and become durable with the next "boat" (writes
+coalesce into one storage commit; boats ship continuously, so the window is
+one storage round trip). The contract: a crash inside that window loses the
+transaction — together with everything after it, consistently (the world
+rewinds to the last boat; invariants always hold). Default `false` = acked
+only when durable — and a pessimistic transaction doubles as a barrier: its
+ack means everything before it on those objects is durable too. Rule of
+thumb: telemetry, counters, caches → optimistic; money → pessimistic (or
+optimistic writes followed by one pessimistic barrier).
+
 ### POST /objects/{id}/exec — single-object transaction
 
 ```sh
@@ -117,6 +128,9 @@ db.txn(["alice", "bob"], [
   treat the constraint violation on retry as success.
 - **Keep objects small** (roughly: one entity's rows). Durability is
   snapshot-per-commit — a 100 MB object pays 100 MB per write txn.
+- **High write throughput**: send `optimistic: true` and let boats coalesce
+  (measured: ~240x at object-storage latency). Barrier with one pessimistic
+  txn when you need a durability checkpoint.
 
 ## Developing fafo itself
 

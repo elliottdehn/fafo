@@ -57,9 +57,14 @@ export class Fafo {
     return json as T;
   }
 
-  /** Cross-object atomic transaction; every op's object must be declared. */
-  txn(objects: string[], ops: Op[]): Promise<TxnResponse> {
-    return this.call("POST", "/txn", { objects, ops });
+  /**
+   * Cross-object atomic transaction; every op's object must be declared.
+   * `optimistic` acks after local apply; durability follows within one
+   * storage round trip (a crash in that window loses the txn, consistently).
+   * A later non-optimistic txn acts as a durability barrier.
+   */
+  txn(objects: string[], ops: Op[], opts?: { optimistic?: boolean }): Promise<TxnResponse> {
+    return this.call("POST", "/txn", { objects, ops, optimistic: opts?.optimistic ?? false });
   }
 
   /** Single-object transaction, single statement. */

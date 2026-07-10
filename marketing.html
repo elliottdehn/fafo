@@ -1,0 +1,739 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ScaleWarm — data that keeps itself warm</title>
+<meta name="description" content="ScaleWarm is a transactional object store: one SQL database per object, ACID across objects, placement that learns from your workload, durability at object-storage prices.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,300;12..96,500;12..96,700;12..96,800&family=Instrument+Sans:ital,wght@0,400;0,500;0,600;1,400&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+:root{
+  --char:#1a1412;
+  --char-2:#241b17;
+  --char-3:#2f231d;
+  --ember:#ff4d1c;
+  --amber:#ffa028;
+  --gold:#ffd08a;
+  --radiant:#ffe8cf;
+  --dim:#b8a394;
+  --faint:#7d6c60;
+  --frost-bg:#e7ecef;
+  --frost-ink:#2b3a44;
+  --frost-dim:#5f7280;
+  --frost-line:#c5d0d6;
+  --ramp:linear-gradient(90deg,var(--ember),var(--amber) 55%,var(--gold));
+  --display:"Bricolage Grotesque",system-ui,sans-serif;
+  --body:"Instrument Sans",system-ui,sans-serif;
+  --mono:"IBM Plex Mono",ui-monospace,monospace;
+}
+*{margin:0;padding:0;box-sizing:border-box}
+html{scroll-behavior:smooth}
+body{
+  background:var(--char);
+  color:var(--radiant);
+  font-family:var(--body);
+  font-size:17px;
+  line-height:1.6;
+  -webkit-font-smoothing:antialiased;
+}
+::selection{background:var(--ember);color:var(--char)}
+a{color:inherit}
+.wrap{max-width:1120px;margin:0 auto;padding:0 24px}
+.mono{font-family:var(--mono)}
+
+/* ---------- nav ---------- */
+nav{
+  position:sticky;top:0;z-index:50;
+  background:color-mix(in srgb,var(--char) 82%,transparent);
+  backdrop-filter:blur(12px);
+  border-bottom:1px solid #33261f;
+}
+.nav-inner{display:flex;align-items:center;justify-content:space-between;height:64px}
+.wordmark{
+  font-family:var(--display);font-weight:800;font-size:20px;letter-spacing:-.02em;
+  text-decoration:none;display:flex;align-items:center;gap:10px;
+}
+.flame{
+  width:18px;height:18px;border-radius:50% 50% 50% 4px;
+  background:radial-gradient(circle at 35% 70%,var(--gold),var(--ember) 70%);
+  transform:rotate(45deg);
+  box-shadow:0 0 18px rgba(255,77,28,.55);
+}
+.wordmark b{background:var(--ramp);-webkit-background-clip:text;background-clip:text;color:transparent}
+.nav-links{display:flex;gap:28px;align-items:center;font-size:15px}
+.nav-links a{text-decoration:none;color:var(--dim);transition:color .15s}
+.nav-links a:hover,.nav-links a:focus-visible{color:var(--radiant)}
+.nav-cta{
+  padding:8px 16px;border-radius:8px;border:1px solid #4a3527;color:var(--gold)!important;
+  font-family:var(--mono);font-size:13px;
+}
+.nav-cta:hover{border-color:var(--amber)}
+
+/* ---------- hero ---------- */
+header{position:relative;overflow:hidden}
+header::before{
+  content:"";position:absolute;inset:0;pointer-events:none;
+  background:
+    radial-gradient(900px 420px at 75% -10%,rgba(255,77,28,.16),transparent 65%),
+    radial-gradient(700px 500px at 10% 110%,rgba(255,160,40,.08),transparent 60%);
+}
+.hero{position:relative;padding:88px 0 40px;display:grid;grid-template-columns:1fr;gap:56px}
+.eyebrow{
+  font-family:var(--mono);font-size:13px;letter-spacing:.14em;text-transform:uppercase;
+  color:var(--amber);margin-bottom:22px;display:flex;align-items:center;gap:12px;
+}
+.eyebrow::before{content:"";width:34px;height:1px;background:var(--ramp)}
+h1{
+  font-family:var(--display);font-weight:800;
+  font-size:clamp(44px,7.2vw,92px);
+  line-height:1.0;letter-spacing:-.035em;
+  max-width:14ch;
+}
+h1 .warm{background:var(--ramp);-webkit-background-clip:text;background-clip:text;color:transparent}
+.sub{
+  margin-top:26px;max-width:56ch;font-size:19px;color:var(--dim);
+}
+.sub strong{color:var(--radiant);font-weight:600}
+.cta-row{display:flex;gap:14px;margin-top:36px;flex-wrap:wrap;align-items:center}
+.btn{
+  display:inline-flex;align-items:center;gap:10px;
+  padding:14px 26px;border-radius:10px;font-weight:600;font-size:16px;
+  text-decoration:none;transition:transform .15s,box-shadow .15s;
+}
+.btn-hot{
+  background:var(--ramp);color:#241205;
+  box-shadow:0 6px 30px rgba(255,110,30,.35);
+}
+.btn-hot:hover{transform:translateY(-2px);box-shadow:0 10px 40px rgba(255,110,30,.5)}
+.btn-ghost{border:1px solid #4a3527;color:var(--gold)}
+.btn-ghost:hover{border-color:var(--amber)}
+.clone{
+  margin-top:22px;display:inline-flex;align-items:center;gap:14px;
+  font-family:var(--mono);font-size:14px;color:var(--faint);
+  background:var(--char-2);border:1px solid #33261f;border-radius:8px;padding:11px 16px;
+}
+.clone span{color:var(--gold)}
+.clone button{
+  background:none;border:none;color:var(--faint);cursor:pointer;font-family:var(--mono);
+  font-size:12px;padding:2px 6px;border:1px solid #3d2d23;border-radius:5px;
+}
+.clone button:hover{color:var(--gold)}
+
+/* ---------- the anneal sim ---------- */
+.sim{
+  position:relative;
+  background:var(--char-2);
+  border:1px solid #33261f;border-radius:16px;
+  padding:26px 26px 20px;
+  box-shadow:0 30px 80px rgba(0,0,0,.45);
+}
+.sim-head{display:flex;justify-content:space-between;align-items:baseline;flex-wrap:wrap;gap:10px;margin-bottom:16px}
+.sim-title{font-family:var(--mono);font-size:13px;letter-spacing:.1em;text-transform:uppercase;color:var(--faint)}
+.sim-title em{color:var(--amber);font-style:normal}
+.sim-stat{font-family:var(--mono);font-size:14px;color:var(--dim)}
+.sim-stat b{
+  font-size:26px;color:var(--radiant);font-weight:500;
+  font-variant-numeric:tabular-nums;
+}
+canvas{display:block;width:100%;height:auto;border-radius:10px}
+.sim-foot{
+  display:flex;justify-content:space-between;align-items:center;margin-top:14px;
+  font-family:var(--mono);font-size:12px;color:var(--faint);flex-wrap:wrap;gap:8px;
+}
+.legend{display:flex;gap:18px;flex-wrap:wrap}
+.legend span{display:inline-flex;align-items:center;gap:7px}
+.dot{width:8px;height:8px;border-radius:50%}
+.dot.warm-d{background:var(--amber);box-shadow:0 0 8px rgba(255,160,40,.8)}
+.dot.cross-d{background:#7fb2c9}
+.replay{
+  background:none;border:1px solid #3d2d23;color:var(--dim);border-radius:6px;
+  font-family:var(--mono);font-size:12px;padding:5px 12px;cursor:pointer;
+}
+.replay:hover{color:var(--gold);border-color:var(--amber)}
+
+/* ---------- stat strip ---------- */
+.stats{
+  display:grid;grid-template-columns:repeat(4,1fr);
+  border-top:1px solid #33261f;border-bottom:1px solid #33261f;
+  margin-top:72px;
+}
+.stat{padding:34px 26px;border-left:1px solid #33261f}
+.stat:first-child{border-left:none}
+.stat b{
+  display:block;font-family:var(--display);font-weight:700;font-size:34px;letter-spacing:-.02em;
+  background:var(--ramp);-webkit-background-clip:text;background-clip:text;color:transparent;
+}
+.stat span{font-size:14px;color:var(--faint);display:block;margin-top:6px;line-height:1.45}
+
+/* ---------- sections ---------- */
+section{padding:104px 0}
+.sec-eyebrow{
+  font-family:var(--mono);font-size:13px;letter-spacing:.14em;text-transform:uppercase;
+  margin-bottom:18px;
+}
+h2{
+  font-family:var(--display);font-weight:700;font-size:clamp(32px,4.4vw,52px);
+  letter-spacing:-.03em;line-height:1.05;max-width:22ch;
+}
+.lede{margin-top:20px;max-width:58ch;font-size:18px}
+
+/* cold section — the one deliberately cold block on a warm page */
+.cold{background:var(--frost-bg);color:var(--frost-ink)}
+.cold .sec-eyebrow{color:var(--frost-dim)}
+.cold .sec-eyebrow::after{content:" · 3°C";opacity:.6}
+.cold .lede{color:var(--frost-dim)}
+.cold-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:1px;background:var(--frost-line);border:1px solid var(--frost-line);margin-top:56px}
+.cold-card{background:var(--frost-bg);padding:30px 26px}
+.cold-card h3{font-family:var(--display);font-weight:700;font-size:20px;letter-spacing:-.01em;margin-bottom:10px}
+.cold-card p{font-size:15px;color:var(--frost-dim)}
+.cold-card .tag{
+  font-family:var(--mono);font-size:11px;letter-spacing:.1em;text-transform:uppercase;
+  color:#8195a1;display:block;margin-bottom:14px;
+}
+
+/* mechanics */
+.warm-sec .sec-eyebrow{color:var(--amber)}
+.mech{display:grid;grid-template-columns:1fr 1fr;gap:64px;align-items:start;margin-top:64px;padding-top:56px;border-top:1px solid #33261f}
+.mech:first-of-type{margin-top:56px;border-top:none;padding-top:0}
+.mech h3{font-family:var(--display);font-weight:700;font-size:28px;letter-spacing:-.02em;margin-bottom:14px}
+.mech p{color:var(--dim);font-size:16px;max-width:48ch}
+.mech p+p{margin-top:12px}
+.mech .k{color:var(--gold);font-family:var(--mono);font-size:.92em}
+.panel{
+  background:var(--char-2);border:1px solid #33261f;border-radius:12px;
+  padding:22px;font-family:var(--mono);font-size:13.5px;line-height:1.75;color:var(--dim);
+  overflow-x:auto;white-space:pre;
+}
+.panel .c{color:var(--faint)}
+.panel .g{color:var(--gold)}
+.panel .e{color:var(--ember)}
+.panel .a{color:var(--amber)}
+.panel .r{color:var(--radiant)}
+
+/* code tabs */
+.tabs{margin-top:56px;background:var(--char-2);border:1px solid #33261f;border-radius:14px;overflow:hidden}
+.tab-row{display:flex;border-bottom:1px solid #33261f}
+.tab{
+  font-family:var(--mono);font-size:13px;padding:13px 22px;cursor:pointer;
+  background:none;border:none;color:var(--faint);border-bottom:2px solid transparent;
+}
+.tab[aria-selected="true"]{color:var(--gold);border-bottom-color:var(--amber)}
+.tab-panel{padding:26px;font-family:var(--mono);font-size:13.5px;line-height:1.8;overflow-x:auto;white-space:pre;color:var(--dim)}
+.tab-panel[hidden]{display:none}
+
+/* comparison */
+table{width:100%;border-collapse:collapse;margin-top:52px;font-size:15px}
+th{
+  font-family:var(--mono);font-size:12px;letter-spacing:.1em;text-transform:uppercase;
+  color:var(--faint);text-align:left;padding:14px 18px;border-bottom:1px solid #3d2d23;
+}
+td{padding:16px 18px;border-bottom:1px solid #2b201a;color:var(--dim);vertical-align:top}
+td:first-child{color:var(--radiant);font-weight:500}
+tr.hot td{color:var(--radiant)}
+tr.hot td:first-child{color:var(--gold)}
+tr.hot{background:linear-gradient(90deg,rgba(255,77,28,.07),rgba(255,160,40,.03))}
+
+/* fine print */
+.fine{background:var(--char-2);border-top:1px solid #33261f;border-bottom:1px solid #33261f}
+.fine h2{font-size:clamp(26px,3.4vw,38px)}
+.fine ul{margin-top:40px;list-style:none;columns:2;column-gap:64px}
+.fine li{
+  break-inside:avoid;margin-bottom:22px;padding-left:26px;position:relative;
+  color:var(--dim);font-size:15.5px;
+}
+.fine li::before{content:"✕";position:absolute;left:0;top:1px;color:var(--faint);font-family:var(--mono);font-size:13px}
+.fine li b{color:var(--radiant);font-weight:600}
+.fine .why{margin-top:40px;color:var(--faint);font-size:14.5px;max-width:60ch}
+
+/* footer cta */
+.finale{position:relative;text-align:center;padding:140px 0 120px;overflow:hidden}
+.finale::before{
+  content:"";position:absolute;inset:auto 0 -40% 0;height:80%;
+  background:radial-gradient(50% 100% at 50% 100%,rgba(255,77,28,.28),rgba(255,160,40,.08) 55%,transparent 75%);
+  pointer-events:none;
+}
+.finale h2{margin:0 auto;max-width:16ch}
+.finale .sub{margin:22px auto 0}
+.finale .cta-row{justify-content:center}
+footer{
+  border-top:1px solid #33261f;padding:34px 0;color:var(--faint);font-size:13.5px;
+}
+.foot-inner{display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:14px}
+.foot-inner .mono{font-size:12px}
+
+/* reveal on scroll */
+.reveal{opacity:0;transform:translateY(18px);transition:opacity .7s ease,transform .7s ease}
+.reveal.in{opacity:1;transform:none}
+
+@media (prefers-reduced-motion:reduce){
+  html{scroll-behavior:auto}
+  .reveal{opacity:1;transform:none;transition:none}
+  .btn-hot:hover{transform:none}
+}
+@media (max-width:920px){
+  .stats{grid-template-columns:repeat(2,1fr)}
+  .stat:nth-child(3){border-left:none}
+  .cold-grid{grid-template-columns:1fr}
+  .mech{grid-template-columns:1fr;gap:28px}
+  .fine ul{columns:1}
+}
+@media (max-width:560px){
+  .stats{grid-template-columns:1fr}
+  .stat{border-left:none;border-top:1px solid #33261f}
+  .stat:first-child{border-top:none}
+  .nav-links a:not(.nav-cta){display:none}
+  table{font-size:13px}
+  th,td{padding:10px 8px}
+}
+:focus-visible{outline:2px solid var(--amber);outline-offset:3px;border-radius:4px}
+</style>
+</head>
+<body>
+
+<nav>
+  <div class="wrap nav-inner">
+    <a class="wordmark" href="#"><span class="flame" aria-hidden="true"></span>Scale<b>Warm</b></a>
+    <div class="nav-links">
+      <a href="#how">How it works</a>
+      <a href="#code">API</a>
+      <a href="#compare">Compare</a>
+      <a href="#fineprint">Fine print</a>
+      <a class="nav-cta" href="#get">$ scalewarm up</a>
+    </div>
+  </div>
+</nav>
+
+<header>
+  <div class="wrap hero">
+    <div>
+      <div class="eyebrow">Transactional object store</div>
+      <h1>Data that keeps <span class="warm">itself warm.</span></h1>
+      <p class="sub">One real SQL database per object. <strong>ACID transactions across objects.</strong> Placement that learns from your workload instead of asking you for a shard key. Durability at object-storage prices — and <strong>no server for you to operate.</strong></p>
+      <div class="cta-row">
+        <a class="btn btn-hot" href="#get">Run it before lunch</a>
+        <a class="btn btn-ghost" href="#how">See how it works</a>
+      </div>
+      <div class="clone" id="clone">
+        <span>$</span> git clone https://github.com/scalewarm/scalewarm &amp;&amp; ./scalewarm up
+        <button type="button" data-copy="git clone https://github.com/scalewarm/scalewarm && ./scalewarm up">copy</button>
+      </div>
+    </div>
+
+    <div class="sim reveal in">
+      <div class="sim-head">
+        <div class="sim-title">Live &middot; placement annealing on <em>this page</em>, same rules as the engine</div>
+        <div style="display:flex;gap:28px;flex-wrap:wrap">
+          <div class="sim-stat">cross-node coordination <b id="crossPct">—</b></div>
+          <div class="sim-stat">busiest node <b id="domPct">—</b></div>
+        </div>
+      </div>
+      <canvas id="anneal" width="1040" height="380" role="img"
+        aria-label="Animated simulation: data objects begin scattered across nodes and cluster together as transactions run, while the cross-node coordination percentage falls from around 75% toward its floor."></canvas>
+      <div class="sim-foot">
+        <div class="legend">
+          <span><span class="dot warm-d"></span>objects (grouped by who they transact with)</span>
+          <span><span class="dot cross-d"></span>cross-node transaction — recurring partners co-locate; one-offs snap back home</span>
+          <span><span class="dot" style="background:var(--faint)"></span>crowding cap — no node may hoard (watch "busiest node" hold)</span>
+        </div>
+        <button class="replay" id="replay" type="button">↻ restart cold</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="wrap">
+    <div class="stats">
+      <div class="stat reveal"><b>75% → 13%</b><span>cross-node coordination, learned from live traffic — never configured</span></div>
+      <div class="stat reveal"><b>1 write</b><span>one blob PUT is the entire commit point; recovery is pure roll-forward</span></div>
+      <div class="stat reveal"><b>0 servers</b><span>compute is ephemeral and sleeps to zero; the bucket is the only truth</span></div>
+      <div class="stat reveal"><b>kill -9</b><span>a supported operation — stop the world, restart in any shape, resume</span></div>
+    </div>
+  </div>
+</header>
+
+<section class="cold">
+  <div class="wrap">
+    <div class="sec-eyebrow reveal">The cold path</div>
+    <h2 class="reveal">Somewhere right now, a database server is billing you to do nothing.</h2>
+    <p class="lede reveal">The standard stack asks you to pay three taxes before your first user shows up: a machine that never sleeps, a shard key you must guess before you have traffic, and an ops rotation for the one component that can't go down. None of these are laws of nature. They're habits.</p>
+    <div class="cold-grid">
+      <div class="cold-card reveal">
+        <span class="tag">Tax nº1 — the idle server</span>
+        <h3>Always on, mostly waiting</h3>
+        <p>Your database bills by the hour whether or not anyone writes. Scale-to-zero exists for compute — but state stayed behind, chained to a daemon.</p>
+      </div>
+      <div class="cold-card reveal">
+        <span class="tag">Tax nº2 — the shard key</span>
+        <h3>Guessed early, paid forever</h3>
+        <p>Horizontal scale asks you to predict your access patterns before you have any. Guess wrong and the fix is called a migration, and nobody schedules those for fun.</p>
+      </div>
+      <div class="cold-card reveal">
+        <span class="tag">Tax nº3 — the cold start</span>
+        <h3>Restart means rebuild</h3>
+        <p>Caches empty. Placement forgotten. Connections re-herded. Everything your system learned about itself, discarded on every deploy.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="warm-sec" id="how">
+  <div class="wrap">
+    <div class="sec-eyebrow reveal">How it stays warm</div>
+    <h2 class="reveal">Three mechanics. No magic, only physics.</h2>
+
+    <div class="mech reveal">
+      <div>
+        <h3>Every object is a real SQL database</h3>
+        <p>Not a JSON blob with pretensions — an actual SQLite database per object, with tables, indexes, and <span class="k">CHECK</span> constraints. Your invariants live in the schema, where they can't be forgotten by the one code path someone wrote at 2am.</p>
+        <p>Transactions declare their participants up front and commit atomically across all of them. A constraint violation in one object rolls back every object. The transfer-between-accounts problem is an API call, not an architecture meeting.</p>
+      </div>
+      <div class="panel"><span class="c"># an "object" is one entity with real schema</span>
+POST /objects/<span class="a">alice</span>/exec
+{ <span class="g">"ops"</span>: [
+  { <span class="g">"sql"</span>: <span class="r">"CREATE TABLE account (
+      balance INTEGER NOT NULL
+      CHECK (balance >= 0))"</span> },
+  { <span class="g">"sql"</span>: <span class="r">"INSERT INTO account VALUES (?1)"</span>,
+    <span class="g">"params"</span>: [<span class="e">100</span>] }
+]}</div>
+    </div>
+
+    <div class="mech reveal">
+      <div>
+        <h3>The commit point is one write</h3>
+        <p>Object storage is the only durable truth. Local disks hold disposable working copies — which is why ephemeral containers, spot instances, and <span class="k">kill -9</span> are all fine. A transaction stages its snapshots, then commits with a single blob write. Crash before it: nothing happened. Crash after it: recovery rolls forward at the next boot, mechanically.</p>
+        <p>No quorums to keep fed. No replication topology to tend. The consensus you need is rented from the storage layer's conditional writes, and you only pay for it when ownership moves.</p>
+      </div>
+      <div class="panel"><span class="c"># the entire commit protocol</span>
+<span class="a">1.</span> run SQL in local txns      <span class="c">(undoable)</span>
+<span class="a">2.</span> snapshot + stage to bucket <span class="c">(undoable)</span>
+<span class="a">3.</span> <span class="e">PUT txns/&lt;id&gt;.json</span>         <span class="c">← COMMIT</span>
+<span class="a">4.</span> promote snapshots          <span class="c">(roll-forward)</span>
+
+<span class="c"># crash anywhere: boot recovery finishes
+# the sentence. no operator required.</span></div>
+    </div>
+
+    <div class="mech reveal">
+      <div>
+        <h3>Placement anneals itself</h3>
+        <p>Objects that transact together migrate together — automatically, because moving an object is a routing edit, not a data copy. One-off transactions don't displace settled data (it snaps back home), but a repeated partnership earns a move-in. Load pressure pushes back so no node becomes the hot spot.</p>
+        <p>The result is the simulation at the top of this page: coordination overhead falls from random-placement chaos to the workload's floor, while you write exactly zero placement configuration. And the learning is durable — restart the whole fleet and it resumes where it left off.</p>
+      </div>
+      <div class="panel"><span class="c"># measured, not promised</span>
+window        cross-node    migrations
+0..1000        <span class="e">30.4%</span>          304
+3000..4000     <span class="a">14.2%</span>          142
+9000..10000    <span class="g">13.3%</span>          134
+<span class="c">-- stop the world, restart --</span>
+0..1000        <span class="g">15.5%</span>          155
+<span class="c"># the fleet remembered. floor ≈ noise rate.</span></div>
+    </div>
+  </div>
+</section>
+
+<section id="code">
+  <div class="wrap">
+    <div class="sec-eyebrow reveal" style="color:var(--amber)">Program against it</div>
+    <h2 class="reveal">An API you already know how to use.</h2>
+    <p class="lede reveal" style="color:var(--dim)">HTTP and JSON. SQL you've written a thousand times. Clients are one file with zero dependencies — vendoring is copying.</p>
+
+    <div class="tabs reveal">
+      <div class="tab-row" role="tablist" aria-label="Client examples">
+        <button class="tab" role="tab" aria-selected="true" data-tab="t-curl">curl</button>
+        <button class="tab" role="tab" aria-selected="false" data-tab="t-py">python</button>
+        <button class="tab" role="tab" aria-selected="false" data-tab="t-ts">typescript</button>
+      </div>
+      <div class="tab-panel" id="t-curl"><span class="c"># atomic transfer across two objects — participants declared up front</span>
+curl -s localhost:8787/txn -d '{
+  <span class="g">"objects"</span>: [<span class="a">"alice"</span>, <span class="a">"bob"</span>],
+  <span class="g">"ops"</span>: [
+    {<span class="g">"object"</span>: <span class="a">"alice"</span>, <span class="g">"sql"</span>: <span class="r">"UPDATE account SET balance = balance - ?1"</span>, <span class="g">"params"</span>: [60]},
+    {<span class="g">"object"</span>: <span class="a">"bob"</span>,   <span class="g">"sql"</span>: <span class="r">"UPDATE account SET balance = balance + ?1"</span>, <span class="g">"params"</span>: [60]}
+  ]}'
+
+<span class="c"># {"txn_id":"w17-4","results":[{"rows_affected":1},{"rows_affected":1}]}
+# if alice would overdraft, bob's credit rolls back too. always.</span></div>
+      <div class="tab-panel" id="t-py" hidden><span class="c"># clients/scalewarm.py — stdlib only, copy it into your repo</span>
+db = ScaleWarm()
+
+db.txn([<span class="a">"alice"</span>, <span class="a">"bob"</span>], [
+    (<span class="a">"alice"</span>, <span class="r">"UPDATE account SET balance = balance - ?1"</span>, [60]),
+    (<span class="a">"bob"</span>,   <span class="r">"UPDATE account SET balance = balance + ?1"</span>, [60]),
+])
+
+rows = db.query(<span class="a">"alice"</span>, <span class="r">"SELECT balance FROM account"</span>)
+<span class="c"># [{"balance": 40}]</span></div>
+      <div class="tab-panel" id="t-ts" hidden><span class="c">// clients/scalewarm.ts — fetch only: Node, Bun, Deno, browsers, Workers</span>
+const db = new ScaleWarm();
+
+await db.txn([<span class="a">"alice"</span>, <span class="a">"bob"</span>], [
+  { object: <span class="a">"alice"</span>, sql: <span class="r">"UPDATE account SET balance = balance - ?1"</span>, params: [60] },
+  { object: <span class="a">"bob"</span>,   sql: <span class="r">"UPDATE account SET balance = balance + ?1"</span>, params: [60] },
+]);
+
+const rows = await db.query(<span class="a">"alice"</span>, <span class="r">"SELECT balance FROM account"</span>);
+<span class="c">// [{ balance: 40 }]</span></div>
+    </div>
+  </div>
+</section>
+
+<section id="compare">
+  <div class="wrap">
+    <div class="sec-eyebrow reveal" style="color:var(--amber)">Choose your tradeoff</div>
+    <h2 class="reveal">Everyone sells guarantees. We itemize them.</h2>
+    <table class="reveal">
+      <thead>
+        <tr><th>Your data layer</th><th>SQL per entity</th><th>ACID across entities</th><th>Shard key required</th><th>Idle cost</th><th>You operate</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>Big relational server</td><td>shared schema</td><td>yes</td><td>eventually, painfully</td><td>always-on</td><td>the server</td></tr>
+        <tr><td>Serverless KV / documents</td><td>no — blobs</td><td>limited item txns</td><td>yes, day one</td><td>low</td><td>nothing</td></tr>
+        <tr><td>Per-entity isolates</td><td>yes</td><td><b>no</b></td><td>no</td><td>low</td><td>nothing</td></tr>
+        <tr><td>Hand-rolled SQLite files</td><td>yes</td><td>you'll build it wrong once</td><td>n/a</td><td>zero</td><td>the schlep</td></tr>
+        <tr class="hot"><td>ScaleWarm</td><td>yes — real SQLite</td><td>yes, declared up front</td><td>never — learned</td><td>object storage only</td><td>nothing</td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<section class="fine" id="fineprint">
+  <div class="wrap">
+    <div class="sec-eyebrow reveal" style="color:var(--amber)">Fine print, in large type</div>
+    <h2 class="reveal">When you should not use ScaleWarm.</h2>
+    <ul>
+      <li class="reveal"><b>Big objects.</b> Durability is snapshot-per-commit: a 100&nbsp;MB object pays 100&nbsp;MB per write transaction. Keep objects entity-sized. (Delta shipping is on the roadmap; today this is the rule.)</li>
+      <li class="reveal"><b>Fleet-wide analytics.</b> There is no global SQL engine. "Average balance across all accounts" means fanning out over objects. Ship changes to a warehouse for that.</li>
+      <li class="reveal"><b>One supernova object.</b> Each object has exactly one writer at a time — that's where the guarantees come from. Optimistic batching takes a single hot object to tens of thousands of writes per second; past one core's serial ceiling, you need redesign, not more nodes.</li>
+      <li class="reveal"><b>Sub-millisecond commits.</b> The commit point is a blob write. On local disk that's fast; against remote object storage it's a network round trip. Physics is undefeated.</li>
+      <li class="reveal"><b>Decades of scar tissue.</b> Mature databases have survived failure modes we haven't met yet. If your blast radius is measured in careers, bring the grown-ups.</li>
+    </ul>
+    <p class="why reveal">Why tell you this? Because every system that hid its tradeoffs eventually introduced you to them personally, at 3am. Our pitch is that the guarantees are itemized — including the ones we don't sell.</p>
+  </div>
+</section>
+
+<section class="finale" id="get">
+  <div class="wrap">
+    <h2 class="reveal">Warm in one <span style="background:var(--ramp);-webkit-background-clip:text;background-clip:text;color:transparent">command.</span></h2>
+    <p class="sub reveal">Clone it, start it, forget it's there. State survives restarts, deploys, and your chaos-monkey phase. When you outgrow the laptop, the same bucket runs a fleet.</p>
+    <div class="cta-row reveal">
+      <a class="btn btn-hot" href="#">git clone &amp; go</a>
+      <a class="btn btn-ghost" href="#how">Read the architecture</a>
+    </div>
+  </div>
+</section>
+
+<footer>
+  <div class="wrap foot-inner">
+    <span>ScaleWarm — a transactional object store. Open source.</span>
+    <span class="mono">state lives in the bucket · compute is a costume it wears</span>
+  </div>
+</footer>
+
+<script>
+/* ---------- annealing simulation: same rules as the engine ---------- */
+(function(){
+  const canvas = document.getElementById("anneal");
+  const ctx = canvas.getContext("2d");
+  const pctEl = document.getElementById("crossPct");
+  const domEl = document.getElementById("domPct");
+  const reduced = matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+  const COLS = 8, ROWS = 3, NODES = COLS * ROWS;
+  const CLIQUES = 24, SIZE = 3, NOISE = 0.10;
+  const W = canvas.width, H = canvas.height;
+  const cw = W / COLS, ch = H / ROWS;
+
+  // deterministic splitmix64-ish PRNG
+  let seed;
+  function rnd(){ seed = (seed + 0x9e3779b9) | 0; let z = seed ^ (seed >>> 16);
+    z = Math.imul(z, 0x21f0aaad); z ^= z >>> 15; z = Math.imul(z, 0x735a2d97);
+    return ((z ^= z >>> 15) >>> 0) / 4294967296; }
+
+  let objs, history, flashes, arcs, heat, loads, timer;
+  // Pressure: same rule as the engine's Routing::crowded — a node may hold
+  // at most max(4, 2x fair share) migrated objects. Without this cap,
+  // cohesion collapses everything onto one mega-node (observed for real:
+  // 87 of 96 objects on one worker before the fix).
+  const CAP = Math.max(4, Math.floor((2 * CLIQUES * SIZE) / NODES));
+
+  function nodeCenter(n){
+    return { x:(n % COLS) * cw + cw / 2, y: Math.floor(n / COLS) * ch + ch / 2 };
+  }
+  function jitter(o){
+    const c = nodeCenter(o.node);
+    const a = o.slot * 2.399963;           // golden-angle spiral within cell
+    const r = 6 + 9 * Math.sqrt(o.slot % 7);
+    return { x: c.x + Math.cos(a) * r, y: c.y + Math.sin(a) * r };
+  }
+  function reset(){
+    seed = 42;
+    objs = []; history = []; flashes = []; arcs = [];
+    heat = new Array(NODES).fill(0);
+    loads = new Array(NODES).fill(0);
+    for (let c = 0; c < CLIQUES; c++)
+      for (let m = 0; m < SIZE; m++){
+        const node = Math.floor(rnd() * NODES);
+        const o = { clique: c, node, slot: c * SIZE + m, x: 0, y: 0 };
+        const p = jitter(o); o.x = p.x; o.y = p.y;
+        loads[node]++;
+        objs.push(o);
+      }
+    pctEl.textContent = "—";
+    domEl.textContent = "—";
+  }
+  function hotClique(){ return Math.floor(Math.min(rnd(), rnd()) * CLIQUES); }
+  function pick(c){ return objs.filter(o => o.clique === c); }
+
+  function step(){
+    let parts, noise = false;
+    if (rnd() < NOISE){
+      noise = true;
+      const a = pick(hotClique()), b = pick(hotClique());
+      parts = [a[Math.floor(rnd() * SIZE)], b[Math.floor(rnd() * SIZE)]];
+    } else {
+      const c = pick(hotClique());
+      const i = Math.floor(rnd() * SIZE);
+      parts = [c[i], c[(i + 1 + Math.floor(rnd() * (SIZE - 1))) % SIZE]];
+    }
+    const cross = parts[0].node !== parts[1].node;
+    history.push(cross ? 1 : 0);
+    if (history.length > 400) history.shift();
+
+    if (cross){
+      arcs.push({ a: { ...parts[0] }, b: { ...parts[1] }, t: 1 });
+      // Three forces, same as the engine:
+      // cohesion — recurring partners co-locate permanently;
+      // hysteresis — a one-off (noise) transaction runs co-located but the
+      //   visitor snaps back home, so it can't displace settled data;
+      // pressure — the less-loaded node wins ties, and a node at the
+      //   crowding cap refuses move-ins outright.
+      if (!noise){
+        let [stay, move] =
+          loads[parts[0].node] <= loads[parts[1].node]
+            ? [parts[0], parts[1]]
+            : [parts[1], parts[0]];
+        if (loads[stay.node] < CAP){
+          loads[move.node]--;
+          move.node = stay.node;
+          loads[move.node]++;
+        }
+      }
+    }
+    for (const p of parts){
+      heat[p.node] = Math.min(1, heat[p.node] + 0.25);
+      flashes.push({ o: p, t: 1 });
+    }
+    const rate = history.reduce((s, v) => s + v, 0) / history.length;
+    pctEl.textContent = (rate * 100).toFixed(1) + "%";
+    domEl.textContent = ((Math.max(...loads) / objs.length) * 100).toFixed(0) + "%";
+  }
+
+  function draw(){
+    ctx.clearRect(0, 0, W, H);
+    for (let n = 0; n < NODES; n++){
+      const x = (n % COLS) * cw, y = Math.floor(n / COLS) * ch;
+      ctx.fillStyle = `rgba(255,${120 + 60 * heat[n]},40,${0.03 + heat[n] * 0.10})`;
+      ctx.strokeStyle = "rgba(255,180,110,0.10)";
+      roundRect(x + 4, y + 4, cw - 8, ch - 8, 8);
+      ctx.fill(); ctx.stroke();
+      heat[n] *= 0.985;
+    }
+    for (const arc of arcs){
+      ctx.strokeStyle = `rgba(127,178,201,${arc.t * 0.8})`;
+      ctx.lineWidth = 1.4;
+      ctx.beginPath();
+      const mx = (arc.a.x + arc.b.x) / 2, my = Math.min(arc.a.y, arc.b.y) - 34;
+      ctx.moveTo(arc.a.x, arc.a.y); ctx.quadraticCurveTo(mx, my, arc.b.x, arc.b.y);
+      ctx.stroke();
+      arc.t -= 0.03;
+    }
+    arcs = arcs.filter(a => a.t > 0);
+    for (const o of objs){
+      const target = jitter(o);
+      o.x += (target.x - o.x) * 0.12;
+      o.y += (target.y - o.y) * 0.12;
+      const hue = 18 + (o.clique / CLIQUES) * 34;   // ember → amber band
+      ctx.fillStyle = `hsl(${hue} 100% ${58 + (o.clique % 3) * 6}%)`;
+      ctx.beginPath(); ctx.arc(o.x, o.y, 3.2, 0, 7); ctx.fill();
+    }
+    for (const f of flashes){
+      ctx.strokeStyle = `rgba(255,232,207,${f.t * 0.9})`;
+      ctx.lineWidth = 1.2;
+      ctx.beginPath(); ctx.arc(f.o.x, f.o.y, 4 + (1 - f.t) * 9, 0, 7); ctx.stroke();
+      f.t -= 0.06;
+    }
+    flashes = flashes.filter(f => f.t > 0);
+  }
+  function roundRect(x, y, w, h, r){
+    ctx.beginPath();
+    ctx.moveTo(x + r, y); ctx.arcTo(x + w, y, x + w, y + h, r);
+    ctx.arcTo(x + w, y + h, x, y + h, r); ctx.arcTo(x, y + h, x, y, r);
+    ctx.arcTo(x, y, x + w, y, r); ctx.closePath();
+  }
+
+  // Runs forever — a frozen simulation would be off-message on this page.
+  // Paused while off-screen so it never burns battery for nobody.
+  let running = false;
+  function frame(){
+    for (let i = 0; i < 3; i++) step();
+    draw();
+    if (running) timer = requestAnimationFrame(frame);
+  }
+  function play(){
+    if (reduced || running) return;
+    running = true;
+    timer = requestAnimationFrame(frame);
+  }
+  function pause(){
+    running = false;
+    if (timer) cancelAnimationFrame(timer);
+  }
+  function run(){
+    pause();
+    reset();
+    if (reduced){                     // static: fast-forward, render once
+      for (let i = 0; i < 4000; i++) step();
+      arcs = []; flashes = [];
+      for (const o of objs){ const p = jitter(o); o.x = p.x; o.y = p.y; }
+      draw();
+      return;
+    }
+    play();
+  }
+  document.getElementById("replay").addEventListener("click", run);
+  reset();
+  if (reduced) run();
+  new IntersectionObserver(entries => {
+    for (const e of entries) e.isIntersecting ? play() : pause();
+  }, { threshold: 0.05 }).observe(canvas);
+})();
+
+/* ---------- tabs ---------- */
+document.querySelectorAll(".tab").forEach(tab => {
+  tab.addEventListener("click", () => {
+    document.querySelectorAll(".tab").forEach(t => t.setAttribute("aria-selected", "false"));
+    document.querySelectorAll(".tab-panel").forEach(p => p.hidden = true);
+    tab.setAttribute("aria-selected", "true");
+    document.getElementById(tab.dataset.tab).hidden = false;
+  });
+});
+
+/* ---------- copy ---------- */
+document.querySelectorAll("[data-copy]").forEach(btn => {
+  btn.addEventListener("click", async () => {
+    try { await navigator.clipboard.writeText(btn.dataset.copy); btn.textContent = "copied"; }
+    catch { btn.textContent = "select it"; }
+    setTimeout(() => btn.textContent = "copy", 1500);
+  });
+});
+
+/* ---------- reveals ---------- */
+const io = new IntersectionObserver(entries => {
+  for (const e of entries) if (e.isIntersecting){ e.target.classList.add("in"); io.unobserve(e.target); }
+}, { threshold: 0.12 });
+document.querySelectorAll(".reveal").forEach(el => io.observe(el));
+</script>
+</body>
+</html>

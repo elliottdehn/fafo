@@ -33,7 +33,7 @@ fn env_or(name: &str, default: usize) -> usize {
 }
 
 async fn submit(node: &Node, objects: Vec<String>, ops: Vec<Op>) {
-    cluster::submit(node, objects, ops, false)
+    cluster::submit(node, objects, ops, false, std::env::var("OPT").is_ok())
         .await
         .expect("txn succeeds");
 }

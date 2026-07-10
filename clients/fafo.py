@@ -53,13 +53,22 @@ class Fafo:
                 message = str(e)
             raise FafoError(e.code, message) from None
 
-    def txn(self, objects, ops):
-        """ops: iterable of (object, sql) or (object, sql, params)."""
+    def txn(self, objects, ops, optimistic=False):
+        """ops: iterable of (object, sql) or (object, sql, params).
+
+        optimistic=True acks after local apply; durability follows within
+        one storage round trip (a crash in that window loses the txn,
+        consistently). A later optimistic=False txn is a durability barrier.
+        """
         payload = [
             {"object": op[0], "sql": op[1], "params": list(op[2]) if len(op) > 2 else []}
             for op in ops
         ]
-        return self._call("POST", "/txn", {"objects": list(objects), "ops": payload})
+        return self._call(
+            "POST",
+            "/txn",
+            {"objects": list(objects), "ops": payload, "optimistic": optimistic},
+        )
 
     def exec(self, obj, sql, params=None):
         return self._call("POST", f"/objects/{obj}/exec", {"sql": sql, "params": params or []})
