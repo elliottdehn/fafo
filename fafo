@@ -1,8 +1,9 @@
 #!/bin/sh
 # fafo — run the local instance like infrastructure: start it, forget it.
 #
-#   ./fafo up        build if needed, start in background, wait until healthy
-#   ./fafo down      graceful stop (SIGTERM -> leases tombstoned)
+#   ./fafo up        build if needed, run in THIS terminal (Ctrl-C stops it)
+#   ./fafo up -d     run in the background instead — start it, forget it
+#   ./fafo down      graceful stop of a backgrounded instance
 #   ./fafo status    liveness + placement stats
 #   ./fafo logs [n]  tail the log
 #   ./fafo nuke      stop and wipe all local state
@@ -25,24 +26,61 @@ case "${1:-}" in
       exit 0
     fi
     if [ ! -x ./target/release/fafo ]; then
-      echo "first run: building fafo (bundled SQLite compiles too — a few minutes)..."
+      echo "first run: building fafo (bundled SQLite compiles too — a minute or two)..."
     fi
     cargo build --release
     mkdir -p "$DATA"
-    DATA_DIR=$DATA PORT=$PORT nohup ./target/release/fafo >> "$LOG" 2>&1 &
-    echo $! > "$PIDFILE"
+    if [ "${2:-}" = "-d" ]; then
+      DATA_DIR=$DATA PORT=$PORT nohup ./target/release/fafo >> "$LOG" 2>&1 &
+      echo $! > "$PIDFILE"
+      i=0
+      while [ $i -lt 50 ]; do
+        if curl -sf "http://127.0.0.1:$PORT/healthz" > /dev/null 2>&1; then
+          echo "fafo up on http://127.0.0.1:$PORT (pid $(cat "$PIDFILE"), data in $DATA)"
+          echo "it's yours now — see AGENTS.md; ./fafo down stops it"
+          exit 0
+        fi
+        i=$((i + 1))
+        sleep 0.1
+      done
+      echo "fafo failed to become healthy; last log lines:" >&2
+      tail -5 "$LOG" >&2
+      exit 1
+    fi
+    DATA_DIR=$DATA PORT=$PORT ./target/release/fafo &
+    SRV=$!
+    echo $SRV > "$PIDFILE"
+    trap 'kill -TERM "$SRV" 2>/dev/null' INT TERM
     i=0
     while [ $i -lt 50 ]; do
       if curl -sf "http://127.0.0.1:$PORT/healthz" > /dev/null 2>&1; then
-        echo "fafo up on http://127.0.0.1:$PORT (pid $(cat "$PIDFILE"), data in $DATA)"
-        exit 0
+        cat <<EOF
+
+  fafo is up — this terminal is the database (Ctrl-C stops it cleanly).
+
+  try it from another terminal:
+
+    curl -X POST localhost:$PORT/objects/hello/exec \
+      -H 'content-type: application/json' \
+      -d '{"ops":[{"sql":"CREATE TABLE IF NOT EXISTS notes (body TEXT)"},
+                  {"sql":"INSERT INTO notes VALUES (?1)","params":["hello fafo"]}]}'
+
+    curl -X POST localhost:$PORT/objects/hello/query \
+      -H 'content-type: application/json' \
+      -d '{"sql":"SELECT * FROM notes"}'
+
+  that "hello" object is its own SQLite database; state survives restarts
+  in $DATA. cross-object transactions, long-polls, WebSockets: AGENTS.md.
+  prefer the background? ./fafo up -d
+
+EOF
+        break
       fi
       i=$((i + 1))
       sleep 0.1
     done
-    echo "fafo failed to become healthy; last log lines:" >&2
-    tail -5 "$LOG" >&2
-    exit 1
+    wait "$SRV" || true
+    rm -f "$PIDFILE"
     ;;
   down)
     if running; then

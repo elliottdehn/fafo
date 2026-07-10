@@ -15,8 +15,8 @@ world, restart in any shape, pick up where it left off.
 ## Use it as infrastructure
 
 ```sh
-./fafo up      # start in background, wait until healthy — then forget it
-./fafo down    # graceful stop; ./fafo nuke wipes state
+./fafo up      # build if needed, run right here — Ctrl-C stops it cleanly
+./fafo up -d   # or in the background: start it, forget it (./fafo down stops)
 ```
 
 Then program against `http://127.0.0.1:8787` — **see [AGENTS.md](AGENTS.md)

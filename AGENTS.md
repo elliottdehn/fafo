@@ -8,14 +8,15 @@ internals to use it — this file is the contract.
 ## Run it, then forget it
 
 ```sh
-./fafo up        # builds if needed, starts in background, waits until healthy
+./fafo up -d     # builds if needed, starts in background, waits until healthy
 ./fafo status    # liveness + placement stats
 ./fafo down      # graceful stop (state persists in ./data)
 ./fafo logs 100  # tail the log
 ./fafo nuke      # stop and wipe ALL local state
 ```
 
-`./fafo up` is idempotent — safe to call at the top of any script. Default
+`./fafo up -d` is idempotent — safe to call at the top of any script (plain
+`./fafo up` runs in the foreground for humans trying it out). Default
 port 8787 (`FAFO_PORT` to change), state in `./data` (`FAFO_DATA`). State
 survives stop/start/kill -9; `nuke` is the only thing that deletes data.
 
