@@ -31,6 +31,7 @@ use crate::cluster::{
     Node, Op, OpResult, TakeError, TransferMeta, TxnResponse, VisitInfo, checkpoint_key,
 };
 use crate::delta::{self, COMPACT_CHAIN, COMPACT_FRACTION_DENOM, DELTA_MIN_BYTES, Manifest};
+use crate::grants;
 use crate::object::{LiveObject, evict, fetch_image, materialize, object_key, purge};
 use crate::store::BlobStore;
 use serde::{Deserialize, Serialize};
@@ -56,6 +57,9 @@ pub enum WorkerMsg {
         /// if its condition doesn't hold at the serialization point, it
         /// parks instead of replying and is re-checked after every write.
         poll: Option<PollOpts>,
+        /// Capability-holder txns run under SQLite's authorizer: every
+        /// action (through CTEs and trigger cascades) must be granted.
+        cap: Option<std::sync::Arc<grants::Capability>>,
         /// Optimistic txns are acked after local apply and ship in the next
         /// boat; pessimistic txns hold their ack until the boat is durable
         /// (and thereby act as flush barriers for everything before them).
@@ -159,6 +163,7 @@ struct Parked {
     read_only: bool,
     optimistic: bool,
     poll: Option<PollOpts>,
+    cap: Option<std::sync::Arc<grants::Capability>>,
     resp: oneshot::Sender<Result<TxnResponse, ApiError>>,
     /// How many participants (in sorted order) we hold queue heads for.
     acquired: usize,
@@ -285,6 +290,7 @@ impl Worker {
                 ops,
                 read_only,
                 poll,
+                cap,
                 optimistic,
                 resp,
             } => {
@@ -298,6 +304,7 @@ impl Worker {
                         read_only,
                         optimistic,
                         poll,
+                        cap,
                         resp,
                         acquired: 0,
                         taking: false,
@@ -1044,7 +1051,10 @@ impl Worker {
         }
 
         // Apply locally; durability is the boat's job.
-        match self.apply(&p.participants, &p.ops, p.read_only).await {
+        match self
+            .apply(&p.participants, &p.ops, p.read_only, p.cap.as_deref())
+            .await
+        {
             Err(e) => {
                 let _ = p.resp.send(Err(e));
             }
@@ -1202,6 +1212,7 @@ impl Worker {
         participants: &[String],
         ops: &[Op],
         read_only: bool,
+        cap: Option<&grants::Capability>,
     ) -> Result<(Vec<OpResult>, Vec<String>), ApiError> {
         // Participants are guaranteed live: advance() activates cold
         // objects (off-loop) before a txn is allowed to run.
@@ -1234,10 +1245,34 @@ impl Worker {
             .iter()
             .map(|id| file_change_counter(&self.objects[id].live_path))
             .collect();
+        // Capability holders run under SQLite's own authorizer: it fires
+        // at prepare time for every action — through CTEs and trigger
+        // cascades — so an insert-only token cannot smuggle an UPDATE in
+        // anywhere. Installed per participant (a cross-object txn may
+        // carry different verbs per object), removed before COMMIT.
+        if let Some(cap) = cap {
+            for id in participants {
+                let object = id.clone();
+                let cap = std::sync::Arc::new(cap.clone());
+                conn_of(&self.objects, id).authorizer(Some(
+                    move |ctx: rusqlite::hooks::AuthContext<'_>| cap_gate(&cap, &object, &ctx),
+                ));
+            }
+        }
+        let clear_authorizers = |objects: &HashMap<String, LiveObject>| {
+            if cap.is_some() {
+                for id in participants {
+                    conn_of(objects, id).authorizer(
+                        None::<fn(rusqlite::hooks::AuthContext<'_>) -> rusqlite::hooks::Authorization>,
+                    );
+                }
+            }
+        };
         for id in participants {
-            conn_of(&self.objects, id)
-                .execute_batch("BEGIN")
-                .map_err(|e| ApiError::internal(e.to_string()))?;
+            if let Err(e) = conn_of(&self.objects, id).execute_batch("BEGIN") {
+                clear_authorizers(&self.objects);
+                return Err(ApiError::internal(e.to_string()));
+            }
         }
 
         let mut results = Vec::with_capacity(ops.len());
@@ -1255,10 +1290,12 @@ impl Worker {
             for id in participants {
                 let _ = conn_of(&self.objects, id).execute_batch("ROLLBACK");
             }
+            clear_authorizers(&self.objects);
             return Err(ApiError::bad_request(format!(
                 "op failed, transaction rolled back: {msg}"
             )));
         }
+        clear_authorizers(&self.objects);
 
         let mut commit_err = None;
         for id in participants {
@@ -1297,6 +1334,51 @@ impl Worker {
             .map(|(id, _)| id.clone())
             .collect();
         Ok((results, changed))
+    }
+}
+
+/// SQLite authorizer gate for capability holders. Maps engine actions to
+/// grant verbs; reads inside a write txn are allowed for anyone holding
+/// any verb on the object (you cannot meaningfully UPDATE without reading
+/// the WHERE columns), while top-level reads go through the "read" verb at
+/// the API layer. PRAGMA and ATTACH are flatly denied to capabilities.
+fn cap_gate(
+    cap: &grants::Capability,
+    object: &str,
+    ctx: &rusqlite::hooks::AuthContext<'_>,
+) -> rusqlite::hooks::Authorization {
+    use rusqlite::hooks::{AuthAction, Authorization};
+    let verb = match ctx.action {
+        AuthAction::Insert { .. } => "insert",
+        AuthAction::Update { .. } => "update",
+        AuthAction::Delete { .. } => "delete",
+        AuthAction::Read { .. } => {
+            let any = ["read", "insert", "update", "delete", "ddl"]
+                .iter()
+                .any(|v| grants::allows(cap, object, v));
+            return if any {
+                Authorization::Allow
+            } else {
+                Authorization::Deny
+            };
+        }
+        AuthAction::Select
+        | AuthAction::Function { .. }
+        | AuthAction::Transaction { .. }
+        | AuthAction::Savepoint { .. }
+        | AuthAction::Recursive => return Authorization::Allow,
+        AuthAction::Pragma { .. } | AuthAction::Attach { .. } | AuthAction::Detach { .. } => {
+            return Authorization::Deny;
+        }
+        // Everything else is schema-shaped: CREATE/DROP/ALTER/REINDEX/...,
+        // temp variants included. Unknown actions land here too — deny by
+        // default is the right failure mode for a security gate.
+        _ => "ddl",
+    };
+    if grants::allows(cap, object, verb) {
+        Authorization::Allow
+    } else {
+        Authorization::Deny
     }
 }
 

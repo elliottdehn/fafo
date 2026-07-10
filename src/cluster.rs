@@ -858,10 +858,24 @@ pub async fn submit(
     read_only: bool,
     optimistic: bool,
 ) -> Result<TxnResponse, ApiError> {
+    submit_as(node, None, objects, ops, read_only, optimistic).await
+}
+
+/// submit with a capability attached: the txn runs under SQLite's
+/// authorizer at the owning worker, so every engine action (through CTEs
+/// and trigger cascades) must be covered by the token's verbs.
+pub async fn submit_as(
+    node: &Node,
+    cap: Option<std::sync::Arc<crate::grants::Capability>>,
+    objects: Vec<String>,
+    ops: Vec<Op>,
+    read_only: bool,
+    optimistic: bool,
+) -> Result<TxnResponse, ApiError> {
     let ids = validate_txn(objects, &ops)?;
     node.clock.fetch_add(1, Ordering::Relaxed);
     node.stats.total_txns.fetch_add(1, Ordering::Relaxed);
-    submit_routed(node, ids, ops, read_only, optimistic).await
+    submit_routed(node, cap, ids, ops, read_only, optimistic).await
 }
 
 /// Shared txn validation: sorted, deduped participant ids, every op's
@@ -893,6 +907,7 @@ pub fn validate_txn(objects: Vec<String>, ops: &[Op]) -> Result<Vec<String>, Api
 /// Routing half of submit, callable from the RPC handler (already validated).
 pub async fn submit_routed(
     node: &Node,
+    cap: Option<std::sync::Arc<crate::grants::Capability>>,
     ids: Vec<String>,
     ops: Vec<Op>,
     read_only: bool,
@@ -922,6 +937,7 @@ pub async fn submit_routed(
             ops,
             read_only,
             poll: None,
+            cap,
             optimistic,
             resp: rtx,
         })
@@ -936,14 +952,31 @@ pub async fn submit_routed(
                 ApiError::internal(format!("no live node holds logical worker {target}"))
             })?,
         };
-        match crate::rpc::forward_txn(node, &addr, ids.clone(), ops.clone(), read_only, optimistic)
-            .await
+        match crate::rpc::forward_txn(
+            node,
+            &addr,
+            cap.as_deref().cloned(),
+            ids.clone(),
+            ops.clone(),
+            read_only,
+            optimistic,
+        )
+        .await
         {
             // Transport failure: the cached address may belong to a dead
             // world. Re-read the lease and retry once at the new holder.
             Err(e) if e.message.starts_with("rpc to") => match resolve_addr(node, target).await {
                 Some(fresh) if fresh != addr => {
-                    crate::rpc::forward_txn(node, &fresh, ids, ops, read_only, optimistic).await
+                    crate::rpc::forward_txn(
+                        node,
+                        &fresh,
+                        cap.as_deref().cloned(),
+                        ids,
+                        ops,
+                        read_only,
+                        optimistic,
+                    )
+                    .await
                 }
                 _ => Err(e),
             },
@@ -999,6 +1032,7 @@ pub async fn submit_poll(
             conn,
             frame,
         }),
+        cap: None,
         optimistic: false,
         resp: rtx,
     })
@@ -2587,6 +2621,249 @@ mod tests {
         // A write that actually changes bytes still ships.
         publish(&node, &room, "real", false).await;
         assert_eq!(node.stats().await.ships, ships_before + 1);
+        node.shutdown().await;
+    }
+
+    // ==================================================== capability verbs
+    //
+    // Inserts, updates, and deletes are different powers. Enforcement is
+    // SQLite's authorizer at prepare time — CTEs and trigger cascades are
+    // classified by the engine itself, not by keyword sniffing.
+
+    fn test_cap(objects: &str, verbs: &[&str]) -> std::sync::Arc<crate::grants::Capability> {
+        std::sync::Arc::new(crate::grants::Capability {
+            grants: vec![crate::grants::Grant {
+                objects: objects.into(),
+                verbs: verbs.iter().map(|s| s.to_string()).collect(),
+            }],
+            exp: u64::MAX,
+            sub: None,
+        })
+    }
+
+    async fn exec_as(
+        node: &Node,
+        cap: std::sync::Arc<crate::grants::Capability>,
+        object: &str,
+        sql: &str,
+    ) -> Result<TxnResponse, ApiError> {
+        submit_as(
+            node,
+            Some(cap),
+            vec![object.to_string()],
+            vec![Op {
+                object: object.to_string(),
+                sql: sql.to_string(),
+                params: vec![],
+            }],
+            false,
+            false,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn insert_only_tokens_append_and_nothing_else() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = boot(dir.path(), 4, ClaimSpec::All, "a").await;
+        let log = id_on_worker(1, 4, "log");
+        exec(
+            &node,
+            &[&log],
+            &[(&log, "CREATE TABLE events (id INTEGER PRIMARY KEY AUTOINCREMENT, body TEXT)")],
+        )
+        .await
+        .unwrap();
+
+        let appender = test_cap(&log, &["insert"]);
+        exec_as(&node, appender.clone(), &log, "INSERT INTO events (body) VALUES ('e1')")
+            .await
+            .unwrap();
+
+        for sql in [
+            "UPDATE events SET body = 'rewritten' WHERE id = 1",
+            "DELETE FROM events",
+            "DROP TABLE events",
+            "CREATE TABLE sneaky (x)",
+            "PRAGMA journal_mode = DELETE",
+        ] {
+            let err = exec_as(&node, appender.clone(), &log, sql).await.unwrap_err();
+            assert_eq!(
+                err.status,
+                axum::http::StatusCode::BAD_REQUEST,
+                "{sql} must be denied"
+            );
+            assert!(
+                err.message.contains("not authorized") || err.message.contains("rolled back"),
+                "{sql}: {}",
+                err.message
+            );
+        }
+
+        // History intact, append still works.
+        exec_as(&node, appender, &log, "INSERT INTO events (body) VALUES ('e2')")
+            .await
+            .unwrap();
+        let res = exec(&node, &[&log], &[(&log, "SELECT COUNT(*) AS c FROM events")])
+            .await
+            .unwrap();
+        let v = serde_json::to_value(&res.results).unwrap();
+        assert_eq!(v[0]["rows"][0]["c"], 2);
+        node.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn trigger_cascades_cannot_smuggle_verbs() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = boot(dir.path(), 4, ClaimSpec::All, "a").await;
+        let obj = id_on_worker(2, 4, "audited");
+        // Root installs a trigger: inserting into inbox DELETEs from audit.
+        // An insert-only token inserting into inbox would transitively
+        // delete — the authorizer sees the trigger's DELETE at prepare
+        // time and refuses the whole statement.
+        exec(
+            &node,
+            &[&obj],
+            &[
+                (&obj, "CREATE TABLE inbox (body TEXT)"),
+                (&obj, "CREATE TABLE audit (note TEXT)"),
+                (&obj, "INSERT INTO audit VALUES ('important')"),
+                (
+                    &obj,
+                    "CREATE TRIGGER purge AFTER INSERT ON inbox BEGIN DELETE FROM audit; END",
+                ),
+            ],
+        )
+        .await
+        .unwrap();
+
+        let appender = test_cap(&obj, &["insert"]);
+        let err = exec_as(&node, appender, &obj, "INSERT INTO inbox VALUES ('hi')")
+            .await
+            .unwrap_err();
+        assert!(
+            err.message.contains("not authorized"),
+            "trigger cascade must be caught: {}",
+            err.message
+        );
+
+        // With delete granted too, the same statement (and its cascade) runs.
+        let both = test_cap(&obj, &["insert", "delete"]);
+        exec_as(&node, both, &obj, "INSERT INTO inbox VALUES ('hi')")
+            .await
+            .unwrap();
+        let res = exec(&node, &[&obj], &[(&obj, "SELECT COUNT(*) AS c FROM audit")])
+            .await
+            .unwrap();
+        let v = serde_json::to_value(&res.results).unwrap();
+        assert_eq!(v[0]["rows"][0]["c"], 0, "cascade ran once authorized");
+        node.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn update_tokens_can_read_their_where_clause_but_ctes_cant_sneak_inserts() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = boot(dir.path(), 4, ClaimSpec::All, "a").await;
+        let obj = id_on_worker(1, 4, "acct2");
+        make_account(&node, &obj).await; // balance 100
+
+        // UPDATE needs to read the WHERE column: allowed for any verb
+        // holder on the object (you can't meaningfully update blind).
+        let updater = test_cap(&obj, &["update"]);
+        exec_as(
+            &node,
+            updater.clone(),
+            &obj,
+            "UPDATE account SET balance = 50 WHERE balance = 100",
+        )
+        .await
+        .unwrap();
+        assert_eq!(balance(&node, &obj).await, 50);
+
+        // A WITH ... INSERT is still an INSERT, whatever it starts with.
+        let err = exec_as(
+            &node,
+            updater,
+            &obj,
+            "WITH x(v) AS (SELECT 1) INSERT INTO account SELECT v FROM x",
+        )
+        .await
+        .unwrap_err();
+        assert!(err.message.contains("not authorized"), "{}", err.message);
+        node.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn cross_object_txns_enforce_per_object_verbs() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = boot(dir.path(), 8, ClaimSpec::All, "a").await;
+        let acct = id_on_worker(1, 8, "acct3");
+        let outbox = id_on_worker(6, 8, "outbox3");
+        make_account(&node, &acct).await;
+        make_channel(&node, &outbox).await;
+
+        // update on the account, insert on the channel: the outbox shape,
+        // with each object's connection gated by its own verbs.
+        let cap = std::sync::Arc::new(crate::grants::Capability {
+            grants: vec![
+                crate::grants::Grant {
+                    objects: acct.clone(),
+                    verbs: vec!["update".into()],
+                },
+                crate::grants::Grant {
+                    objects: outbox.clone(),
+                    verbs: vec!["insert".into()],
+                },
+            ],
+            exp: u64::MAX,
+            sub: None,
+        });
+        submit_as(
+            &node,
+            Some(cap.clone()),
+            vec![acct.clone(), outbox.clone()],
+            vec![
+                Op {
+                    object: acct.clone(),
+                    sql: "UPDATE account SET balance = balance - 10".into(),
+                    params: vec![],
+                },
+                Op {
+                    object: outbox.clone(),
+                    sql: "INSERT INTO msgs (body) VALUES ('spent 10')".into(),
+                    params: vec![],
+                },
+            ],
+            false,
+            false,
+        )
+        .await
+        .unwrap();
+
+        // Swap the verbs across objects: both directions must fail.
+        let err = submit_as(
+            &node,
+            Some(cap),
+            vec![acct.clone(), outbox.clone()],
+            vec![
+                Op {
+                    object: acct.clone(),
+                    sql: "INSERT INTO account (balance) VALUES (5)".into(),
+                    params: vec![],
+                },
+                Op {
+                    object: outbox,
+                    sql: "INSERT INTO msgs (body) VALUES ('x')".into(),
+                    params: vec![],
+                },
+            ],
+            false,
+            false,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.message.contains("not authorized"), "{}", err.message);
+        assert_eq!(balance(&node, &acct).await, 90, "the atomic txn rolled back whole");
         node.shutdown().await;
     }
 }

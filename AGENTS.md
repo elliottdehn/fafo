@@ -134,6 +134,37 @@ your socket; if that node itself dies, it can't. Pair presence rows with
 an `expires_at` column refreshed on a heartbeat and filter it in the view
 query — the will is the fast path, the expiry is the backstop.
 
+### Capability tokens: connecting untrusted devices
+
+The root `API_TOKEN` is your backend's credential. To let end-user devices
+connect directly, mint capability tokens — per-object, per-verb grants,
+verified statelessly by every node (HMAC over the cluster secret; nothing
+to look up, nothing to revoke: keep TTLs short):
+
+```sh
+curl -sX POST $F/grant -H "authorization: Bearer $ROOT" \
+  -H 'content-type: application/json' -d '{
+    "grants": [
+      { "objects": "room-42",   "verbs": ["read", "poll", "insert"] },
+      { "objects": "user-77-*", "verbs": ["read", "write", "poll"] }
+    ], "ttl_secs": 900, "sub": "user-77" }'
+# -> { "token": "fafo1.…", "exp": 1783… }
+```
+
+The token goes wherever the root token would (bearer header, or the
+`fafo-token.` subprotocol on WebSocket). Verbs: `read`, `insert`,
+`update`, `delete`, `ddl`, `poll` — plus `write` as shorthand for the
+four write verbs. Inserts, updates, and deletes are deliberately separate
+powers: publish-to-a-channel is not rewrite-history. Enforcement is
+SQLite's own authorizer at statement-prepare time, so CTEs and trigger
+cascades are classified by the engine — an insert-only token cannot
+smuggle a DELETE through a trigger. `PRAGMA` and `ATTACH` are always
+denied to capability holders; `/stats`, `/objects`, and `/grant` need
+root. Wills run under the grants frozen at arm time, so an expired token
+still keeps its already-authorized promise. Objects match exactly or by
+prefix glob (`user-77-*`) — design your object ids so tenancy is a
+prefix.
+
 ## HTTP API (debugging & scripts)
 
 Same transactions, one request each. Base URL: `http://127.0.0.1:8787`.

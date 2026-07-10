@@ -26,6 +26,11 @@ pub enum Request {
         read_only: bool,
         #[serde(default)]
         optimistic: bool,
+        /// The caller's capability travels with a proxied txn so the owning
+        /// node's authorizer enforces the same verbs. The RPC channel is
+        /// cluster-secret-authed, so the grants are trusted as presented.
+        #[serde(default)]
+        cap: Option<crate::grants::Capability>,
     },
     Take {
         worker: usize,
@@ -104,6 +109,7 @@ pub async fn health(node: &Node, base: &str) -> bool {
 pub async fn forward_txn(
     node: &Node,
     base: &str,
+    cap: Option<crate::grants::Capability>,
     objects: Vec<String>,
     ops: Vec<Op>,
     read_only: bool,
@@ -117,6 +123,7 @@ pub async fn forward_txn(
             ops,
             read_only,
             optimistic,
+            cap,
         },
     )
     .await
