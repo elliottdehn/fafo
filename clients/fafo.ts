@@ -138,6 +138,21 @@ export class Fafo {
     return this.call("GET", "/stats");
   }
 
+  /**
+   * Mint a capability token (root token required): per-object, per-verb
+   * grants safe to hand to untrusted end-user devices. Verbs: read,
+   * insert, update, delete, ddl, poll — or "write" (= the four write
+   * verbs). Objects match exactly or by prefix glob ("user-77-*").
+   * Keep TTLs short; verification is stateless, so expiry IS revocation.
+   */
+  async grant(
+    grants: { objects: string; verbs: string[] }[],
+    ttlSecs: number,
+    sub?: string,
+  ): Promise<{ token: string; exp: number }> {
+    return this.call("POST", "/grant", { grants, ttl_secs: ttlSecs, sub });
+  }
+
   /** Open a persistent connection: many transactions, one socket. */
   connect(): Promise<FafoSocket> {
     return FafoSocket.open(this["base"], this["token"]);
