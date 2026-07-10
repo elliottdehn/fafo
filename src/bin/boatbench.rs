@@ -61,6 +61,7 @@ async fn boot(root: &std::path::Path, blobs: &str, tag: &str) -> Node {
         api_token: None,
         max_unshipped: cluster::DEFAULT_MAX_UNSHIPPED,
         limits: fafo::limits::Limits::detect(),
+        fence_ttl: std::time::Duration::from_secs(10),
     })
     .await
     .unwrap()

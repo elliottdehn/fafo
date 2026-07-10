@@ -3,8 +3,8 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>ScaleWarm — data that keeps itself warm</title>
-<meta name="description" content="ScaleWarm is a transactional object store: one SQL database per object, ACID across objects, placement that learns from your workload, durability at object-storage prices.">
+<title>ScaleWarm — data that scales itself</title>
+<meta name="description" content="ScaleWarm is a transactional object store: one SQL database per object or per tenant, ACID across objects, a million virtual shards, placement and batching that tune themselves — at object-storage prices.">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,300;12..96,500;12..96,700;12..96,800&family=Instrument+Sans:ital,wght@0,400;0,500;0,600;1,400&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
@@ -309,8 +309,8 @@ footer{
   <div class="wrap hero">
     <div>
       <div class="eyebrow">Transactional object store</div>
-      <h1>Data that keeps <span class="warm">itself warm.</span></h1>
-      <p class="sub">One real SQL database per object. <strong>ACID transactions across objects.</strong> Placement that learns from your workload instead of asking you for a shard key. Durability at object-storage prices — and <strong>no server for you to operate.</strong></p>
+      <h1>Data that <span class="warm">scales itself.</span></h1>
+      <p class="sub">One real SQL database per object — an entity or a whole tenant. <strong>ACID transactions across objects.</strong> A million virtual shards that cost nothing until touched. Placement, batch size, and resource budgets that tune themselves. Durability at object-storage prices — and <strong>no server for you to operate.</strong></p>
       <div class="cta-row">
         <a class="btn btn-hot" href="#get">Run it before lunch</a>
         <a class="btn btn-ghost" href="#how">See how it works</a>
@@ -345,8 +345,8 @@ footer{
   <div class="wrap">
     <div class="stats">
       <div class="stat reveal"><b>75% → 13%</b><span>cross-node coordination, learned from live traffic — never configured</span></div>
-      <div class="stat reveal"><b>1 write</b><span>one blob PUT is the entire commit point; recovery is pure roll-forward</span></div>
-      <div class="stat reveal"><b>0 servers</b><span>compute is ephemeral and sleeps to zero; the bucket is the only truth</span></div>
+      <div class="stat reveal"><b>1,000,000</b><span>logical shards: booted, split across nodes, and transacting in under a second</span></div>
+      <div class="stat reveal"><b>~240&times;</b><span>write throughput in optimistic mode: acks in microseconds, durable within one storage round trip</span></div>
       <div class="stat reveal"><b>kill -9</b><span>a supported operation — stop the world, restart in any shape, resume</span></div>
     </div>
   </div>
@@ -380,12 +380,12 @@ footer{
 <section class="warm-sec" id="how">
   <div class="wrap">
     <div class="sec-eyebrow reveal">How it stays warm</div>
-    <h2 class="reveal">Three mechanics. No magic, only physics.</h2>
+    <h2 class="reveal">Four mechanics. No magic, only physics.</h2>
 
     <div class="mech reveal">
       <div>
         <h3>Every object is a real SQL database</h3>
-        <p>Not a JSON blob with pretensions — an actual SQLite database per object, with tables, indexes, and <span class="k">CHECK</span> constraints. Your invariants live in the schema, where they can't be forgotten by the one code path someone wrote at 2am.</p>
+        <p>Not a JSON blob with pretensions — an actual SQLite database per object, with tables, indexes, and <span class="k">CHECK</span> constraints. An object can be one entity or <strong style="color:var(--radiant)">a whole tenant's database</strong>: past 64&nbsp;KB, writes ship page deltas, so a tenant pays for what changed, not what it weighs. Measured: 500 writes to a 5&nbsp;MB tenant shipped 0.1&nbsp;MB.</p>
         <p>Transactions declare their participants up front and commit atomically across all of them. A constraint violation in one object rolls back every object. The transfer-between-accounts problem is an API call, not an architecture meeting.</p>
       </div>
       <div class="panel"><span class="c"># an "object" is one entity with real schema</span>
@@ -402,8 +402,8 @@ POST /objects/<span class="a">alice</span>/exec
     <div class="mech reveal">
       <div>
         <h3>The commit point is one write</h3>
-        <p>Object storage is the only durable truth. Local disks hold disposable working copies — which is why ephemeral containers, spot instances, and <span class="k">kill -9</span> are all fine. A transaction stages its snapshots, then commits with a single blob write. Crash before it: nothing happened. Crash after it: recovery rolls forward at the next boot, mechanically.</p>
-        <p>No quorums to keep fed. No replication topology to tend. The consensus you need is rented from the storage layer's conditional writes, and you only pay for it when ownership moves.</p>
+        <p>Object storage is the only durable truth. Local disks hold disposable working copies — which is why ephemeral containers, spot instances, and <span class="k">kill -9</span> are all fine. Writes coalesce into <strong style="color:var(--radiant)">boats</strong>: one blob write commits the whole batch, and boats sail as fast as storage allows, so batch size tunes itself to load. Crash before the record: nothing happened. After: recovery rolls forward, mechanically.</p>
+        <p>Per transaction, you choose the ack: <span class="k">optimistic</span> returns in microseconds and is durable within one round trip (a crash rewinds consistently, never corruptly); the default holds your ack until the boat lands — and certifies everything before it. Same database, both contracts.</p>
       </div>
       <div class="panel"><span class="c"># the entire commit protocol</span>
 <span class="a">1.</span> run SQL in local txns      <span class="c">(undoable)</span>
@@ -429,6 +429,21 @@ window        cross-node    migrations
 <span class="c">-- stop the world, restart --</span>
 0..1000        <span class="g">15.5%</span>          155
 <span class="c"># the fleet remembered. floor ≈ noise rate.</span></div>
+    </div>
+
+    <div class="mech reveal">
+      <div>
+        <h3>Scale is address space, not headcount</h3>
+        <p>Shards are virtual: declare a million of them and nothing happens — a shard costs a task, a file, a heartbeat only once it's <em>touched</em>. Leases cover fixed blocks of the shard space, so cluster bookkeeping is constant-size no matter how ambitious the namespace. There is no shard key to design and no resharding migration to schedule, ever.</p>
+        <p>The same self-sizing runs downward: each node reads its own container's memory limit at boot and folds its disk ledger, batch caps, and cache budgets to fit — the identical image runs on 256&nbsp;MB or 12&nbsp;GB without being told which it woke up in.</p>
+      </div>
+      <div class="panel"><span class="c"># measured, on a laptop</span>
+logical shards         <span class="g">1,000,000</span>
+nodes                  2 (auto-claiming)
+boot + split + txn     <span class="g">&lt; 1 second</span>
+worker tasks created   <span class="a">8</span>
+shard keys designed    <span class="e">0</span>
+config files written   <span class="e">0</span></div>
     </div>
   </div>
 </section>
@@ -506,7 +521,7 @@ const rows = await db.query(<span class="a">"alice"</span>, <span class="r">"SEL
       <li class="reveal"><b>Very cold, very large objects.</b> Writes ship page deltas — a multi-megabyte tenant database pays for what changed, not what it weighs — but <em>waking or migrating</em> a large object still transfers its full size. Physics keeps that one.</li>
       <li class="reveal"><b>Fleet-wide analytics.</b> There is no global SQL engine. "Average balance across all accounts" means fanning out over objects. Ship changes to a warehouse for that.</li>
       <li class="reveal"><b>One supernova object.</b> Each object has exactly one writer at a time — that's where the guarantees come from. Optimistic batching takes a single hot object to tens of thousands of writes per second; past one core's serial ceiling, you need redesign, not more nodes.</li>
-      <li class="reveal"><b>Sub-millisecond commits.</b> The commit point is a blob write. On local disk that's fast; against remote object storage it's a network round trip. Physics is undefeated.</li>
+      <li class="reveal"><b>Sub-millisecond <em>synchronous</em> durability.</b> Optimistic mode acks in microseconds with durability one storage round trip behind; if every single ack must be durable-before-reply in sub-millisecond time, the commit point is still a blob write and physics is undefeated.</li>
       <li class="reveal"><b>Decades of scar tissue.</b> Mature databases have survived failure modes we haven't met yet. If your blast radius is measured in careers, bring the grown-ups.</li>
     </ul>
     <p class="why reveal">Why tell you this? Because every system that hid its tradeoffs eventually introduced you to them personally, at 3am. Our pitch is that the guarantees are itemized — including the ones we don't sell.</p>

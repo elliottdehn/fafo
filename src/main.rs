@@ -73,6 +73,7 @@ async fn main() -> anyhow::Result<()> {
             Err(_) => limits.default_max_unshipped(),
         },
         limits,
+        fence_ttl: std::time::Duration::from_millis(env_or("FENCE_TTL_MS", "10000").parse()?),
     })
     .await?;
 

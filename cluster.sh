@@ -8,7 +8,7 @@ cargo build --release 2>/dev/null
 
 say() { printf '\n== %s\n' "$1"; }
 spawn() { # port claim-spec
-  DATA_DIR=$DATA PORT=$1 LOGICAL_WORKERS=16 CLAIM=$2 CLUSTER_SECRET=demo \
+  DATA_DIR=$DATA PORT=$1 LOGICAL_WORKERS=16 CLAIM=$2 CLUSTER_SECRET=demo FENCE_TTL_MS=500 \
     ./target/release/fafo > /dev/null 2>&1 &
   echo $!
 }

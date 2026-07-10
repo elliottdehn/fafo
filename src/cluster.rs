@@ -210,6 +210,13 @@ pub struct NodeConfig {
     /// Container resource budgets (disk ledger, boat byte cap, activation
     /// permits). `Limits::detect()` sizes them from cgroups/env.
     pub limits: crate::limits::Limits,
+    /// Fencing TTL. A commit may only pass the commit point within this
+    /// long of a verified lease (else it re-verifies inline), and a node
+    /// taking over a NON-tombstoned lease waits this long before its first
+    /// write — so a paused-then-resumed old holder always lands its final
+    /// commits before the new holder's first read. Closes the split-brain
+    /// window under bounded-clock-rate assumptions.
+    pub fence_ttl: std::time::Duration,
 }
 
 pub const DEFAULT_MAX_UNSHIPPED: u64 = 256 * 1024 * 1024;
@@ -244,6 +251,16 @@ pub struct NodeInner {
     /// Set by the lease guard just before fail-stop; checked at the commit
     /// point as a last line of defense.
     pub fenced: AtomicBool,
+    pub fence_ttl: std::time::Duration,
+    /// When our leases were last verified current, double-stamped: the
+    /// monotonic clock catches process pauses (it keeps ticking while we
+    /// don't); the wall clock catches system suspend (where monotonic
+    /// may sleep too). Stale on EITHER axis forces re-verification.
+    pub verified: Mutex<(std::time::Instant, std::time::SystemTime)>,
+    /// No commit may pass before this instant: set to claim time + TTL when
+    /// taking over a non-tombstoned lease, giving a paused predecessor's
+    /// recency gate time to expire first.
+    pub earliest_write: Mutex<std::time::Instant>,
     tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
 }
 
@@ -480,6 +497,9 @@ pub async fn start(cfg: NodeConfig) -> anyhow::Result<Node> {
         stats: Stats::default(),
         epochs: RwLock::new(HashMap::new()),
         fenced: AtomicBool::new(false),
+        fence_ttl: cfg.fence_ttl,
+        verified: Mutex::new((std::time::Instant::now(), std::time::SystemTime::now())),
+        earliest_write: Mutex::new(std::time::Instant::now()),
         tasks: Mutex::new(Vec::new()),
     });
 
@@ -546,6 +566,14 @@ pub async fn start(cfg: NodeConfig) -> anyhow::Result<Node> {
                 if !claimable {
                     continue;
                 }
+                // Taking over WITHOUT a tombstone means the holder may be
+                // paused, not dead: wait out its fencing TTL before our
+                // first write, so its last stale commits (if any) land
+                // strictly before we read or write anything.
+                if !lease.released {
+                    let mut ew = node.earliest_write.lock().unwrap();
+                    *ew = (*ew).max(std::time::Instant::now() + cfg.fence_ttl);
+                }
                 lease.epoch + 1
             }
             None => 1,
@@ -571,31 +599,19 @@ pub async fn start(cfg: NodeConfig) -> anyhow::Result<Node> {
         claimed += 1;
     }
 
+    // Claiming just created/verified our leases: stamp it.
+    *node.verified.lock().unwrap() = (std::time::Instant::now(), std::time::SystemTime::now());
+
     // Lease guard: fail-stop if any of our epochs gets superseded. Losing a
     // lease means another node is now the writer for that worker; continuing
     // would violate single-writer. Exiting the whole process is the correct
-    // (fail-stop) response, not a recoverable error.
+    // (fail-stop) response, not a recoverable error. Each clean sweep also
+    // refreshes the recency stamps the commit gate checks.
     let guard_node = node.clone();
     node.tasks.lock().unwrap().push(tokio::spawn(async move {
         loop {
             tokio::time::sleep(LEASE_GUARD_INTERVAL).await;
-            let epochs: Vec<(usize, u64)> = {
-                let e = guard_node.epochs.read().unwrap();
-                e.iter().map(|(w, e)| (*w, *e)).collect()
-            };
-            for (b, mine) in epochs {
-                match latest_lease(guard_node.store.as_ref(), b).await {
-                    Ok(Some(lease)) if lease.epoch > mine => {
-                        guard_node.fenced.store(true, Ordering::SeqCst);
-                        eprintln!(
-                            "FENCED: lease for block {b} superseded (epoch {} > {mine}); fail-stopping",
-                            lease.epoch
-                        );
-                        std::process::exit(1);
-                    }
-                    _ => {}
-                }
-            }
+            verify_leases(&guard_node).await;
         }
     }));
 
@@ -607,6 +623,54 @@ pub async fn start(cfg: NodeConfig) -> anyhow::Result<Node> {
         blocks
     );
     Ok(node)
+}
+
+/// Re-check every lease this node holds. Superseded -> fail-stop (the flag
+/// is set first so in-flight commits refuse the commit point). All current
+/// -> refresh the recency stamps the commit gate relies on.
+pub async fn verify_leases(node: &Node) -> bool {
+    let epochs: Vec<(usize, u64)> = {
+        let e = node.epochs.read().unwrap();
+        e.iter().map(|(b, e)| (*b, *e)).collect()
+    };
+    for (b, mine) in epochs {
+        if let Ok(Some(lease)) = latest_lease(node.store.as_ref(), b).await
+            && lease.epoch > mine
+        {
+            fail_stop(
+                node,
+                &format!(
+                    "lease for block {b} superseded (epoch {} > {mine})",
+                    lease.epoch
+                ),
+            );
+            return false;
+        }
+    }
+    *node.verified.lock().unwrap() = (std::time::Instant::now(), std::time::SystemTime::now());
+    true
+}
+
+/// Are the recency stamps too old to trust for a commit? Stale on either
+/// clock: monotonic catches process pauses, wall catches system suspend.
+pub fn lease_stale(node: &Node) -> bool {
+    let (mono, wall) = *node.verified.lock().unwrap();
+    if mono.elapsed() > node.fence_ttl {
+        return true;
+    }
+    std::time::SystemTime::now()
+        .duration_since(wall)
+        .map(|d| d > node.fence_ttl)
+        .unwrap_or(false) // wall clock went backwards (NTP): trust monotonic
+}
+
+fn fail_stop(node: &Node, msg: &str) {
+    node.fenced.store(true, Ordering::SeqCst);
+    eprintln!("FENCED: {msg}; fail-stopping");
+    // Under test, exiting would take the whole test runner with us; the
+    // fenced flag (which the commit gate honors) stands in for death.
+    #[cfg(not(test))]
+    std::process::exit(1);
 }
 
 /// Get (or lazily spawn) the local worker task for a logical worker this
@@ -887,6 +951,7 @@ mod tests {
             api_token: None,
             max_unshipped: DEFAULT_MAX_UNSHIPPED,
             limits: crate::limits::Limits::detect(),
+            fence_ttl: std::time::Duration::from_secs(60),
         })
         .await
         .unwrap()
@@ -1293,6 +1358,7 @@ mod tests {
             api_token: None,
             max_unshipped: DEFAULT_MAX_UNSHIPPED,
             limits: crate::limits::Limits::detect(),
+            fence_ttl: std::time::Duration::from_secs(60),
         })
         .await
         .unwrap();
@@ -1392,6 +1458,7 @@ mod tests {
             api_token: None,
             max_unshipped: DEFAULT_MAX_UNSHIPPED,
             limits,
+            fence_ttl: std::time::Duration::from_secs(60),
         })
         .await
         .unwrap();
@@ -1468,6 +1535,7 @@ mod tests {
             api_token: None,
             max_unshipped: DEFAULT_MAX_UNSHIPPED,
             limits,
+            fence_ttl: std::time::Duration::from_secs(60),
         })
         .await
         .unwrap();
@@ -1564,6 +1632,98 @@ mod tests {
         );
         node_a.shutdown().await;
         node_b.shutdown().await;
+    }
+
+    async fn boot_fenced(
+        root: &std::path::Path,
+        tag: &str,
+        fence_ttl: std::time::Duration,
+    ) -> Node {
+        let store: Arc<dyn BlobStore> = Arc::new(FsBlobStore::new(root.join("blobs")).unwrap());
+        start(NodeConfig {
+            store,
+            live_dir: root.join(format!("live-{tag}")),
+            logical: 4,
+            claim: ClaimSpec::All,
+            bind: "127.0.0.1:0".into(),
+            advertise: None,
+            hysteresis: 200,
+            secret: "test".into(),
+            api_token: None,
+            max_unshipped: DEFAULT_MAX_UNSHIPPED,
+            limits: crate::limits::Limits::detect(),
+            fence_ttl,
+        })
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn takeover_of_unreleased_lease_waits_out_the_fence_ttl() {
+        let dir = tempfile::tempdir().unwrap();
+        let store: Arc<dyn BlobStore> = Arc::new(FsBlobStore::new(dir.path().join("blobs")).unwrap());
+        // A dead holder left non-tombstoned leases behind (kill -9 world).
+        let corpse = serde_json::to_vec(&Lease {
+            addr: "http://127.0.0.1:9".into(),
+        })
+        .unwrap();
+        for b in 0..4 {
+            store.put(&format!("_lease/b{b}/e1.json"), &corpse).await.unwrap();
+        }
+
+        let ttl = std::time::Duration::from_millis(400);
+        let node = boot_fenced(dir.path(), "a", ttl).await;
+        let claimed_at = std::time::Instant::now();
+
+        // First WRITE must not land before the predecessor's TTL expires.
+        exec(&node, &["obj"], &[("obj", "CREATE TABLE t (n INTEGER)")])
+            .await
+            .unwrap();
+        let elapsed = claimed_at.elapsed();
+        assert!(
+            elapsed >= std::time::Duration::from_millis(300),
+            "first commit should wait out the fence TTL, took {elapsed:?}"
+        );
+        node.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn stale_lease_is_refused_at_the_commit_point() {
+        let dir = tempfile::tempdir().unwrap();
+        let ttl = std::time::Duration::from_millis(200);
+        let node = boot_fenced(dir.path(), "a", ttl).await;
+
+        let alice = id_on_worker(1, 4, "alice"); // W=4 => block 1
+        make_account(&node, &alice).await;
+
+        // Simulate a takeover happening while this node is "paused": another
+        // node writes a higher epoch for alice's block.
+        let usurper = serde_json::to_vec(&Lease {
+            addr: "http://127.0.0.1:9".into(),
+        })
+        .unwrap();
+        node.store.put("_lease/b1/e2.json", &usurper).await.unwrap();
+
+        // Let the recency stamp go stale (the guard's 5s tick hasn't run),
+        // then try to commit: the gate must verify inline, discover the
+        // usurper, flag the node fenced, and refuse the commit point.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let err = exec(
+            &node,
+            &[&alice],
+            &[(&alice, "UPDATE account SET balance = balance - 1")],
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.message.contains("superseded") || err.message.contains("fenced"),
+            "commit must be refused, got: {}",
+            err.message
+        );
+        assert!(
+            node.fenced.load(std::sync::atomic::Ordering::SeqCst),
+            "node should consider itself fenced"
+        );
     }
 
     #[tokio::test]

@@ -1135,8 +1135,22 @@ async fn ship_task(
         err = Some(e.to_string());
     }
 
-    // Fencing, last line of defense: refuse the commit point if the lease
-    // guard has flagged us as superseded.
+    // Fencing gate. Three layers, cheapest first:
+    // 1. wait out earliest_write — a takeover of a possibly-paused
+    //    predecessor must let its recency TTL expire before we write;
+    // 2. recency: if our lease hasn't been verified within the TTL (we may
+    //    BE that paused predecessor, just woken), verify inline right now;
+    // 3. the fenced flag, set by any failed verification.
+    if err.is_none() {
+        let deadline = *node.earliest_write.lock().unwrap();
+        let wait = deadline.saturating_duration_since(std::time::Instant::now());
+        if !wait.is_zero() {
+            tokio::time::sleep(wait).await;
+        }
+        if crate::cluster::lease_stale(&node) && !crate::cluster::verify_leases(&node).await {
+            err = Some("lease superseded; commit refused".into());
+        }
+    }
     if err.is_none() && node.fenced.load(Ordering::SeqCst) {
         err = Some("node is fenced; commit refused".into());
     }

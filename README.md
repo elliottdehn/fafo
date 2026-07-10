@@ -44,6 +44,7 @@ cargo test                       # atomicity, serializability, cross-node, recov
 | `CLUSTER_SECRET` | dev default + warning | shared secret for `/internal/rpc` |
 | `API_TOKEN` | unset (open) | bearer token required on the public API |
 | `HYST` | `200` | hysteresis tenure; `0` disables |
+| `FENCE_TTL_MS` | `10000` | fencing recency window + takeover wait-out (dev/demos can lower it) |
 
 ## Fitting the container (resource governor)
 
@@ -165,12 +166,20 @@ came back from the checkpoints, not from scratch.
 - Public API: optional bearer token (`API_TOKEN`). Inter-node RPC: cluster
   secret header, rejected with 401 otherwise. `/healthz` is deliberately
   open (lease claiming and the platform probe it).
-- Every node runs a **lease guard**: if any claimed worker's epoch is
-  superseded, the node fail-stops (`process::exit`), and the commit path
-  independently refuses to pass the commit point once fenced. The residual
-  window is the guard interval (5s) plus one write RTT — a process paused
-  longer than that which wakes mid-commit can still race its replacement.
-  Closing it fully needs storage-side conditional commits per epoch.
+- **Fencing** (three layers): every node runs a lease guard that fail-stops
+  the process if any claimed block's epoch is superseded; the commit path
+  refuses the commit point once fenced; and — closing the paused-writer
+  window — commits require a lease **verified within `FENCE_TTL`**
+  (default 10s, double-stamped on the monotonic AND wall clocks so both
+  process pauses and system suspends read as stale), re-verifying inline
+  when not. The matching half: a node taking over a *non-tombstoned* lease
+  waits `FENCE_TTL` before its first write, so a paused predecessor's last
+  in-flight commits always land strictly before the successor's first read
+  — history stays linear even through a wake-from-the-dead. The remaining
+  assumption is bounded clock *rate* error (not synchronization); for
+  storage-verified fencing with no clock assumptions at all, the upgrade
+  path is a per-block CAS'd commit head, at the cost of one conditional
+  write per boat.
 - Lease takeover needs a failed health check OR a tombstone (graceful
   shutdown writes them), so clean rolls are instant and crashed nodes are
   claimed after one probe. Health-check liveness is right for stopped
