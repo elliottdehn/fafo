@@ -113,6 +113,27 @@ state reverted, or the node is shutting down), just poll again — that IS
 the recovery protocol. Polls are answered by the object's owner: pin the
 socket with `?for=` (HTTP `/objects/{id}/poll` routes correctly already).
 
+### Last-will transactions: what happens when you die
+
+A connection can arm one will — an ordinary atomic transaction that runs
+when the socket dies, whether it said goodbye or not (MQTT-style):
+
+```jsonc
+{ "id": 4, "will": { "ops": [{ "object": "room",
+    "sql": "DELETE FROM presence WHERE session = ?1", "params": ["s-1"] }] } }
+// <- { "id": 4, "result": { "will": "armed" } }
+// re-arming replaces the will; empty ops disarm:
+{ "id": 5, "will": { "ops": [] } }   // <- { "will": "disarmed" }
+```
+
+Wills are validated at arm time (a bad will is rejected while you can
+still hear about it) and run with full txn semantics — so a will can
+release locks, publish "user went offline" to a channel, and delete
+presence rows in one atomic step. Caveat: a will runs at the node holding
+your socket; if that node itself dies, it can't. Pair presence rows with
+an `expires_at` column refreshed on a heartbeat and filter it in the view
+query — the will is the fast path, the expiry is the backstop.
+
 ## HTTP API (debugging & scripts)
 
 Same transactions, one request each. Base URL: `http://127.0.0.1:8787`.
@@ -238,6 +259,10 @@ db.txn(["alice", "bob"], [
 - **Condition wait**: poll `SELECT 1 WHERE NOT EXISTS (...)` or any
   aggregate — "wake me when the queue drains" is
   `SELECT 1 WHERE (SELECT COUNT(*) FROM jobs WHERE done = 0) = 0`.
+- **Presence**: INSERT your row on connect, arm a will that DELETEs it,
+  and let everyone else hold a change-detection poll on the roster query.
+  Joins and leaves arrive as fresh snapshots; no heartbeat protocol to
+  build (add an `expires_at` refresh as the node-death backstop).
 
 ## Deploying to Cloudflare
 

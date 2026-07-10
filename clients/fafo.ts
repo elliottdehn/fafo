@@ -234,6 +234,36 @@ export class FafoSocket {
     return { result, cancel: () => this.ws.send(JSON.stringify({ id, cancel: true })) };
   }
 
+  /**
+   * Arm a last-will transaction: it runs (atomically, like any txn) when
+   * this socket dies — clean close, drop, or error. One will per
+   * connection; arming again replaces it. MQTT got this right.
+   *
+   *   await conn.txn([{ object: "room", sql: "INSERT INTO presence ..." }]);
+   *   await conn.setWill([{ object: "room",
+   *     sql: "DELETE FROM presence WHERE session = ?1", params: [sid] }]);
+   *
+   * Caveat: a will runs on socket close at the node; if the node itself
+   * dies, it can't. Pair presence rows with an expires_at column refreshed
+   * by heartbeat and filter it in your view query.
+   */
+  setWill(ops: Op[], opts?: { objects?: string[]; optimistic?: boolean }): Promise<unknown> {
+    return this.willFrame({ objects: opts?.objects ?? [], ops, optimistic: opts?.optimistic ?? false });
+  }
+
+  /** Disarm the current will. */
+  clearWill(): Promise<unknown> {
+    return this.willFrame({ objects: [], ops: [], optimistic: false });
+  }
+
+  private willFrame(will: { objects: string[]; ops: Op[]; optimistic: boolean }): Promise<unknown> {
+    const id = this.next++;
+    return new Promise((resolve, reject) => {
+      this.pending.set(id, { resolve: resolve as (v: TxnResponse) => void, reject });
+      this.ws.send(JSON.stringify({ id, will }));
+    });
+  }
+
   close(): void {
     this.ws.close();
   }

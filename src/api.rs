@@ -12,7 +12,9 @@
 //!   GET  /objects               list object ids
 //!   GET  /stats                 this process's workers, txns, takes, returns
 
-use crate::cluster::{Node, Op, StatsSnapshot, TxnResponse, cancel_poll, submit, submit_poll};
+use crate::cluster::{
+    Node, Op, StatsSnapshot, TxnResponse, cancel_poll, submit, submit_poll, validate_txn,
+};
 use axum::extract::{Path as UrlPath, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -105,6 +107,30 @@ struct WsFrame {
     /// Abandon the outstanding poll originally sent with this frame's id.
     #[serde(default)]
     cancel: bool,
+    /// Last-will transaction: runs when this socket dies, MQTT-style.
+    /// One will per connection; re-arming replaces it, empty ops disarm.
+    #[serde(default)]
+    will: Option<WillBody>,
+}
+
+#[derive(Deserialize)]
+struct WillBody {
+    /// May be omitted: derived from the ops' objects.
+    #[serde(default)]
+    objects: Vec<String>,
+    /// Empty = disarm the current will.
+    #[serde(default)]
+    ops: Vec<Op>,
+    #[serde(default)]
+    optimistic: bool,
+}
+
+/// An armed will, validated at registration so a bad one is rejected while
+/// the client can still hear about it.
+struct ArmedWill {
+    objects: Vec<String>,
+    ops: Vec<Op>,
+    optimistic: bool,
 }
 
 #[derive(Deserialize)]
@@ -185,6 +211,7 @@ async fn ws_conn(node: Node, socket: axum::extract::ws::WebSocket) {
     // dead client's polls don't linger until the object's next write.
     let outstanding: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<u64, String>>> =
         Default::default();
+    let will: std::sync::Arc<std::sync::Mutex<Option<ArmedWill>>> = Default::default();
     while let Some(Ok(msg)) = stream.next().await {
         let Message::Text(text) = msg else {
             if matches!(msg, Message::Close(_)) {
@@ -195,11 +222,22 @@ async fn ws_conn(node: Node, socket: axum::extract::ws::WebSocket) {
         let node = node.clone();
         let tx = tx.clone();
         let outstanding = outstanding.clone();
+        let will = will.clone();
         tokio::spawn(async move {
-            if let Some(reply) = handle_ws_frame(&node, conn, &outstanding, text.as_str()).await {
+            if let Some(reply) =
+                handle_ws_frame(&node, conn, &outstanding, &will, text.as_str()).await
+            {
                 let _ = tx.send(reply);
             }
         });
+    }
+    // The socket is dead: execute the will first (an ordinary transaction —
+    // it may well wake polls parked by the living), then sweep our own.
+    let armed = will.lock().unwrap().take(); // guard drops before the await
+    if let Some(w) = armed
+        && let Err(e) = submit(&node, w.objects, w.ops, false, w.optimistic).await
+    {
+        eprintln!("conn {conn}: last-will transaction failed: {}", e.message);
     }
     for (frame, object) in outstanding.lock().unwrap().drain() {
         cancel_poll(&node, &object, conn, frame);
@@ -212,6 +250,7 @@ async fn handle_ws_frame(
     node: &Node,
     conn: u64,
     outstanding: &std::sync::Mutex<std::collections::HashMap<u64, String>>,
+    will: &std::sync::Mutex<Option<ArmedWill>>,
     text: &str,
 ) -> Option<String> {
     let frame: WsFrame = match serde_json::from_str(text) {
@@ -226,6 +265,28 @@ async fn handle_ws_frame(
             cancel_poll(node, &object, conn, frame.id);
         }
         return None;
+    }
+    if let Some(w) = frame.will {
+        if w.ops.is_empty() {
+            *will.lock().unwrap() = None;
+            return Some(json!({ "id": frame.id, "result": { "will": "disarmed" } }).to_string());
+        }
+        let mut objects = w.objects;
+        if objects.is_empty() {
+            objects = w.ops.iter().map(|op| op.object.clone()).collect();
+        }
+        return Some(match validate_txn(objects, &w.ops) {
+            Ok(ids) => {
+                *will.lock().unwrap() = Some(ArmedWill {
+                    objects: ids,
+                    ops: w.ops,
+                    optimistic: w.optimistic,
+                });
+                json!({ "id": frame.id, "result": { "will": "armed" } }).to_string()
+            }
+            Err(e) => json!({ "id": frame.id, "error": e.message, "status": e.status.as_u16() })
+                .to_string(),
+        });
     }
     if let Some(poll) = frame.poll {
         outstanding

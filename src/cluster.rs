@@ -858,6 +858,16 @@ pub async fn submit(
     read_only: bool,
     optimistic: bool,
 ) -> Result<TxnResponse, ApiError> {
+    let ids = validate_txn(objects, &ops)?;
+    node.clock.fetch_add(1, Ordering::Relaxed);
+    node.stats.total_txns.fetch_add(1, Ordering::Relaxed);
+    submit_routed(node, ids, ops, read_only, optimistic).await
+}
+
+/// Shared txn validation: sorted, deduped participant ids, every op's
+/// object declared. Used by submit and by will registration (which must
+/// reject a bad will while the client can still hear about it).
+pub fn validate_txn(objects: Vec<String>, ops: &[Op]) -> Result<Vec<String>, ApiError> {
     if objects.is_empty() {
         return Err(ApiError::bad_request("declare at least one object"));
     }
@@ -869,7 +879,7 @@ pub async fn submit(
             return Err(ApiError::bad_request(format!("invalid object id: {id:?}")));
         }
     }
-    for op in &ops {
+    for op in ops {
         if ids.binary_search(&op.object).is_err() {
             return Err(ApiError::bad_request(format!(
                 "op touches undeclared object {:?} — declare it in `objects`",
@@ -877,9 +887,7 @@ pub async fn submit(
             )));
         }
     }
-    node.clock.fetch_add(1, Ordering::Relaxed);
-    node.stats.total_txns.fetch_add(1, Ordering::Relaxed);
-    submit_routed(node, ids, ops, read_only, optimistic).await
+    Ok(ids)
 }
 
 /// Routing half of submit, callable from the RPC handler (already validated).
