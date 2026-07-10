@@ -547,6 +547,9 @@ impl Worker {
             self.pending_txns
                 .retain(|t| !t.participants.iter().any(|p| reverted.contains(p)));
         }
+        // Freshly shipped objects just became sheddable; give the disk
+        // ledger a chance to reclaim if it's over budget.
+        self.node.enforce_disk();
         // Next boat first, so takes/returns below see accurate dirty state.
         self.maybe_launch();
         let mut ready = Vec::new();
@@ -1122,17 +1125,23 @@ async fn ship_task(
     let payload_bytes: u64 = items.iter().map(|i| i.bytes().len() as u64).sum();
     let mut err: Option<String> = None;
 
-    // Stage in parallel: boats with many objects pay one RTT, not one each.
-    let staging_keys: Vec<String> = items.iter().map(|i| i.staging_key(&staging_id)).collect();
-    let staged = futures::future::join_all(
-        items
-            .iter()
-            .zip(&staging_keys)
-            .map(|(item, key)| node.store.put(key, item.bytes())),
-    )
-    .await;
-    if let Some(e) = staged.into_iter().find_map(|r| r.err()) {
-        err = Some(e.to_string());
+    // Small boats inline their payload into the commit record itself: the
+    // entire commit becomes one blob write. Big boats stage first.
+    let inline = payload_bytes <= INLINE_MAX_BYTES;
+    if !inline {
+        // Stage in parallel: boats with many objects pay one RTT, not one each.
+        let staging_keys: Vec<String> =
+            items.iter().map(|i| i.staging_key(&staging_id)).collect();
+        let staged = futures::future::join_all(
+            items
+                .iter()
+                .zip(&staging_keys)
+                .map(|(item, key)| node.store.put(key, item.bytes())),
+        )
+        .await;
+        if let Some(e) = staged.into_iter().find_map(|r| r.err()) {
+            err = Some(e.to_string());
+        }
     }
 
     // Fencing gate. Three layers, cheapest first:
@@ -1156,9 +1165,28 @@ async fn ship_task(
     }
 
     if err.is_none() {
+        let inline_items = if inline {
+            items
+                .iter()
+                .map(|item| {
+                    // Same names as staging-key suffixes; recovery promotes
+                    // through the same path.
+                    let name = item
+                        .staging_key(&staging_id)
+                        .rsplit('/')
+                        .next()
+                        .unwrap()
+                        .to_string();
+                    (name, hex_encode(item.bytes()))
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
         let record = serde_json::to_vec(&TxnRecord {
             txn_id: staging_id.clone(),
             objects: objects.clone(),
+            inline: inline_items,
         })
         .expect("record serializes");
         if let Err(e) = node.store.put(&txn_key(&staging_id), &record).await {
@@ -1194,8 +1222,10 @@ async fn ship_task(
                 }
             }
             if promoted {
-                for item in &items {
-                    let _ = node.store.delete(&item.staging_key(&staging_id)).await;
+                if !inline {
+                    for item in &items {
+                        let _ = node.store.delete(&item.staging_key(&staging_id)).await;
+                    }
                 }
                 let _ = node.store.delete(&txn_key(&staging_id)).await;
                 // Compaction GC: superseded deltas are already ignored by
@@ -1223,8 +1253,10 @@ async fn ship_task(
             let _ = reply.send(WorkerMsg::ShipDone { objects, ok: true });
         }
         Some(e) => {
-            for item in &items {
-                let _ = node.store.delete(&item.staging_key(&staging_id)).await;
+            if !inline {
+                for item in &items {
+                    let _ = node.store.delete(&item.staging_key(&staging_id)).await;
+                }
             }
             for (resp, _) in waiters {
                 let _ = resp.send(Err(ApiError::internal(format!("commit failed: {e}"))));
@@ -1346,6 +1378,30 @@ async fn send_adopt(node: &Node, home: usize, object: String, meta: TransferMeta
 struct TxnRecord {
     txn_id: String,
     objects: Vec<String>,
+    /// Small boats skip staging entirely: payloads ride INSIDE the commit
+    /// record as (staged-style name, hex bytes) pairs, making the whole
+    /// commit ONE blob write. Entries use the same `<obj>.snap` /
+    /// `<obj>.delta.<counter>` names as staging keys, so recovery promotes
+    /// them through the identical code path.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    inline: Vec<(String, String)>,
+}
+
+/// Boats whose total payload fits here commit with a single R2 op.
+const INLINE_MAX_BYTES: u64 = 96 * 1024;
+
+fn hex_encode(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn hex_decode(s: &str) -> Option<Vec<u8>> {
+    if s.len() % 2 != 0 {
+        return None;
+    }
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok())
+        .collect()
 }
 
 fn txn_key(staging_id: &str) -> String {
@@ -1380,11 +1436,20 @@ pub async fn recover(store: &dyn BlobStore) -> anyhow::Result<()> {
             store.delete(&key).await?;
             continue;
         };
-        for staged in store.list(&format!("staging/{}/", record.txn_id)).await? {
-            if let Some(blob) = store.get(&staged).await? {
-                promote_staged(store, &staged, &blob).await?;
+        if record.inline.is_empty() {
+            for staged in store.list(&format!("staging/{}/", record.txn_id)).await? {
+                if let Some(blob) = store.get(&staged).await? {
+                    promote_staged(store, &staged, &blob).await?;
+                }
+                store.delete(&staged).await?;
             }
-            store.delete(&staged).await?;
+        } else {
+            // Inline boat: the payload lives in the record itself.
+            for (name, hexed) in &record.inline {
+                if let Some(blob) = hex_decode(hexed) {
+                    promote_staged(store, name, &blob).await?;
+                }
+            }
         }
         store.delete(&key).await?;
         println!("recovered committed txn {}", record.txn_id);
@@ -1474,15 +1539,27 @@ mod tests {
         let record = serde_json::to_vec(&TxnRecord {
             txn_id: "t1".into(),
             objects: vec!["alice".into(), "carol".into()],
+            inline: vec![],
         })
         .unwrap();
         store.put("txns/t1.json", &record).await.unwrap();
+        // An INLINE boat that reached its commit point but never promoted:
+        // the payload lives in the record itself.
+        let record = serde_json::to_vec(&TxnRecord {
+            txn_id: "t3".into(),
+            objects: vec!["dave".into()],
+            inline: vec![("dave.snap".into(), hex_encode(b"INLINE"))],
+        })
+        .unwrap();
+        store.put("txns/t3.json", &record).await.unwrap();
         // ...and staging from a boat that never reached its commit point.
         store.put("staging/t2/bob.snap", b"JUNK").await.unwrap();
 
         recover(store.as_ref()).await.unwrap();
 
         assert_eq!(store.get("objects/alice.db").await.unwrap().unwrap(), b"NEW");
+        assert_eq!(store.get("objects/dave.db").await.unwrap().unwrap(), b"INLINE");
+        assert!(store.get("txns/t3.json").await.unwrap().is_none());
         assert_eq!(
             store.get("objects/carol.d.0000000007").await.unwrap().unwrap(),
             b"DELTA7"

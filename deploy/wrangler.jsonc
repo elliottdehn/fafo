@@ -21,7 +21,11 @@
       "class_name": "FafoNode",
       "image": "../Dockerfile",
       "instance_type": "standard-1",
-      "max_instances": 4
+      "max_instances": 4,
+      // Geography IS the latency budget: an unpinned beta scheduler put
+      // half our fleet in London while the users and the R2 bucket were in
+      // North America (measured: 0.9s baseline vs 0.11s).
+      "constraints": { "regions": ["ENAM"] }
     }
   ],
   "durable_objects": {

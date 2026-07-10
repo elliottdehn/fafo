@@ -73,7 +73,92 @@ pub fn router(node: Node) -> Router {
         // peers with it, and the platform pings it.
         .route("/healthz", get(healthz))
         .route("/internal/rpc", post(rpc_handler))
+        // The database-connection experience: one WebSocket, many
+        // transactions as frames. After the upgrade, frames bypass the
+        // per-request platform machinery entirely — this is the low-latency
+        // production path. Auth via ?token= (browsers can't set headers on
+        // WS), checked in the handler.
+        .route("/ws", get(ws_handler))
         .with_state(node)
+}
+
+#[derive(Deserialize)]
+struct WsFrame {
+    /// Client-chosen correlation id, echoed in the reply.
+    id: u64,
+    /// May be omitted: derived from the ops' objects.
+    #[serde(default)]
+    objects: Vec<String>,
+    ops: Vec<Op>,
+    #[serde(default)]
+    read_only: bool,
+    #[serde(default)]
+    optimistic: bool,
+}
+
+async fn ws_handler(
+    State(node): State<Node>,
+    axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
+    ws: axum::extract::ws::WebSocketUpgrade,
+) -> Response {
+    if let Some(token) = &node.api_token
+        && q.get("token") != Some(token)
+    {
+        return ApiError {
+            status: StatusCode::UNAUTHORIZED,
+            message: "missing or invalid ?token=".into(),
+        }
+        .into_response();
+    }
+    ws.on_upgrade(move |socket| ws_conn(node, socket))
+}
+
+async fn ws_conn(node: Node, socket: axum::extract::ws::WebSocket) {
+    use axum::extract::ws::Message;
+    use futures::{SinkExt, StreamExt};
+    let (mut sink, mut stream) = socket.split();
+    // Frames execute concurrently (pipelining, like a real DB connection);
+    // a single writer task serializes replies onto the socket.
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let writer = tokio::spawn(async move {
+        while let Some(reply) = rx.recv().await {
+            if sink.send(Message::Text(reply.into())).await.is_err() {
+                break;
+            }
+        }
+    });
+    while let Some(Ok(msg)) = stream.next().await {
+        let Message::Text(text) = msg else {
+            if matches!(msg, Message::Close(_)) {
+                break;
+            }
+            continue;
+        };
+        let node = node.clone();
+        let tx = tx.clone();
+        tokio::spawn(async move {
+            let reply = handle_ws_frame(&node, text.as_str()).await;
+            let _ = tx.send(reply);
+        });
+    }
+    drop(tx);
+    let _ = writer.await;
+}
+
+async fn handle_ws_frame(node: &Node, text: &str) -> String {
+    let frame: WsFrame = match serde_json::from_str(text) {
+        Ok(f) => f,
+        Err(e) => return json!({ "id": null, "error": format!("bad frame: {e}") }).to_string(),
+    };
+    let mut objects = frame.objects;
+    if objects.is_empty() {
+        objects = frame.ops.iter().map(|op| op.object.clone()).collect();
+    }
+    match submit(node, objects, frame.ops, frame.read_only, frame.optimistic).await {
+        Ok(result) => json!({ "id": frame.id, "result": result }).to_string(),
+        Err(e) => json!({ "id": frame.id, "error": e.message, "status": e.status.as_u16() })
+            .to_string(),
+    }
 }
 
 /// Public API auth: if API_TOKEN is configured, require it as a bearer.
@@ -101,7 +186,15 @@ async fn require_api_token(
 }
 
 async fn healthz(State(node): State<Node>) -> Json<Value> {
-    Json(json!({ "ok": true, "workers": node.claimed_workers() }))
+    // Location vars are injected by Cloudflare Containers; geography is the
+    // dominant latency term (measured 0.11s..0.9s per-instance), so make it
+    // visible.
+    Json(json!({
+        "ok": true,
+        "workers": node.claimed_workers(),
+        "location": std::env::var("CLOUDFLARE_LOCATION").unwrap_or_default(),
+        "region": std::env::var("CLOUDFLARE_REGION").unwrap_or_default(),
+    }))
 }
 
 /// Inter-node RPC endpoint. Guarded by the cluster secret, not the API token

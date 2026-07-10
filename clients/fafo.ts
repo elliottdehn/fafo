@@ -94,4 +94,72 @@ export class Fafo {
   stats(): Promise<Record<string, unknown>> {
     return this.call("GET", "/stats");
   }
+
+  /** Open a persistent connection: many transactions, one socket. */
+  connect(): Promise<FafoSocket> {
+    return FafoSocket.open(this["base"], this["token"]);
+  }
+}
+
+/**
+ * The production path: transactions as frames on one WebSocket. After the
+ * upgrade, frames skip the per-request platform overhead — think of it as
+ * the database connection, with pipelining for free.
+ *
+ *   const conn = await new Fafo(url, token).connect();
+ *   await conn.txn([{ object: "alice", sql: "..." }]); // objects inferred
+ */
+export class FafoSocket {
+  private next = 1;
+  private pending = new Map<number, { resolve: (v: TxnResponse) => void; reject: (e: Error) => void }>();
+
+  private constructor(private ws: WebSocket) {}
+
+  static open(base: string, token?: string): Promise<FafoSocket> {
+    const url = base.replace(/^http/, "ws") + "/ws" + (token ? `?token=${token}` : "");
+    return new Promise((resolve, reject) => {
+      const ws = new WebSocket(url);
+      const sock = new FafoSocket(ws);
+      ws.onopen = () => resolve(sock);
+      ws.onerror = () => reject(new Error("websocket failed to open"));
+      ws.onmessage = (ev) => {
+        const msg = JSON.parse(String(ev.data)) as {
+          id: number;
+          result?: TxnResponse;
+          error?: string;
+          status?: number;
+        };
+        const p = sock.pending.get(msg.id);
+        if (!p) return;
+        sock.pending.delete(msg.id);
+        if (msg.error !== undefined) p.reject(new FafoError(msg.status ?? 500, msg.error));
+        else p.resolve(msg.result as TxnResponse);
+      };
+      ws.onclose = () => {
+        for (const p of sock.pending.values()) p.reject(new Error("connection closed"));
+        sock.pending.clear();
+      };
+    });
+  }
+
+  /** objects may be omitted; they're inferred from the ops. */
+  txn(ops: Op[], opts?: { objects?: string[]; optimistic?: boolean; readOnly?: boolean }): Promise<TxnResponse> {
+    const id = this.next++;
+    return new Promise((resolve, reject) => {
+      this.pending.set(id, { resolve, reject });
+      this.ws.send(
+        JSON.stringify({
+          id,
+          objects: opts?.objects ?? [],
+          ops,
+          optimistic: opts?.optimistic ?? false,
+          read_only: opts?.readOnly ?? false,
+        }),
+      );
+    });
+  }
+
+  close(): void {
+    this.ws.close();
+  }
 }

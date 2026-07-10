@@ -151,11 +151,17 @@ impl Routing {
     }
 }
 
-/// Deterministic across processes: DefaultHasher::new() uses fixed keys.
+/// FNV-1a 64: deterministic AND portable — the Worker router implements
+/// these same ten lines in TypeScript to send requests straight to the
+/// owning instance, deleting the inter-instance hairpin for any object
+/// still at its hash-default home.
 pub fn default_worker(object: &str, logical: usize) -> usize {
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    object.hash(&mut h);
-    (h.finish() % logical as u64) as usize
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in object.as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    (h % logical as u64) as usize
 }
 
 // --------------------------------------------------------------------- node
@@ -633,8 +639,14 @@ pub async fn verify_leases(node: &Node) -> bool {
         let e = node.epochs.read().unwrap();
         e.iter().map(|(b, e)| (*b, *e)).collect()
     };
+    // ONE list covers every block (16 sequential lists here was both the
+    // guard's R2 bill and multi-second latency outliers at the commit gate).
+    let blocks = node.routing.read().unwrap().blocks;
+    let Ok(leases) = load_leases(node.store.as_ref(), blocks).await else {
+        return true; // transient store error: keep the old stamp, retry later
+    };
     for (b, mine) in epochs {
-        if let Ok(Some(lease)) = latest_lease(node.store.as_ref(), b).await
+        if let Some(lease) = leases.get(&b)
             && lease.epoch > mine
         {
             fail_stop(
