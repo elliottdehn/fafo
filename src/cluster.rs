@@ -2443,4 +2443,150 @@ mod tests {
         assert_eq!(poll_rows(&res)[0]["c"], 0, "the doomed row un-happened");
         node.shutdown().await;
     }
+
+    // ====================================================== ephemeral state
+    //
+    // TEMP tables: same SQL, same polls, never dirty the object, never ride
+    // a boat, never cost a storage op. Detected by the main file's change
+    // counter staying put across the commit.
+
+    #[tokio::test]
+    async fn temp_writes_ship_nothing_and_still_wake_polls() {
+        let dir = tempfile::tempdir().unwrap();
+        // A brutally slow store makes any accidental ship obvious.
+        let store: Arc<dyn BlobStore> = Arc::new(SlowStore(
+            FsBlobStore::new(dir.path().join("blobs")).unwrap(),
+            std::time::Duration::from_millis(300),
+        ));
+        let node = boot_with_store(dir.path(), store, 4).await;
+        let room = id_on_worker(1, 4, "room");
+        make_channel(&node, &room).await; // durable schema, ships
+        let ships_before = node.stats().await.ships;
+
+        // Pessimistic TEMP writes must ack immediately: there is nothing
+        // to make durable, so not even a pessimistic txn waits for a boat.
+        let started = std::time::Instant::now();
+        exec(
+            &node,
+            &[&room],
+            &[(&room, "CREATE TEMP TABLE typing (u TEXT PRIMARY KEY, at INTEGER)")],
+        )
+        .await
+        .unwrap();
+        exec(
+            &node,
+            &[&room],
+            &[(&room, "INSERT INTO typing VALUES ('alice', 1)")],
+        )
+        .await
+        .unwrap();
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(150),
+            "temp-only pessimistic txns must not wait for the 300ms store"
+        );
+
+        // ...but they DO wake pollers: signals ride the same protocol.
+        let n2 = node.clone();
+        let r2 = room.clone();
+        let parked = tokio::spawn(async move {
+            poll_q(&n2, &r2, "SELECT u FROM typing WHERE u = 'bob'", vec![], false, None).await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        exec(&node, &[&room], &[(&room, "INSERT INTO typing VALUES ('bob', 2)")])
+            .await
+            .unwrap();
+        let res = parked.await.unwrap().unwrap();
+        assert_eq!(poll_rows(&res)[0]["u"], "bob");
+
+        // TEMP joins MAIN in one query.
+        publish(&node, &room, "hello", false).await;
+        let res = poll_q(
+            &node,
+            &room,
+            "SELECT (SELECT COUNT(*) FROM msgs) AS durable, (SELECT COUNT(*) FROM typing) AS ephemeral",
+            vec![],
+            false,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(poll_rows(&res)[0]["durable"], 1);
+        assert_eq!(poll_rows(&res)[0]["ephemeral"], 2);
+
+        // Only the durable publish shipped; every temp write was free.
+        let ships_after = node.stats().await.ships;
+        assert_eq!(ships_after, ships_before + 1, "temp writes never launched a boat");
+        node.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn temp_state_evaporates_on_eviction_main_survives() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = boot(dir.path(), 4, ClaimSpec::All, "a").await;
+        let room = id_on_worker(1, 4, "room");
+        make_channel(&node, &room).await;
+        publish(&node, &room, "durable", false).await;
+        exec(
+            &node,
+            &[&room],
+            &[
+                (&room, "CREATE TEMP TABLE typing (u TEXT)"),
+                (&room, "INSERT INTO typing VALUES ('alice')"),
+            ],
+        )
+        .await
+        .unwrap();
+
+        // TEMP writes leave the object clean, so shedding still works —
+        // ephemeral state doesn't pin memory or disk.
+        let owner = { node.routing.read().unwrap().owner_of(&room) };
+        local_sender(&node, owner)
+            .unwrap()
+            .send(WorkerMsg::Shed)
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // Reactivation restores durable state; the temp table is gone —
+        // that's the contract (and the query error says so plainly).
+        let err = exec(&node, &[&room], &[(&room, "SELECT * FROM typing")])
+            .await
+            .unwrap_err();
+        assert!(err.message.contains("typing"), "got: {}", err.message);
+        let res = exec(&node, &[&room], &[(&room, "SELECT body FROM msgs")])
+            .await
+            .unwrap();
+        let v = serde_json::to_value(&res.results).unwrap();
+        assert_eq!(v[0]["rows"][0]["body"], "durable");
+        node.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn noop_writes_dont_ship_either() {
+        let dir = tempfile::tempdir().unwrap();
+        let store: Arc<dyn BlobStore> = Arc::new(SlowStore(
+            FsBlobStore::new(dir.path().join("blobs")).unwrap(),
+            std::time::Duration::from_millis(300),
+        ));
+        let node = boot_with_store(dir.path(), store, 4).await;
+        let room = id_on_worker(1, 4, "room");
+        make_channel(&node, &room).await;
+        let ships_before = node.stats().await.ships;
+
+        // Matches zero rows -> no page changes -> counter unmoved -> free.
+        let started = std::time::Instant::now();
+        exec(
+            &node,
+            &[&room],
+            &[(&room, "UPDATE msgs SET body = 'x' WHERE id = 999")],
+        )
+        .await
+        .unwrap();
+        assert!(started.elapsed() < std::time::Duration::from_millis(150));
+        assert_eq!(node.stats().await.ships, ships_before);
+
+        // A write that actually changes bytes still ships.
+        publish(&node, &room, "real", false).await;
+        assert_eq!(node.stats().await.ships, ships_before + 1);
+        node.shutdown().await;
+    }
 }

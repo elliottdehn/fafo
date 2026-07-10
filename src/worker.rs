@@ -1048,7 +1048,7 @@ impl Worker {
             Err(e) => {
                 let _ = p.resp.send(Err(e));
             }
-            Ok(results) => {
+            Ok((results, changed)) => {
                 let response = TxnResponse {
                     txn_id: format!("w{}-{}", self.id, txn),
                     results,
@@ -1090,8 +1090,20 @@ impl Worker {
                             let _ = p.resp.send(Ok(response));
                         }
                     }
-                } else {
+                } else if changed.is_empty() {
+                    // TEMP-only (or no-op) write: durable state already
+                    // matches, so there is nothing to ship — even a
+                    // pessimistic txn acks right now. Ephemeral tables are
+                    // signals, typing, cursors: same SQL, zero storage
+                    // cost. Polls still fire below.
+                    let _ = p.resp.send(Ok(response));
                     for object in &p.participants {
+                        for (resp, fired) in self.take_fired_polls(object, false) {
+                            let _ = resp.send(Ok(fired));
+                        }
+                    }
+                } else {
+                    for object in &changed {
                         if !self.dirty.contains_key(object) {
                             let bytes = self
                                 .objects
@@ -1118,8 +1130,10 @@ impl Worker {
                     } else {
                         Some((p.resp, response))
                     };
+                    // Boat grouping only binds the objects that must land
+                    // together — the ones this txn durably changed.
                     self.pending_txns.push(AppliedTxn {
-                        participants: p.participants.clone(),
+                        participants: changed,
                         waiter,
                     });
                     for object in &p.participants {
@@ -1179,12 +1193,16 @@ impl Worker {
     /// participants (local SQLite txns), but durability is deferred to the
     /// boat: run_and_complete marks participants dirty and maybe_launch
     /// ships them.
+    /// On writes, additionally returns the participants whose MAIN database
+    /// file actually changed (header change counter moved). A txn that only
+    /// touched TEMP tables — or changed nothing — commits locally, wakes
+    /// polls, and ships nothing: ephemeral state is free.
     async fn apply(
         &mut self,
         participants: &[String],
         ops: &[Op],
         read_only: bool,
-    ) -> Result<Vec<OpResult>, ApiError> {
+    ) -> Result<(Vec<OpResult>, Vec<String>), ApiError> {
         // Participants are guaranteed live: advance() activates cold
         // objects (off-loop) before a txn is allowed to run.
         fn conn_of<'a>(
@@ -1209,9 +1227,13 @@ impl Worker {
                 drop(stmt);
                 results.push(run_op(conn, &op.sql, &op.params).map_err(ApiError::bad_request)?);
             }
-            return Ok(results);
+            return Ok((results, Vec::new()));
         }
 
+        let counters_before: Vec<Option<u32>> = participants
+            .iter()
+            .map(|id| file_change_counter(&self.objects[id].live_path))
+            .collect();
         for id in participants {
             conn_of(&self.objects, id)
                 .execute_batch("BEGIN")
@@ -1262,8 +1284,33 @@ impl Worker {
             return Err(ApiError::internal(format!("local commit failed: {e}")));
         }
 
-        Ok(results)
+        // SQLite bumps the main file's change counter iff the commit wrote
+        // it. Unchanged counter = TEMP-only (or no-op) writes: durable
+        // state is already correct, so the boat has nothing to carry.
+        let changed = participants
+            .iter()
+            .zip(&counters_before)
+            .filter(|(id, before)| {
+                let after = file_change_counter(&self.objects[id.as_str()].live_path);
+                after != **before || after.is_none()
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        Ok((results, changed))
     }
+}
+
+/// The 4-byte big-endian change counter in the SQLite header — the same
+/// counter delta shipping versions by. None if unreadable (treated as
+/// changed: when in doubt, ship).
+fn file_change_counter(path: &std::path::Path) -> Option<u32> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = std::fs::File::open(path).ok()?;
+    f.seek(SeekFrom::Start(delta::HEADER_CHANGE_COUNTER as u64))
+        .ok()?;
+    let mut buf = [0u8; 4];
+    f.read_exact(&mut buf).ok()?;
+    Some(u32::from_be_bytes(buf))
 }
 
 pub enum ShipPayload {

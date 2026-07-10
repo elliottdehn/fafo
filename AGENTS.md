@@ -259,6 +259,14 @@ db.txn(["alice", "bob"], [
 - **Condition wait**: poll `SELECT 1 WHERE NOT EXISTS (...)` or any
   aggregate — "wake me when the queue drains" is
   `SELECT 1 WHERE (SELECT COUNT(*) FROM jobs WHERE done = 0) = 0`.
+- **Ephemeral state is a table property, not a second API**: anything in a
+  `CREATE TEMP TABLE` gets full SQL and wakes polls like durable state, but
+  never rides a boat and never costs a storage op — typing indicators,
+  60Hz cursor positions, occupancy counters, all free. The contract:
+  temp state is per-activation; eviction, migration, and restart clear it
+  (queries then error "no such table" — recreate on reconnect). Bonus from
+  the same mechanism: writes that change nothing (UPDATE matching zero
+  rows) also ship nothing.
 - **Presence**: INSERT your row on connect, arm a will that DELETEs it,
   and let everyone else hold a change-detection poll on the roster query.
   Joins and leaves arrive as fresh snapshots; no heartbeat protocol to
