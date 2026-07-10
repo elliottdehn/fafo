@@ -136,6 +136,84 @@ db.txn(["alice", "bob"], [
   (measured: ~240x at object-storage latency). Barrier with one pessimistic
   txn when you need a durability checkpoint.
 
+## Deploying to Cloudflare
+
+Prereqs: `wrangler` (npx is fine) authenticated, Docker daemon RUNNING
+(wrangler builds the image locally), a Workers Paid plan (Containers).
+
+```sh
+npx wrangler r2 bucket create fafo-state
+cd deploy && npm install
+
+# Secrets. Generate the first two; the R2 pair comes from the dashboard:
+# dash.cloudflare.com -> R2 -> Manage API tokens -> Object Read & Write,
+# scoped to the bucket. wrangler cannot mint R2 S3 credentials.
+openssl rand -hex 24 | npx wrangler secret put CLUSTER_SECRET
+openssl rand -hex 24 | npx wrangler secret put API_TOKEN     # save these!
+printf '<ACCOUNT_ID>'  | npx wrangler secret put R2_ACCOUNT_ID
+printf 'fafo-state'    | npx wrangler secret put R2_BUCKET
+printf '<KEY_ID>'      | npx wrangler secret put R2_ACCESS_KEY_ID
+printf '<SECRET_KEY>'  | npx wrangler secret put R2_SECRET_ACCESS_KEY
+
+npx wrangler deploy          # builds ../Dockerfile, pushes, creates the app
+# then set vars.PUBLIC_URL in wrangler.jsonc to the printed URL + redeploy
+```
+
+Non-negotiables learned in production:
+
+- **Pin the container region** (`containers[].constraints.regions`) to the
+  same region as your R2 bucket and your users. The beta scheduler
+  otherwise places instances anywhere on Earth — we measured half a fleet
+  in London and one container in Bangalore serving Ohio traffic at 0.9s a
+  request. Geography is the latency budget; everything else is noise.
+- **Keep both Dockerfile stages on the same Debian release.** `rust:*-slim`
+  silently tracks new Debian releases; a newer-glibc build stage on an
+  older-glibc runtime crashes before `main()` with `GLIBC_x.yz not found`.
+- Rolling deploys replace instances gradually. Instances claim
+  deterministic worker ranges (fafo-N owns [N*W/I,(N+1)*W/I)), so
+  mid-rollout you may see mixed old/new behavior and transient
+  "no live node holds logical worker" — it converges; don't panic-redeploy.
+
+## Debugging production
+
+```sh
+npx wrangler tail fafo                      # live Worker exceptions + logs
+npx wrangler containers list                # app status (provisioning/active)
+
+# Per-instance introspection through the router (N = 0..instances-1):
+curl $BASE/internal/instance/fafo-N/healthz # location, region, worker count
+curl $BASE/internal/instance/fafo-N/stats \
+  -H "authorization: Bearer $API_TOKEN"     # claim ranges, txns, ships
+
+# Inspect R2 state directly (curl speaks SigV4):
+B=https://<ACCOUNT_ID>.r2.cloudflarestorage.com/fafo-state
+curl -s --aws-sigv4 "aws:amz:auto:s3" --user "$KEY_ID:$SECRET" \
+  "$B?list-type=2&prefix=_lease/" | grep -o "<Key>[^<]*</Key>"
+```
+
+Reading the signs:
+
+- **`error code: 1101`** = the Worker threw. `wrangler tail` while
+  reproducing. "Container is not running / crashed checking ports" means
+  the BINARY died at boot — reproduce locally with the exact image:
+  `docker run --rm -e BLOB_STORE=r2 -e R2_... fafo-fafonode:<tag>`.
+- **healthz shows `"workers":0`**: the node is mid-boot (the HTTP server
+  deliberately starts before the claim loop) or lost its claims — check
+  again in seconds, then check `_lease/` in the bucket for who holds what.
+- **Slow requests**: check each instance's healthz `location` first;
+  a misplaced container dominates everything. Then remember the tiers:
+  reads/optimistic ≈ instance baseline + ~30ms; pessimistic adds one R2
+  round trip; a request whose object lives on ANOTHER instance adds a
+  ~0.5-1s hairpin (avoided for hash-default objects by the Worker's FNV
+  routing; WebSocket clients should pin with `/ws?for=<object>`).
+- **Wiping state**: deleting `_lease/*` and `_worker/*` from the bucket is
+  safe (placement is a hint) but running nodes keep in-memory claims until
+  restarted — wipe, then redeploy, then WAIT for all instances to report
+  their deterministic ranges. Deleting `objects/*` deletes the data.
+- Epoch chains growing under `_lease/b*/` are normal (each boot bumps);
+  a node fail-stopping with `FENCED` lost its lease to a successor —
+  also normal during takeovers. Ambient churn only matters if it loops.
+
 ## Developing fafo itself
 
 ```sh
