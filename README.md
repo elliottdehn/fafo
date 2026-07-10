@@ -39,7 +39,7 @@ cargo test                       # atomicity, serializability, cross-node, recov
 | `DATA_DIR` | `./data` | live working copies + fs blobs |
 | `BLOB_STORE` | `fs` | `fs` or `r2` |
 | `R2_ACCOUNT_ID` or `R2_ENDPOINT`, `R2_BUCKET`, `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY` | — | R2 credentials (S3 API, SigV4) |
-| `LOGICAL_WORKERS` | `64` | fixed at cluster creation (create-once meta) |
+| `LOGICAL_WORKERS` | `4096` | fixed at cluster creation; workers are virtual, so big is cheap |
 | `CLAIM` | `all` | `all`, `7`, `0-15`, or `auto:<k>` (claim k free workers) |
 | `CLUSTER_SECRET` | dev default + warning | shared secret for `/internal/rpc` |
 | `API_TOKEN` | unset (open) | bearer token required on the public API |
@@ -132,10 +132,16 @@ store. Period.
 - **Ownership moves only when clean**: takes and hysteresis returns wait
   for the object's boat to land, so a new owner never activates a stale
   snapshot.
-- **Topology**: processes claim logical workers by creating
-  `_lease/w<i>/e<epoch>.json` — `BlobStore::create` (create-if-absent,
-  `If-None-Match: *` on R2) is the system's only consensus primitive. Dead
-  holder → bump the epoch. 4 procs x 4 workers, 1 proc x 64: deployment detail.
+- **Topology**: logical workers are VIRTUAL. The worker space (default
+  4096; a million works fine) is divided into ≤256 fixed lease blocks;
+  nodes claim blocks by creating `_lease/b<i>/e<epoch>.json` —
+  `BlobStore::create` (create-if-absent, `If-None-Match: *` on R2) is the
+  system's only consensus primitive. Dead holder → bump the epoch. Worker
+  tasks materialize on first touch (Orleans-style), so claims, the lease
+  guard, boot, and RAM are all O(blocks + touched workers), never
+  O(LOGICAL_WORKERS). Measured: two nodes boot a 1,000,000-worker cluster,
+  split it, and transact across it in under a second, with single-digit
+  worker tasks materialized.
 - **Placement** persists as per-worker checkpoints (`_worker/<i>.json`),
   written remove-side-first on every transfer so no object is durably
   claimed twice; a crash between writes orphans the object, which falls back
@@ -211,7 +217,8 @@ transfers its full size, and each object still has one serial writer.
   (repeat visits ride the commuter cache + delta chain).
 - The R2 store's list parser assumes fafo's restricted key charset.
 - `LOGICAL_WORKERS` is fixed at cluster creation; resharding is a manual
-  migration.
+  migration. (With virtual workers there's little reason to ever outgrow
+  the default.)
 - Backpressure (MAX_UNSHIPPED_MB, default 256) only engages above the
   watermark: optimistic acks demote to durable-ack pacing until the backlog
   drains. Below it, zero effect.

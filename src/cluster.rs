@@ -86,7 +86,8 @@ pub enum TakeError {
 #[derive(Debug, Serialize)]
 pub struct StatsSnapshot {
     pub logical_workers: usize,
-    pub claimed_here: Vec<usize>,
+    /// Worker ranges covered by this node's block leases.
+    pub claimed_here: Vec<(usize, usize)>,
     pub total_txns: u64,
     pub cross_worker_txns: u64,
     pub takes: u64,
@@ -112,12 +113,21 @@ pub struct WorkerStat {
 /// the owning worker is the authority for what it owns.
 pub struct Routing {
     pub logical: usize,
+    /// Lease blocks over the worker space (see ClusterMeta::blocks).
+    pub blocks: usize,
     pub exceptions: HashMap<String, usize>,
-    /// Logical worker -> base URL of the node holding its lease.
+    /// Lease block -> base URL of the node holding it. Block-keyed so the
+    /// map stays O(blocks) however large the logical worker space is.
     pub addrs: HashMap<usize, String>,
 }
 
 impl Routing {
+    pub fn addr_of_worker(&self, worker: usize) -> Option<String> {
+        self.addrs
+            .get(&block_of(worker, self.logical, self.blocks))
+            .cloned()
+    }
+
     pub fn owner_of(&self, object: &str) -> usize {
         self.exceptions
             .get(object)
@@ -207,8 +217,13 @@ pub const DEFAULT_MAX_UNSHIPPED: u64 = 256 * 1024 * 1024;
 pub struct NodeInner {
     pub store: Arc<dyn BlobStore>,
     pub routing: RwLock<Routing>,
-    /// Senders for logical workers claimed by THIS node.
+    /// Senders for logical workers SPAWNED on this node. Workers are
+    /// virtual: owning a block claims its whole worker range, but a task
+    /// only exists once a worker is first touched (Orleans-style), so a
+    /// million logical workers cost nothing until used.
     pub local: RwLock<HashMap<usize, mpsc::UnboundedSender<WorkerMsg>>>,
+    /// Where spawned workers keep live files (needed for lazy spawning).
+    pub live_dir: PathBuf,
     /// Logical clock for tenure/visit windows (per-node; hints only).
     pub clock: AtomicU64,
     pub hysteresis: u64,
@@ -224,7 +239,7 @@ pub struct NodeInner {
     pub activation_permits: Arc<tokio::sync::Semaphore>,
     pub http: reqwest::Client,
     pub stats: Stats,
-    /// Epochs of leases this node holds; watched by the lease guard.
+    /// Epochs of block leases this node holds; watched by the lease guard.
     pub epochs: RwLock<HashMap<usize, u64>>,
     /// Set by the lease guard just before fail-stop; checked at the commit
     /// point as a last line of defense.
@@ -250,6 +265,27 @@ pub struct Stats {
 #[derive(Serialize, Deserialize)]
 struct ClusterMeta {
     logical_workers: usize,
+    /// Lease granularity: the worker space is divided into this many fixed
+    /// blocks, and leases are per-block. Claims, the lease guard, and
+    /// tombstones are O(blocks) — never O(logical_workers) — which is what
+    /// lets LOGICAL_WORKERS be a million without the metadata caring.
+    /// Fixed at cluster creation; the fixed grid is also what keeps
+    /// create-if-absent sound (arbitrary ranges could overlap).
+    #[serde(default = "default_blocks_legacy")]
+    blocks: usize,
+}
+
+fn default_blocks_legacy() -> usize {
+    64 // pre-blocks clusters had per-worker leases with W=64
+}
+
+/// Workers [b*W/B, (b+1)*W/B) belong to block b.
+pub fn block_of(worker: usize, logical: usize, blocks: usize) -> usize {
+    worker * blocks / logical
+}
+
+pub fn block_range(block: usize, logical: usize, blocks: usize) -> (usize, usize) {
+    (block * logical / blocks, (block + 1) * logical / blocks)
 }
 
 #[derive(Serialize, Deserialize)]
@@ -266,12 +302,12 @@ pub fn checkpoint_key(worker: usize) -> String {
     format!("_worker/{worker}.json")
 }
 
-fn lease_key(worker: usize, epoch: u64) -> String {
-    format!("_lease/w{worker}/e{epoch}.json")
+fn lease_key(block: usize, epoch: u64) -> String {
+    format!("_lease/b{block}/e{epoch}.json")
 }
 
-fn tombstone_key(worker: usize, epoch: u64) -> String {
-    format!("_lease/w{worker}/e{epoch}.released")
+fn tombstone_key(block: usize, epoch: u64) -> String {
+    format!("_lease/b{block}/e{epoch}.released")
 }
 
 const LEASE_GUARD_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
@@ -282,11 +318,20 @@ struct LeaseState {
     released: bool,
 }
 
-async fn latest_lease(store: &dyn BlobStore, worker: usize) -> anyhow::Result<Option<LeaseState>> {
-    let prefix = format!("_lease/w{worker}/");
+async fn latest_lease(store: &dyn BlobStore, block: usize) -> anyhow::Result<Option<LeaseState>> {
+    let prefix = format!("_lease/b{block}/");
     let keys = store.list(&prefix).await?;
+    lease_from_keys(store, block, &keys).await
+}
+
+async fn lease_from_keys(
+    store: &dyn BlobStore,
+    block: usize,
+    keys: &[String],
+) -> anyhow::Result<Option<LeaseState>> {
+    let prefix = format!("_lease/b{block}/");
     let mut best: Option<u64> = None;
-    for key in &keys {
+    for key in keys {
         if let Some(epoch) = key
             .strip_prefix(&prefix)
             .and_then(|k| k.strip_prefix('e'))
@@ -300,16 +345,43 @@ async fn latest_lease(store: &dyn BlobStore, worker: usize) -> anyhow::Result<Op
     let Some(epoch) = best else {
         return Ok(None);
     };
-    let Some(bytes) = store.get(&lease_key(worker, epoch)).await? else {
+    let Some(bytes) = store.get(&lease_key(block, epoch)).await? else {
         return Ok(None);
     };
     let lease: Lease = serde_json::from_slice(&bytes)?;
-    let released = keys.contains(&tombstone_key(worker, epoch));
+    let released = keys.contains(&tombstone_key(block, epoch));
     Ok(Some(LeaseState {
         epoch,
         addr: lease.addr,
         released,
     }))
+}
+
+/// Every block's current lease, from ONE list of the lease space —
+/// boot cost is O(live blocks), not O(logical workers).
+async fn load_leases(
+    store: &dyn BlobStore,
+    blocks: usize,
+) -> anyhow::Result<HashMap<usize, LeaseState>> {
+    let keys = store.list("_lease/").await?;
+    let mut by_block: HashMap<usize, Vec<String>> = HashMap::new();
+    for key in keys {
+        if let Some(b) = key
+            .strip_prefix("_lease/b")
+            .and_then(|k| k.split('/').next())
+            .and_then(|k| k.parse::<usize>().ok())
+            && b < blocks
+        {
+            by_block.entry(b).or_default().push(key);
+        }
+    }
+    let mut out = HashMap::new();
+    for (block, keys) in by_block {
+        if let Some(state) = lease_from_keys(store, block, &keys).await? {
+            out.insert(block, state);
+        }
+    }
+    Ok(out)
 }
 
 /// Boot a node: agree on W (create-once cluster meta), recover the commit
@@ -320,11 +392,15 @@ pub async fn start(cfg: NodeConfig) -> anyhow::Result<Node> {
     // Cluster config is create-once: first node wins, everyone else adopts.
     let meta_bytes = serde_json::to_vec(&ClusterMeta {
         logical_workers: cfg.logical,
+        blocks: cfg.logical.min(256),
     })?;
     cfg.store.create("_meta/cluster.json", &meta_bytes).await?;
-    let logical = match cfg.store.get("_meta/cluster.json").await? {
-        Some(bytes) => serde_json::from_slice::<ClusterMeta>(&bytes)?.logical_workers,
-        None => cfg.logical,
+    let (logical, blocks) = match cfg.store.get("_meta/cluster.json").await? {
+        Some(bytes) => {
+            let meta: ClusterMeta = serde_json::from_slice(&bytes)?;
+            (meta.logical_workers, meta.blocks)
+        }
+        None => (cfg.logical, cfg.logical.min(256)),
     };
 
     // Any node may recover: roll-forward is idempotent (same bytes, same
@@ -374,22 +450,23 @@ pub async fn start(cfg: NodeConfig) -> anyhow::Result<Node> {
         .clone()
         .unwrap_or_else(|| format!("http://{}", listener.local_addr().unwrap()));
 
-    // Current lease holders for every worker (so we can route to peers).
-    let mut addrs = HashMap::new();
-    for w in 0..logical {
-        if let Some(lease) = latest_lease(cfg.store.as_ref(), w).await? {
-            addrs.insert(w, lease.addr);
-        }
-    }
+    // Current block-lease holders (one list; so we can route to peers).
+    let leases = load_leases(cfg.store.as_ref(), blocks).await?;
+    let addrs: HashMap<usize, String> = leases
+        .iter()
+        .map(|(b, lease)| (*b, lease.addr.clone()))
+        .collect();
 
     let node: Node = Arc::new(NodeInner {
         store: cfg.store.clone(),
         routing: RwLock::new(Routing {
             logical,
+            blocks,
             exceptions,
             addrs,
         }),
         local: RwLock::new(HashMap::new()),
+        live_dir: cfg.live_dir.clone(),
         clock: AtomicU64::new(0),
         hysteresis: cfg.hysteresis,
         advertise: advertise.clone(),
@@ -413,36 +490,59 @@ pub async fn start(cfg: NodeConfig) -> anyhow::Result<Node> {
         let _ = axum::serve(listener, app).await;
     }));
 
-    let candidates: Vec<usize> = match &cfg.claim {
-        ClaimSpec::All => (0..logical).collect(),
-        ClaimSpec::Workers(ws) => ws.iter().copied().filter(|w| *w < logical).collect(),
+    // Claiming operates on BLOCKS: O(≤256) blob ops however big W is.
+    let candidate_blocks: Vec<usize> = match &cfg.claim {
+        ClaimSpec::All => (0..blocks).collect(),
+        ClaimSpec::Workers(ws) => {
+            let mut bs: Vec<usize> = ws
+                .iter()
+                .filter(|w| **w < logical)
+                .map(|w| block_of(*w, logical, blocks))
+                .collect();
+            bs.sort_unstable();
+            bs.dedup();
+            bs
+        }
         ClaimSpec::Auto(_) => {
             // Rotate the scan by our address hash so concurrent booters
             // start claiming from different offsets (fewer create races).
             let mut h = std::collections::hash_map::DefaultHasher::new();
             advertise.hash(&mut h);
-            let start = (h.finish() % logical as u64) as usize;
-            (0..logical).map(|i| (start + i) % logical).collect()
+            let start = (h.finish() % blocks as u64) as usize;
+            (0..blocks).map(|i| (start + i) % blocks).collect()
         }
     };
-    let quota = match &cfg.claim {
-        ClaimSpec::Auto(k) => *k,
+    // Auto quota is expressed in workers; convert to blocks, rounding up.
+    let quota_blocks = match &cfg.claim {
+        ClaimSpec::Auto(k) => (k * blocks).div_ceil(logical).max(1),
         _ => usize::MAX,
     };
 
+    // Health-check each foreign holder once, not once per block.
+    let mut addr_alive: HashMap<String, bool> = HashMap::new();
     let mut claimed = 0usize;
-    for w in candidates {
-        if claimed >= quota {
+    for b in candidate_blocks {
+        if claimed >= quota_blocks {
             break;
         }
-        let next_epoch = match latest_lease(cfg.store.as_ref(), w).await? {
+        let next_epoch = match leases.get(&b) {
             Some(lease) => {
                 // Claimable when: cleanly released, held by our own
                 // predecessor identity (rolling deploy of a named
                 // instance), or the holder is dead.
-                let claimable = lease.released
-                    || lease.addr == advertise
-                    || !crate::rpc::health(&node, &lease.addr).await;
+                let claimable = if lease.released || lease.addr == advertise {
+                    true
+                } else {
+                    let alive = match addr_alive.get(&lease.addr) {
+                        Some(a) => *a,
+                        None => {
+                            let a = crate::rpc::health(&node, &lease.addr).await;
+                            addr_alive.insert(lease.addr.clone(), a);
+                            a
+                        }
+                    };
+                    !alive
+                };
                 if !claimable {
                     continue;
                 }
@@ -455,19 +555,19 @@ pub async fn start(cfg: NodeConfig) -> anyhow::Result<Node> {
         })?;
         if !cfg
             .store
-            .create(&lease_key(w, next_epoch), &lease_bytes)
+            .create(&lease_key(b, next_epoch), &lease_bytes)
             .await?
         {
             continue; // lost the claim race
         }
-        let tx = worker::spawn(node.clone(), w, cfg.live_dir.join(format!("w{w}")))?;
-        node.local.write().unwrap().insert(w, tx);
-        node.epochs.write().unwrap().insert(w, next_epoch);
+        // No worker tasks are spawned here: workers are virtual and
+        // materialize on first touch (local_sender).
+        node.epochs.write().unwrap().insert(b, next_epoch);
         node.routing
             .write()
             .unwrap()
             .addrs
-            .insert(w, advertise.clone());
+            .insert(b, advertise.clone());
         claimed += 1;
     }
 
@@ -483,12 +583,12 @@ pub async fn start(cfg: NodeConfig) -> anyhow::Result<Node> {
                 let e = guard_node.epochs.read().unwrap();
                 e.iter().map(|(w, e)| (*w, *e)).collect()
             };
-            for (w, mine) in epochs {
-                match latest_lease(guard_node.store.as_ref(), w).await {
+            for (b, mine) in epochs {
+                match latest_lease(guard_node.store.as_ref(), b).await {
                     Ok(Some(lease)) if lease.epoch > mine => {
                         guard_node.fenced.store(true, Ordering::SeqCst);
                         eprintln!(
-                            "FENCED: lease for worker {w} superseded (epoch {} > {mine}); fail-stopping",
+                            "FENCED: lease for block {b} superseded (epoch {} > {mine}); fail-stopping",
                             lease.epoch
                         );
                         std::process::exit(1);
@@ -500,12 +600,37 @@ pub async fn start(cfg: NodeConfig) -> anyhow::Result<Node> {
     }));
 
     println!(
-        "node {} claimed {:?} of {} logical workers",
+        "node {} claimed worker ranges {:?} of {} logical workers ({} blocks)",
         advertise,
-        node.claimed(),
-        logical
+        node.claimed_ranges(),
+        logical,
+        blocks
     );
     Ok(node)
+}
+
+/// Get (or lazily spawn) the local worker task for a logical worker this
+/// node's leases cover. Returns None if the worker isn't ours. This is what
+/// makes workers virtual: a claimed-but-untouched worker costs nothing.
+pub fn local_sender(node: &Node, worker: usize) -> Option<mpsc::UnboundedSender<WorkerMsg>> {
+    if let Some(tx) = node.local.read().unwrap().get(&worker) {
+        return Some(tx.clone());
+    }
+    if !node.owns_worker(worker) {
+        return None;
+    }
+    let mut local = node.local.write().unwrap();
+    if let Some(tx) = local.get(&worker) {
+        return Some(tx.clone()); // lost a benign race; someone spawned it
+    }
+    let tx = worker::spawn(
+        node.clone(),
+        worker,
+        node.live_dir.join(format!("w{worker}")),
+    )
+    .ok()?;
+    local.insert(worker, tx.clone());
+    Some(tx)
 }
 
 impl NodeInner {
@@ -521,10 +646,42 @@ impl NodeInner {
         }
     }
 
+    /// Worker ranges this node's block leases cover. Kept as ranges — with
+    /// a million logical workers, enumerating ids would be self-harm.
+    pub fn claimed_ranges(&self) -> Vec<(usize, usize)> {
+        let routing = self.routing.read().unwrap();
+        let mut blocks: Vec<usize> = self.epochs.read().unwrap().keys().copied().collect();
+        blocks.sort_unstable();
+        let mut ranges: Vec<(usize, usize)> = Vec::new();
+        for b in blocks {
+            let (start, end) = block_range(b, routing.logical, routing.blocks);
+            match ranges.last_mut() {
+                Some((_, prev_end)) if *prev_end == start => *prev_end = end,
+                _ => ranges.push((start, end)),
+            }
+        }
+        ranges
+    }
+
+    /// Total workers this node's leases cover.
+    pub fn claimed_workers(&self) -> usize {
+        self.claimed_ranges().iter().map(|(s, e)| e - s).sum()
+    }
+
+    /// Test/deme helper: enumerate claimed worker ids (small W only).
     pub fn claimed(&self) -> Vec<usize> {
-        let mut v: Vec<usize> = self.local.read().unwrap().keys().copied().collect();
-        v.sort_unstable();
-        v
+        self.claimed_ranges()
+            .iter()
+            .flat_map(|&(s, e)| s..e)
+            .collect()
+    }
+
+    /// Does a block lease this node holds cover this worker?
+    pub fn owns_worker(&self, worker: usize) -> bool {
+        let routing = self.routing.read().unwrap();
+        let b = block_of(worker, routing.logical, routing.blocks);
+        drop(routing);
+        self.epochs.read().unwrap().contains_key(&b)
     }
 
     /// Graceful shutdown: flush every worker's final boat (unshipped
@@ -580,7 +737,7 @@ impl NodeInner {
         per_worker.sort_by_key(|s| s.worker);
         StatsSnapshot {
             logical_workers: self.routing.read().unwrap().logical,
-            claimed_here: self.claimed(),
+            claimed_here: self.claimed_ranges(),
             total_txns: self.stats.total_txns.load(Ordering::Relaxed),
             cross_worker_txns: self.stats.cross_worker_txns.load(Ordering::Relaxed),
             takes: self.stats.takes.load(Ordering::Relaxed),
@@ -596,12 +753,16 @@ impl NodeInner {
 /// cache. Used whenever routing has no (or a stale) address for a worker —
 /// e.g. a node that claimed its lease after we booted.
 pub async fn resolve_addr(node: &Node, worker: usize) -> Option<String> {
-    let lease = latest_lease(node.store.as_ref(), worker).await.ok()??;
+    let block = {
+        let routing = node.routing.read().unwrap();
+        block_of(worker, routing.logical, routing.blocks)
+    };
+    let lease = latest_lease(node.store.as_ref(), block).await.ok()??;
     node.routing
         .write()
         .unwrap()
         .addrs
-        .insert(worker, lease.addr.clone());
+        .insert(block, lease.addr.clone());
     Some(lease.addr)
 }
 
@@ -662,7 +823,7 @@ pub async fn submit_routed(
             .unwrap()
     };
 
-    let local_tx = node.local.read().unwrap().get(&target).cloned();
+    let local_tx = local_sender(node, target);
     if let Some(tx) = local_tx {
         let (rtx, rrx) = oneshot::channel();
         tx.send(WorkerMsg::Submit {
@@ -676,7 +837,7 @@ pub async fn submit_routed(
         rrx.await
             .map_err(|_| ApiError::internal("transaction dropped"))?
     } else {
-        let cached = node.routing.read().unwrap().addrs.get(&target).cloned();
+        let cached = node.routing.read().unwrap().addr_of_worker(target);
         let addr = match cached {
             Some(addr) => addr,
             None => resolve_addr(node, target).await.ok_or_else(|| {
@@ -1349,6 +1510,60 @@ mod tests {
             assert_eq!(v[0]["rows"][0]["n"], 1, "{id} intact after shed cycle");
         }
         node.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn one_million_logical_workers_costs_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let boot_start = std::time::Instant::now();
+        // Two nodes over a million-worker space: leases are per-block
+        // (≤256), workers are virtual (spawned on first touch), so this
+        // boots in milliseconds instead of hours.
+        let node_a = boot(
+            dir.path(),
+            1_000_000,
+            ClaimSpec::Auto(500_000),
+            "a",
+        )
+        .await;
+        let node_b = boot(dir.path(), 1_000_000, ClaimSpec::Auto(500_000), "b").await;
+        let boot_elapsed = boot_start.elapsed();
+        assert!(
+            boot_elapsed.as_secs() < 20,
+            "boot took {boot_elapsed:?}; per-worker costs are back"
+        );
+        assert_eq!(
+            node_a.claimed_workers() + node_b.claimed_workers(),
+            1_000_000,
+            "the fleet covers the whole space"
+        );
+
+        // Real transactions across the space (and across nodes) still work;
+        // only the touched workers ever materialize.
+        let alice = id_on_worker(3, 1_000_000, "alice");
+        let bob = id_on_worker(999_777, 1_000_000, "bob");
+        make_account(&node_a, &alice).await;
+        make_account(&node_a, &bob).await;
+        exec(
+            &node_a,
+            &[&alice, &bob],
+            &[
+                (&alice, "UPDATE account SET balance = balance - 60"),
+                (&bob, "UPDATE account SET balance = balance + 60"),
+            ],
+        )
+        .await
+        .unwrap();
+        assert_eq!(balance(&node_b, &alice).await, 40);
+        assert_eq!(balance(&node_b, &bob).await, 160);
+
+        let spawned = node_a.local.read().unwrap().len() + node_b.local.read().unwrap().len();
+        assert!(
+            spawned <= 8,
+            "only touched workers should materialize, got {spawned}"
+        );
+        node_a.shutdown().await;
+        node_b.shutdown().await;
     }
 
     #[tokio::test]

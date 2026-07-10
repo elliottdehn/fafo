@@ -91,8 +91,17 @@ impl BlobStore for FsBlobStore {
     }
 
     async fn list(&self, prefix: &str) -> anyhow::Result<Vec<String>> {
+        // Walk only the directory the prefix implies, not the whole root —
+        // with a million lease files, a full-root walk per list turns every
+        // lookup into O(everything).
+        let dir = prefix.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
+        let base = if dir.is_empty() {
+            self.root.clone()
+        } else {
+            self.root.join(dir)
+        };
         let mut keys = Vec::new();
-        walk(&self.root, &self.root, &mut keys)?;
+        walk(&base, &self.root, &mut keys)?;
         keys.retain(|k| k.starts_with(prefix));
         keys.sort();
         Ok(keys)

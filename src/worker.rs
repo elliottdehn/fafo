@@ -1236,7 +1236,7 @@ async fn take_task(
             return;
         }
         let outcome = {
-            let local_tx = node.local.read().unwrap().get(&owner).cloned();
+            let local_tx = crate::cluster::local_sender(&node, owner);
             if let Some(tx) = local_tx {
                 let (rtx, rrx) = oneshot::channel();
                 if tx
@@ -1252,7 +1252,7 @@ async fn take_task(
                     rrx.await.map_err(|_| anyhow::anyhow!("take dropped"))
                 }
             } else {
-                let cached = node.routing.read().unwrap().addrs.get(&owner).cloned();
+                let cached = node.routing.read().unwrap().addr_of_worker(owner);
                 let addr = match cached {
                     Some(addr) => Some(addr),
                     None => crate::cluster::resolve_addr(&node, owner).await,
@@ -1306,12 +1306,12 @@ async fn take_task(
 }
 
 async fn send_adopt(node: &Node, home: usize, object: String, meta: TransferMeta) {
-    let local_tx = node.local.read().unwrap().get(&home).cloned();
+    let local_tx = crate::cluster::local_sender(node, home);
     if let Some(tx) = local_tx {
         let _ = tx.send(WorkerMsg::Adopt { object, meta });
         return;
     }
-    let addr = node.routing.read().unwrap().addrs.get(&home).cloned();
+    let addr = node.routing.read().unwrap().addr_of_worker(home);
     if let Some(addr) = addr
         && let Err(e) = crate::rpc::adopt(node, &addr, home, object.clone(), meta).await
     {

@@ -101,7 +101,7 @@ async fn require_api_token(
 }
 
 async fn healthz(State(node): State<Node>) -> Json<Value> {
-    Json(json!({ "ok": true, "workers": node.claimed().len() }))
+    Json(json!({ "ok": true, "workers": node.claimed_workers() }))
 }
 
 /// Inter-node RPC endpoint. Guarded by the cluster secret, not the API token
@@ -140,7 +140,7 @@ async fn rpc_handler(
             object,
             taker,
         } => {
-            let tx = node.local.read().unwrap().get(&worker).cloned();
+            let tx = crate::cluster::local_sender(&node, worker);
             match tx {
                 Some(tx) => {
                     let (rtx, rrx) = oneshot::channel();
@@ -166,7 +166,7 @@ async fn rpc_handler(
             object,
             meta,
         } => {
-            let tx = node.local.read().unwrap().get(&worker).cloned();
+            let tx = crate::cluster::local_sender(&node, worker);
             match tx {
                 Some(tx) if tx.send(WorkerMsg::Adopt { object, meta }).is_ok() => RpcResp::Ok,
                 _ => RpcResp::Err("worker is gone".into()),

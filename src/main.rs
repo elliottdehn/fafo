@@ -39,7 +39,7 @@ async fn main() -> anyhow::Result<()> {
     let data_dir = env_or("DATA_DIR", "./data");
     let host = env_or("HOST", "127.0.0.1"); // container images set HOST=0.0.0.0
     let port = env_or("PORT", "8787");
-    let logical: usize = env_or("LOGICAL_WORKERS", "64").parse()?;
+    let logical: usize = env_or("LOGICAL_WORKERS", "4096").parse()?;
     let hysteresis: u64 = env_or("HYST", "200").parse()?;
     let secret = match std::env::var("CLUSTER_SECRET") {
         Ok(s) => s,
