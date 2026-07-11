@@ -17,7 +17,10 @@ The endless miner (`dst mine`) then found bug 23 in ~1,500 fresh seeds, and
 bug 24 the moment a **multi-workload** battery (ERC20 supply, escrow
 settlement races, idempotent counters, three-way watched feeds — all racing
 at once) cranked cross-object contention past what plain transfers reach.
-All of these survived the example suite; none survived the dice.
+Two more faults — per-node clock skew and a **pause adversary** (a live node
+loses its lease to a takeover and rejoins) — then flushed out the fencing
+trio, bugs 25–27. All of these survived the example suite; none survived the
+dice.
 
 Format: what the oracle saw → what was actually wrong → the fix — plus an
 ELI5 and a nastiness score (severity × subtlety × blast radius; 10 means
@@ -289,6 +292,51 @@ and `advance()` heals routing toward that truth, both directions.
 
 > ELI5: The county says you own the house and you agree — but your own GPS insists it's across town, so you keep driving to a stranger's door, who sends you home, where your GPS sends you back. Forever. **Nastiness: 8/10.**
 
+## The pause adversary: fencing under takeover
+
+Three forks the DST only reached once it grew two new faults: **per-node
+clock-rate skew** (each node's clock ticks at a slightly different rate) and
+the **pause adversary** — a live node is isolated from its peers while a
+rebooted peer takes over its lease, then it rejoins and tries to keep
+writing. That is the textbook zombie-writer scenario fencing exists for, and
+it flushed out three separate ways a refused write survived anyway. Together
+they cut pause-fault safety forks from ~33% of seeds to under 1%.
+
+**25. The fenced write that committed anyway.** The commit gate verified the
+lease only when its own recency stamp had already gone stale (a
+`lease_stale &&` fast-path). But a node can be superseded while its stamp is
+perfectly fresh: it keeps refreshing its lease through the *store* even while
+RPC-partitioned from everyone, so "my stamp is recent" and "I still hold the
+lease" are not the same claim. A boat whose block had already been taken over
+sailed straight through the fast path and wrote its commit record on top of
+the new owner's — two writers, one object. Fix: verify the lease
+**unconditionally** at every commit point. One `_lease/` list per boat is the
+price of storage-verified fencing, and it is not optional.
+
+> ELI5: The bouncer only re-checked your wristband if it *looked* faded. But a wristband can be revoked while it still looks new — so people who'd already been kicked out walked right back in. Now everyone gets re-checked at the door, every time. **Nastiness: 9/10 (silent cross-node fork).**
+
+**26. Resurrection from the commuter cache.** Activation has a fast path: if a
+local database file survives from a previous stay, skip the download and just
+apply the deltas newer than it. But a fenced writer's *refused* write also
+lives in that local file — at a change counter **ahead of** anything durable.
+On the next activation the fast path trusted the cache, saw its high counter,
+and resurrected the write the commit gate had just correctly refused. Fix:
+trust the cache only within `[base, max_durable]` — a counter beyond every
+durable delta is an un-committed local scribble, not a shortcut. Discard it
+and download the base.
+
+> ELI5: Your laptop had a newer draft than the server, so it "helpfully" kept yours — except that draft was the exact edit the server had rejected. Trusting local-is-newer un-rejected it. Now "newer than the server" only counts if the server has actually seen it. **Nastiness: 8/10.**
+
+**27. Shipping an object you no longer own.** A worker that had gone dirty on
+an object, then handed that object off in a migration, would still carry it
+into its next boat and ship it — a fork minted at the source, two workers
+writing one object's history. The fork tripwire caught it downstream, but the
+write had already sailed. Fix: before launching a boat, `maybe_launch` reverts
+any dirty object the worker no longer owns (and the whole txn-closure around
+it) instead of shipping it. Never ship what you don't own.
+
+> ELI5: You packed a box that belongs to the new tenant and almost mailed it under your name. Now the check happens before the truck leaves: anything that isn't yours comes back off the truck. **Nastiness: 8/10.**
+
 ## The bug that isn't fixed yet (honesty)
 
 Config-fuzzing also found that a node which **permanently dies with no
@@ -298,30 +346,53 @@ unreadable forever. ~14% of *unconstrained* configs hit it.
 This one is documented, not fixed — deliberately. It sits at the edge of
 the operating envelope: the deployment target (Cloudflare Containers)
 always reschedules a crashed instance, so "fewer nodes, forever" is not a
-state production reaches. And two attempts to add an orphan-reclaim sweep
-were **reverted for making things worse** — the exact "every fix ships a
-new failure mode" trap:
+state production reaches. To close it you would let a *peer* speculatively
+reclaim a presumed-dead node's blocks — and **nine** attempts at that
+reclaim have now been reverted for making things worse, the exact "every fix
+ships a new failure mode" trap. The lineage, shortest to deepest:
 
-1. Reclaim based on an RPC **health check** forked immediately: health-check
-   rides RPC, so a live-but-*partitioned* holder reads as dead, gets its
-   block stolen, and both write.
-2. Reclaim based on **lease deadlines** (a holder refreshes through the
-   store; reclaim only a lapsed lease) fixed the partition race — a
-   partitioned holder still refreshes — but STILL forked on the default
-   config, because reclaiming a block interacts with the crash/reboot/
-   migration timing to leave two live copies of a worker's object state.
-   The real crux is reconciling **block-lease** ownership with
-   **object-checkpoint** ownership on reclaim, and it needs a clear-headed
-   design, not a late-night patch.
+1. Reclaim on an RPC **health check** forked immediately: health-check rides
+   RPC, so a live-but-*partitioned* holder reads as dead, gets its block
+   stolen, and both write.
+2. Reclaim on **lease deadlines** (a holder refreshes through the store;
+   reclaim only a lapsed lease) fixed the partition race — a partitioned
+   holder still refreshes — but still forked, because a block takeover does
+   not reconcile with per-*object* ownership.
+3. A **generation-keyed** durable layout (each owner writes to its own
+   generation's key, so a superseded writer is invisible) regressed 7×: it
+   is fundamentally incompatible with page-delta shipping, because a delta is
+   relative to a base and cannot cross a generation boundary.
+4. **Compare-and-swap on the base** (the store's new `put_cas` / `version`,
+   which model R2's `If-Match`) fenced single writers correctly but proved
+   **net-neutral**: single-key CAS cannot make a *cross-object* transfer
+   atomic — once one half's base is durably promoted you cannot un-promote
+   it, so fencing the other half just *relocates* the tear.
+5. A **commit-time claim** (`create`-if-absent on a per-object-version key,
+   the right idea for fencing the fork *before* any write) regressed too,
+   because the fence has to cover **every** promotion path — the recovery
+   roll-forward still promoted with a plain overwrite and clobbered anyway.
 
-The disciplined call was to keep the availability limitation (bounded,
-understood, out-of-envelope) rather than ship the data corruption that
-"fixing" it kept introducing. The fuzzer stays constrained to the supported
-envelope (always-restart, fence TTL above the fencing safety floor), where
-the committed system survives **thousands of randomized cluster shapes with
-zero safety violations** — which is the property that actually matters.
+The definitive root, paid for in full: safe speculative reclaim needs
+**cross-object atomic commit under a fork**, which single-key primitives
+can only approximate. The genuine fix is a log-structured commit — every
+promotion path (ship, recovery, compaction) funnelled through one fenced,
+ordered, idempotent apply, so a committed record lands exactly once and no
+path can clobber. That is a protocol, not a patch.
 
-> ELI5: We found that if a member of the band quits mid-tour and is never replaced, their songs stop getting played. The fix — teaching the others to cover — kept accidentally having two people sing the same song at once, which is worse, so we wrote down "don't lose a member permanently" and kept the band tight instead. **Nastiness: 5/10 (bounded availability, no data risk).**
+What the campaign *did* settle is where the line actually is. Holding every
+realistic fault on — crashes, restarts, clock skew, a reliable store — and
+turning the speculative-reclaim pause **off**, the system is **974 / 974
+seeds clean, zero safety and zero liveness violations**. The entire residual
+(~0.6%) lives in that one adversary: a peer stealing a partitioned-but-live
+node's blocks — a takeover the platform never asks for, since it reschedules
+genuinely-dead instances instead. So the honest status is not "broken": it
+is a system provably clean in the model it runs in, whose fuzzer is
+stress-testing a deliberately-unbuilt feature. The disciplined call remains
+to keep the bounded availability limit rather than ship the data corruption
+that "fixing" it keeps introducing — and to reach for the log-structured
+commit only if speculative reclaim ever becomes a feature worth its cost.
+
+> ELI5: If a band member is stranded off-stage and never replaced, their songs stop — but our roadies keep trying to have someone *else* grab that member's guitar mid-song, and it keeps ending with two people playing the same part out of sync, which is worse. We've now tried nine kinds of roadie. So we wrote down "wait for the venue to send a real replacement" (which it always does) and proved the band is flawless when nobody freelances the swap. **Nastiness: 5/10 (bounded availability, no data risk in the supported model).**
 
 ## Before the dice: what the example suite caught
 

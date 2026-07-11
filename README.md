@@ -102,7 +102,7 @@ cargo run --release --bin dst -- run --seed 7    # one cluster life
 cargo run --release --bin dst -- mine --fuzz     # all cores, random shapes, forever
 ```
 
-It has found and closed [24 bugs and counting](bugs.md) — the ledger, with
+It has found and closed [27 bugs and counting](bugs.md) — the ledger, with
 an ELI5 and a nastiness score for each, is honestly the best reading in
 this repo.
 
