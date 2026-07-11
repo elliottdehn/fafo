@@ -406,10 +406,11 @@ impl Worker {
                             // Resetting tenure here made every first grant
                             // read as "unsettled" and killed hysteresis
                             // returns cluster-wide.
-                            if ok && !matches!(claim, Claim::Transit(_, _)) {
-                                if let Some(m) = self.meta.get_mut(&object) {
-                                    m.arrived_at = 0;
-                                }
+                            if ok
+                                && !matches!(claim, Claim::Transit(_, _))
+                                && let Some(m) = self.meta.get_mut(&object)
+                            {
+                                m.arrived_at = 0;
                             }
                             ok
                             // fall through if true: durably ours, serve it
@@ -1038,10 +1039,9 @@ impl Worker {
                 // but only when no queue exists. Clobbering a live queue
                 // here would drop parked txns and takes on the floor;
                 // advance() enqueues into an existing one correctly.
-                if !self.queues.contains_key(&object) {
-                    self.queues
-                        .insert(object, VecDeque::from([Entry::Txn(txn)]));
-                }
+                self.queues
+                    .entry(object)
+                    .or_insert_with(|| VecDeque::from([Entry::Txn(txn)]));
                 self.pump(vec![txn]).await;
             }
             TakenResult::AlreadyLocal => self.pump(vec![txn]).await,

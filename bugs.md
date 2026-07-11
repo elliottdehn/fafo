@@ -8,8 +8,9 @@ transfer atomicity, and liveness after every phase. A crash IS a repro: the
 seed replays it bit for bit.
 
 Baseline before the campaign: **18 of 50 seeds failing.** After: **0 of 50,
-three consecutive sweeps**, 137/137 example tests green. All of these
-survived the ~100-test example suite; none survived the dice.
+three consecutive sweeps**, 140/140 example tests green — including with the
+will oracle live (bug 22), the specific bug the harness was built to catch.
+All of these survived the ~100-test example suite; none survived the dice.
 
 Format: what the oracle saw → what was actually wrong → the fix — plus an
 ELI5 and a nastiness score (severity × subtlety × blast radius; 10 means
@@ -207,6 +208,39 @@ and therefore boat composition — across runs; a UUID in the ship path; raw
 product; every one of these had to die before seed-replay meant anything.
 
 > ELI5: You can't study the game tape if the dice secretly roll differently every time you rewatch it. **Nastiness: 5/10.**
+
+## The bug the harness was built for
+
+**22. The will that died with its node.** A last-will is a transaction a
+client arms to run when its connection dies — release my locks, mark me
+offline, delete my presence row. fafo ran it from the node holding the
+socket, on socket close. That is correct when the socket closes and the
+node lives. It is silently wrong when the NODE dies: the socket is just as
+dead, the client is just as gone, but the promise was process memory and
+the process is ash. The will oracle names it exactly — *"connection for X
+is dead (node crashed) but its will never fired"* — reproducible at any
+seed with a crash-doomed will via `dst run --no-durable-wills`.
+
+> **Durable wills.** Arming now also writes the will (ops + frozen grants)
+> into a `_wills` system object with a `deadline`. While the connection
+> lives, its node pushes the deadline forward (the refresher). When the
+> node dies, the refreshing stops, the deadline lapses, and any surviving
+> node's sweeper claims the lapsed will and fires it — under the frozen
+> capability, so the authorizer still gates every action. A clean close
+> deletes the durable copy so it never double-fires; the claim keeps the
+> common case single-fire; and because a sweeper can die mid-fire and
+> another reclaim, firing is at-least-once and the will ops must be
+> idempotent — the same contract the HTTP path already documents.
+
+The deadline clock is the one seam production and simulation genuinely
+differ on: wall time across nodes in production (the fencing model's
+bounded-clock-rate assumption already relies on it), a shared virtual
+instant under the simulator so deadlines stay comparable AND the run
+replays bit-for-bit. Default now: **0 of 50 seeds fail with the will
+oracle live**, and the fix is proven both directions — persistence off
+reproduces the original loss, persistence on satisfies the oracle.
+
+> ELI5: You left a note with the doorman — "if I don't come back, water my plants." Then the whole building burned down, doorman and note with it, and your plants died. Now the note is filed at city hall with a timer; when your check-ins stop, the next building over waters the plants. **Nastiness: 9/10.**
 
 ---
 

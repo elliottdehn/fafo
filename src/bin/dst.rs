@@ -37,13 +37,23 @@ fn main() {
     if has("--wills-strict") {
         cfg.wills_survive_node_crash = true;
     }
+    // Reproduce the original memory-only will bug: persistence off, oracle
+    // on. The default (persistence on) is the fix.
+    if has("--no-durable-wills") {
+        cfg.durable_wills = false;
+        cfg.wills_survive_node_crash = true;
+    }
 
+    let extra = has("--no-durable-wills") || has("--wills-strict");
     match mode {
         "run" => run_one(cfg),
         "check" => check(cfg),
-        "mine" => mine(cfg, &flag("--jobs"), &flag("--seconds"), has("--wills-strict")),
+        "mine" => mine(cfg, &flag("--jobs"), &flag("--seconds"), extra),
         _ => {
-            eprintln!("usage: dst run|check|mine [--seed N] [--config f.json] [--jobs J] [--seconds S] [--wills-strict]");
+            eprintln!(
+                "usage: dst run|check|mine [--seed N] [--config f.json] \
+                 [--jobs J] [--seconds S] [--wills-strict] [--no-durable-wills]"
+            );
             std::process::exit(2);
         }
     }

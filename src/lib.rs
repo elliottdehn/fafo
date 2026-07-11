@@ -49,6 +49,9 @@ pub mod delta;
 pub mod grants;
 pub mod limits;
 
+// Durable last-wills: promises that outlive the node holding the socket.
+pub mod wills;
+
 // The adversary: deterministic simulation testing (see plan.md and the
 // dst binary). Ships in the crate so `cargo run --bin dst` needs nothing
 // special — anyone can mine.

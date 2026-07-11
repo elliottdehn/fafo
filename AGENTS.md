@@ -130,10 +130,19 @@ when the socket dies, whether it said goodbye or not (MQTT-style):
 Wills are validated at arm time (a bad will is rejected while you can
 still hear about it) and run with full txn semantics — so a will can
 release locks, publish "user went offline" to a channel, and delete
-presence rows in one atomic step. Caveat: a will runs at the node holding
-your socket; if that node itself dies, it can't. Pair presence rows with
-an `expires_at` column refreshed on a heartbeat and filter it in the view
-query — the will is the fast path, the expiry is the backstop.
+presence rows in one atomic step.
+
+Wills survive the death of the node holding your socket. Arming persists
+the will durably with a deadline the holding node keeps refreshing; if
+that node dies, the deadline lapses and any surviving node fires the will
+(under the grants frozen at arm time). Two consequences worth designing
+for: firing is **at-least-once** — a sweeper can die mid-fire and another
+retry — so keep will ops idempotent (an `INSERT OR IGNORE`, a delete, an
+UPSERT — the same idempotency money-like writes already want); and a
+crash-orphaned will fires within a bounded delay (its refresh TTL), not
+instantly, so for sub-second presence pair the will with an `expires_at`
+column refreshed on a heartbeat and filter it in the view query — the
+will is the durable backstop, the expiry is the fast path.
 
 ### Capability tokens: connecting untrusted devices
 

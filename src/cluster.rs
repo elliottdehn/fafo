@@ -20,7 +20,7 @@
 //! process could commit within it. Documented in the README.
 
 use crate::api::ApiError;
-use crate::Map;
+use crate::{Map, Set};
 use crate::store::BlobStore;
 use crate::worker::{self, WorkerMsg};
 use serde::{Deserialize, Serialize};
@@ -257,6 +257,20 @@ pub struct NodeConfig {
     /// (found as a once-per-sweep heisen-failure: wall time outran
     /// FENCE_TTL while virtual time was fine).
     pub wall_fence: bool,
+    /// How long an unrefreshed durable will lives before the sweeper fires
+    /// it. Must exceed the refresh interval (TTL/3) comfortably, so a
+    /// healthy connection never fires its own will early.
+    pub will_ttl: std::time::Duration,
+    /// Persist armed wills durably so they survive the node's death. True
+    /// in production. The DST can turn this off to reproduce the original
+    /// memory-only bug — a will that dies with its node.
+    pub durable_wills: bool,
+    /// The clock durable-will deadlines are measured against. None
+    /// (production): wall time — synchronized across nodes to the same
+    /// bounded-clock-rate assumption the fencing gate already makes. Some
+    /// (simulation): a process-global tokio virtual instant shared by
+    /// every node, so deadlines are comparable AND deterministic.
+    pub clock_base: Option<tokio::time::Instant>,
 }
 
 impl NodeConfig {
@@ -279,11 +293,18 @@ impl NodeConfig {
             serve_http: true,
             exit_on_fence: true,
             wall_fence: true,
+            will_ttl: std::time::Duration::from_secs(30),
+            durable_wills: true,
+            clock_base: None,
         }
     }
 }
 
 pub const DEFAULT_MAX_UNSHIPPED: u64 = 256 * 1024 * 1024;
+
+/// Per-worker transit markers loaded at boot: worker -> (object ->
+/// (destination worker, handoff generation)).
+type BootTransit = Map<usize, Map<String, (usize, u64)>>;
 
 pub struct NodeInner {
     pub store: Arc<dyn BlobStore>,
@@ -308,7 +329,7 @@ pub struct NodeInner {
     pub disk: Mutex<crate::limits::DiskLedger>,
     /// Per-worker transit maps loaded from checkpoints at boot, so a
     /// rebooted giver still remembers which handoffs were in flight.
-    pub boot_transit: Mutex<Map<usize, Map<String, (usize, u64)>>>,
+    pub boot_transit: Mutex<BootTransit>,
     /// Per-worker owned sets (with generations) reconciled at boot; each
     /// worker task consumes its slice when it spawns.
     pub boot_owned: Mutex<Map<usize, Map<String, u64>>>,
@@ -346,9 +367,31 @@ pub struct NodeInner {
     /// node (simulation).
     exit_on_fence: bool,
     wall_fence: bool,
+    pub will_ttl: std::time::Duration,
+    pub durable_wills: bool,
+    clock_base: Option<tokio::time::Instant>,
+    /// Session ids of durable wills armed on connections THIS node holds.
+    /// The refresher keeps their deadlines in the future; when this node
+    /// dies the set dies with it, deadlines lapse, and other nodes' sweepers
+    /// fire the wills.
+    pub armed_wills: Mutex<Set<String>>,
     /// Every task this node spawned: HTTP server, lease guard, workers,
     /// boats, takes. crash() aborts them all — kill -9 with a scalpel.
     tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
+}
+
+impl NodeInner {
+    /// Current time in milliseconds on the will-deadline clock: wall time
+    /// in production, the shared virtual clock under simulation.
+    pub fn now_ms(&self) -> u64 {
+        match self.clock_base {
+            Some(base) => base.elapsed().as_millis() as u64,
+            None => std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64,
+        }
+    }
 }
 
 pub type Node = Arc<NodeInner>;
@@ -595,7 +638,7 @@ pub async fn start(cfg: NodeConfig) -> anyhow::Result<Node> {
     // lower worker id — arbitrary but deterministic, and safe because the
     // data lives in the blob store either way.
     let mut exceptions: Map<String, usize> = Map::default();
-    let mut boot_transit: Map<usize, Map<String, (usize, u64)>> = Map::default();
+    let mut boot_transit: BootTransit = Map::default();
     let mut boot_owned: Map<usize, Map<String, u64>> = Map::default();
     let mut claim_gens: Map<String, (usize, u64)> = Map::default();
     for key in cfg.store.list("_worker/").await? {
@@ -705,6 +748,10 @@ pub async fn start(cfg: NodeConfig) -> anyhow::Result<Node> {
         earliest_write: Mutex::new(tokio::time::Instant::now()),
         exit_on_fence: cfg.exit_on_fence,
         wall_fence: cfg.wall_fence,
+        will_ttl: cfg.will_ttl,
+        durable_wills: cfg.durable_wills,
+        clock_base: cfg.clock_base,
+        armed_wills: Mutex::new(Set::default()),
         tasks: Mutex::new(Vec::new()),
     });
 
@@ -829,6 +876,35 @@ pub async fn start(cfg: NodeConfig) -> anyhow::Result<Node> {
             verify_leases(&guard_node).await;
         }
     });
+
+    // Durable-will machinery. The refresher keeps this node's live wills
+    // from firing early; the sweeper fires wills the cluster has orphaned
+    // (their node stopped refreshing = their node died). Both run on every
+    // node; the sweeper's claim keeps two from firing one will at once.
+    let tick = (cfg.will_ttl / 3).max(std::time::Duration::from_millis(50));
+    if cfg.durable_wills {
+    let refresh_node = node.clone();
+    node.spawn_tracked(async move {
+        loop {
+            tokio::time::sleep(tick).await;
+            let sessions: Vec<String> =
+                refresh_node.armed_wills.lock().unwrap().iter().cloned().collect();
+            let deadline = refresh_node.now_ms() + refresh_node.will_ttl.as_millis() as u64;
+            crate::wills::refresh(&refresh_node, &sessions, deadline).await;
+        }
+    });
+    let sweep_node = node.clone();
+    let claim_ttl = cfg.will_ttl.as_millis() as u64;
+    node.spawn_tracked(async move {
+        // Stagger against the refresher so a sweep never races the tick
+        // that would have kept a healthy will alive.
+        tokio::time::sleep(tick / 2).await;
+        loop {
+            tokio::time::sleep(tick).await;
+            crate::wills::sweep(&sweep_node, sweep_node.now_ms(), claim_ttl).await;
+        }
+    });
+    }
 
     println!(
         "node {} claimed worker ranges {:?} of {} logical workers ({} blocks)",
@@ -1149,6 +1225,23 @@ pub async fn submit_as(
     node.clock.fetch_add(1, Ordering::Relaxed);
     node.stats.total_txns.fetch_add(1, Ordering::Relaxed);
     submit_routed(node, cap, ids, ops, read_only, optimistic).await
+}
+
+/// Like `submit_as`, but for the system's own objects (`_wills`), whose
+/// underscore-prefixed ids `valid_id` deliberately forbids to users. Same
+/// routing and durability; only the id gate is skipped. Never reachable
+/// from the public API — internal callers only.
+pub async fn submit_system(
+    node: &Node,
+    mut objects: Vec<String>,
+    ops: Vec<Op>,
+    optimistic: bool,
+) -> Result<TxnResponse, ApiError> {
+    objects.sort();
+    objects.dedup();
+    node.clock.fetch_add(1, Ordering::Relaxed);
+    node.stats.total_txns.fetch_add(1, Ordering::Relaxed);
+    submit_routed(node, None, objects, ops, false, optimistic).await
 }
 
 /// Shared txn validation: sorted, deduped participant ids, every op's
@@ -3257,6 +3350,119 @@ mod tests {
         )
         .await
         .unwrap();
+    }
+
+    // ===================================================== durable wills
+    //
+    // A will armed on a connection must fire when that connection dies —
+    // including when the whole NODE dies, taking the socket's in-memory
+    // teardown with it. The durable copy + sweeper are what make the
+    // node-death case hold. (The DST exercises this across fault storms;
+    // these pin the mechanics directly.)
+
+    use crate::api::{Auth, Session};
+
+    async fn arm_will(session: &Session, key: &str) {
+        let frame = serde_json::json!({
+            "id": 1,
+            "will": { "ops": [{
+                "object": "graveyard",
+                "sql": "INSERT OR IGNORE INTO g (k) VALUES (?1)",
+                "params": [key],
+            }]}
+        });
+        let reply = session.frame(&frame.to_string()).await.unwrap();
+        let reply: Value = serde_json::from_str(&reply).unwrap();
+        assert_eq!(reply["result"]["will"], "armed", "got: {reply}");
+    }
+
+    async fn graveyard(node: &Node) -> Vec<String> {
+        let res = submit_system(
+            node,
+            vec!["graveyard".into()],
+            vec![Op {
+                object: "graveyard".into(),
+                sql: "SELECT k FROM g ORDER BY k".into(),
+                params: vec![],
+            }],
+            false,
+        )
+        .await
+        .unwrap();
+        match res.results.into_iter().next() {
+            Some(OpResult::Rows { rows }) => rows
+                .iter()
+                .map(|r| r["k"].as_str().unwrap().to_string())
+                .collect(),
+            _ => vec![],
+        }
+    }
+
+    #[tokio::test]
+    async fn a_lapsed_durable_will_is_swept_and_fired_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = boot(dir.path(), 4, ClaimSpec::All, "a").await;
+        exec(&node, &["graveyard"], &[("graveyard", "CREATE TABLE g (k TEXT PRIMARY KEY)")])
+            .await
+            .unwrap();
+
+        let session = Session::open(node.clone(), Auth::Root);
+        arm_will(&session, "will-x").await;
+        // The durable record exists and hasn't fired yet.
+        assert!(graveyard(&node).await.is_empty());
+
+        // Force expiry by sweeping with a clock well past the deadline —
+        // the same thing the arming node dying (stopping refreshes) does.
+        let now = node.now_ms() + node.will_ttl.as_millis() as u64 + 1;
+        crate::wills::sweep(&node, now, node.will_ttl.as_millis() as u64).await;
+        assert_eq!(graveyard(&node).await, vec!["will-x"], "the orphaned will fired");
+
+        // Sweeping again is a no-op: the record was consumed on fire.
+        crate::wills::sweep(&node, now + 1, node.will_ttl.as_millis() as u64).await;
+        assert_eq!(graveyard(&node).await, vec!["will-x"], "fired exactly once");
+        node.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_clean_close_fires_the_will_and_retires_the_durable_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = boot(dir.path(), 4, ClaimSpec::All, "a").await;
+        exec(&node, &["graveyard"], &[("graveyard", "CREATE TABLE g (k TEXT PRIMARY KEY)")])
+            .await
+            .unwrap();
+
+        let session = Session::open(node.clone(), Auth::Root);
+        arm_will(&session, "will-y").await;
+        // A clean close (node alive): the fast path fires immediately...
+        session.close().await;
+        assert_eq!(graveyard(&node).await, vec!["will-y"]);
+
+        // ...and the durable copy is gone, so a later sweep can't re-fire.
+        let now = node.now_ms() + node.will_ttl.as_millis() as u64 + 1;
+        crate::wills::sweep(&node, now, node.will_ttl.as_millis() as u64).await;
+        assert_eq!(graveyard(&node).await, vec!["will-y"], "close consumed it");
+        node.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_refreshed_will_does_not_fire_early() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = boot(dir.path(), 4, ClaimSpec::All, "a").await;
+        exec(&node, &["graveyard"], &[("graveyard", "CREATE TABLE g (k TEXT PRIMARY KEY)")])
+            .await
+            .unwrap();
+        let session = Session::open(node.clone(), Auth::Root);
+        arm_will(&session, "will-z").await;
+
+        // A living connection keeps pushing the deadline out. A sweep at
+        // "now" (before the fresh deadline) must leave the will alone.
+        let sessions: Vec<String> = node.armed_wills.lock().unwrap().iter().cloned().collect();
+        assert_eq!(sessions.len(), 1, "the will registered for refreshing");
+        let far = node.now_ms() + node.will_ttl.as_millis() as u64 * 10;
+        crate::wills::refresh(&node, &sessions, far).await;
+        crate::wills::sweep(&node, node.now_ms(), node.will_ttl.as_millis() as u64).await;
+        assert!(graveyard(&node).await.is_empty(), "a refreshed will must not fire");
+        node.shutdown().await;
     }
 
     async fn publish(node: &Node, id: &str, body: &str, optimistic: bool) {

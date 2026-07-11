@@ -256,6 +256,14 @@ fn next_conn_id() -> u64 {
     NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
+/// A cluster-unique id for a durable will's session: this boot's tag
+/// (address hash + lease epoch, unique across restarts) plus the local
+/// connection counter. Unique so one node's sweeper never confuses two
+/// sessions' wills.
+fn will_session_id(node: &Node, conn: u64) -> String {
+    format!("{}-{conn}", node.tag.get().map(String::as_str).unwrap_or("boot"))
+}
+
 /// One client connection's protocol state, independent of any socket:
 /// the WebSocket pump drives it in production; the simulator opens them
 /// directly against a node. The split matters because the teardown
@@ -298,15 +306,24 @@ impl Session {
         .await
     }
 
-    /// The connection is dead: execute the will first (an ordinary
-    /// transaction — it may well wake polls parked by the living), then
-    /// sweep our own parked polls.
+    /// The connection is dead but the NODE is alive (a clean socket close):
+    /// execute the will now on the fast path (an ordinary transaction — it
+    /// may well wake polls parked by the living), retire its durable copy so
+    /// the sweeper never re-fires it, then sweep our own parked polls.
+    ///
+    /// If instead the node itself died, this never runs — and that is
+    /// exactly the case the durable copy + sweeper exist to cover.
     pub async fn close(&self) {
         let armed = self.will.lock().unwrap().take(); // guard drops before the await
-        if let Some(w) = armed
-            && let Err(e) = submit_as(&self.node, w.cap, w.objects, w.ops, false, w.optimistic).await
-        {
-            eprintln!("conn {}: last-will transaction failed: {}", self.conn, e.message);
+        if let Some(w) = armed {
+            if let Err(e) =
+                submit_as(&self.node, w.cap, w.objects, w.ops, false, w.optimistic).await
+            {
+                eprintln!("conn {}: last-will transaction failed: {}", self.conn, e.message);
+            }
+            let session = will_session_id(&self.node, self.conn);
+            self.node.armed_wills.lock().unwrap().remove(&session);
+            crate::wills::disarm(&self.node, &session).await;
         }
         for (frame, object) in self.outstanding.lock().unwrap().drain() {
             cancel_poll(&self.node, &object, self.conn, frame);
@@ -374,32 +391,58 @@ async fn handle_ws_frame(
         return None;
     }
     if let Some(w) = frame.will {
+        let session = will_session_id(node, conn);
         if w.ops.is_empty() {
             *will.lock().unwrap() = None;
+            node.armed_wills.lock().unwrap().remove(&session);
+            crate::wills::disarm(node, &session).await;
             return Some(json!({ "id": frame.id, "result": { "will": "disarmed" } }).to_string());
         }
         let mut objects = w.objects;
         if objects.is_empty() {
             objects = w.ops.iter().map(|op| op.object.clone()).collect();
         }
-        return Some(match validate_txn(objects, &w.ops) {
-            // A will is a deferred write: gate it at arm time, while the
-            // client can still hear the refusal.
-            Ok(ids) => match authorize(auth, &ids, "write") {
-                Ok(()) => {
-                    *will.lock().unwrap() = Some(ArmedWill {
-                        objects: ids,
-                        ops: w.ops,
-                        optimistic: w.optimistic,
-                        cap: auth.cap(),
-                    });
-                    json!({ "id": frame.id, "result": { "will": "armed" } }).to_string()
-                }
-                Err(e) => return deny(frame.id, e),
-            },
-            Err(e) => json!({ "id": frame.id, "error": e.message, "status": e.status.as_u16() })
-                .to_string(),
+        let ids = match validate_txn(objects, &w.ops) {
+            Ok(ids) => ids,
+            Err(e) => {
+                return Some(
+                    json!({ "id": frame.id, "error": e.message, "status": e.status.as_u16() })
+                        .to_string(),
+                );
+            }
+        };
+        // A will is a deferred write: gate it at arm time, while the client
+        // can still hear the refusal.
+        if let Err(e) = authorize(auth, &ids, "write") {
+            return deny(frame.id, e);
+        }
+        // Persist it durably BEFORE acking "armed": the promise must be
+        // safe against the node dying (that is the whole point of a will).
+        // The in-memory copy is the fast path for a clean close; the
+        // durable copy is the backstop a surviving node's sweeper fires.
+        if node.durable_wills {
+            let durable = crate::wills::DurableWill {
+                objects: ids.clone(),
+                ops: w.ops.clone(),
+                optimistic: w.optimistic,
+                cap: auth.cap().map(|c| (*c).clone()),
+            };
+            let deadline = node.now_ms() + node.will_ttl.as_millis() as u64;
+            if let Err(e) = crate::wills::arm(node, &session, &durable, deadline).await {
+                return deny(
+                    frame.id,
+                    ApiError::internal(format!("could not persist will: {}", e.message)),
+                );
+            }
+            node.armed_wills.lock().unwrap().insert(session);
+        }
+        *will.lock().unwrap() = Some(ArmedWill {
+            objects: ids,
+            ops: w.ops,
+            optimistic: w.optimistic,
+            cap: auth.cap(),
         });
+        return Some(json!({ "id": frame.id, "result": { "will": "armed" } }).to_string());
     }
     if let Some(poll) = frame.poll {
         if let Err(e) = authorize(auth, std::slice::from_ref(&poll.object), "poll") {

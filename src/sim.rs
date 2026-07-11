@@ -40,6 +40,7 @@ impl Rng {
         Self(seed)
     }
 
+    #[allow(clippy::should_implement_trait)] // a seeded generator, not an iterator
     pub fn next(&mut self) -> u64 {
         self.0 = self.0.wrapping_add(0x9e3779b97f4a7c15);
         let mut z = self.0;
@@ -102,12 +103,20 @@ pub struct DstConfig {
     /// Liveness bound: any single submission hanging longer than this
     /// (virtual) is a deadlock, and a crash.
     pub op_timeout_ms: u64,
-    /// The canary: when true, a will armed on a node that CRASHES must
-    /// still fire — which fafo today cannot honor (wills live in the
-    /// node's memory). False skips that check (documented known issue)
-    /// so mining hunts unknown bugs; flip it to watch the DST catch a
-    /// real, known one at any seed with a crash-doomed will.
+    /// How long an unrefreshed durable will lives before a sweeper fires
+    /// it. The oracle waits a few multiples of this for crash-orphaned
+    /// wills to land before declaring one lost.
+    pub will_ttl_ms: u64,
+    /// The canary, now the contract: a will armed on a node that CRASHES
+    /// must still fire, because durable wills persist it and a surviving
+    /// node's sweeper fires it. Default true — this is the property the
+    /// durable-will machinery exists to hold. Set false only to silence
+    /// the will oracle while investigating something else.
     pub wills_survive_node_crash: bool,
+    /// Persist wills durably (the fix). Turn off to reproduce the original
+    /// memory-only bug: `dst run --no-durable-wills` fires the will oracle,
+    /// the default (on) satisfies it — the fix, proven both directions.
+    pub durable_wills: bool,
 }
 
 impl Default for DstConfig {
@@ -130,7 +139,9 @@ impl Default for DstConfig {
             restarts: true,
             fence_ttl_ms: 1000,
             op_timeout_ms: 120_000,
-            wills_survive_node_crash: false,
+            will_ttl_ms: 2000,
+            wills_survive_node_crash: true,
+            durable_wills: true,
         }
     }
 }
@@ -391,6 +402,10 @@ pub struct World {
     generations: Mutex<Vec<u32>>,
     dir: tempfile::TempDir,
     pub trace: Arc<Trace>,
+    /// The shared virtual clock every node's will deadlines measure
+    /// against. Captured once, inside the runtime, so it advances with
+    /// tokio's paused time.
+    clock_base: tokio::time::Instant,
     model: Model,
 }
 
@@ -419,6 +434,7 @@ impl World {
             generations,
             dir: tempfile::tempdir().expect("tempdir"),
             trace: Arc::new(Trace::new()),
+            clock_base: tokio::time::Instant::now(),
             model: Model::default(),
             cfg,
         }
@@ -452,6 +468,12 @@ impl World {
             // Virtual time is the only meaningful clock in here; the wall
             // check would fence healthy nodes whenever the host is busy.
             wall_fence: false,
+            will_ttl: Duration::from_millis(self.cfg.will_ttl_ms),
+            durable_wills: self.cfg.durable_wills,
+            // Every node measures will deadlines against one shared virtual
+            // clock, so deadlines are comparable across the cluster AND the
+            // run replays identically.
+            clock_base: Some(self.clock_base),
             ..NodeConfig::new(
                 self.store.clone() as Arc<dyn BlobStore>,
                 self.dir.path().join(format!("n{i}-g{generation}")),
@@ -757,9 +779,13 @@ impl World {
             let session = Session::open(node, Auth::Root);
             let frame = json!({
                 "id": 1,
+                // Idempotent by construction (INSERT OR IGNORE): a
+                // crash-orphaned will fires at-least-once — the sweeper may
+                // reclaim one whose firer died mid-commit — so its effect
+                // must survive replay, exactly as the will docs advise.
                 "will": { "ops": [{
                     "object": "graveyard",
-                    "sql": "INSERT INTO g (k) VALUES (?1)",
+                    "sql": "INSERT OR IGNORE INTO g (k) VALUES (?1)",
                     "params": [key]
                 }]}
             });
@@ -847,43 +873,57 @@ impl World {
                 .collect();
             present.insert(object, keys);
         }
-        let transfers = self.model.transfers.lock().unwrap();
-        for t in transfers.iter() {
-            let in_from = present[&t.from].contains(&t.key);
-            let in_to = present[&t.to].contains(&t.key);
-            assert_eq!(
-                in_from, in_to,
-                "ATOMICITY violated: transfer {} present in {} but not {} \
-                 (acked={}).\ntrace tail:\n{}",
-                t.key,
-                if in_from { &t.from } else { &t.to },
-                if in_from { &t.to } else { &t.from },
-                t.acked,
-                self.trace.dump_tail()
-            );
-            if t.acked && !t.optimistic {
-                assert!(
-                    in_from,
-                    "DURABILITY violated: acked pessimistic transfer {} vanished.\ntrace tail:\n{}",
+        {
+            let transfers = self.model.transfers.lock().unwrap();
+            for t in transfers.iter() {
+                let in_from = present[&t.from].contains(&t.key);
+                let in_to = present[&t.to].contains(&t.key);
+                assert_eq!(
+                    in_from, in_to,
+                    "ATOMICITY violated: transfer {} present in {} but not {} \
+                     (acked={}).\ntrace tail:\n{}",
                     t.key,
+                    if in_from { &t.from } else { &t.to },
+                    if in_from { &t.to } else { &t.from },
+                    t.acked,
                     self.trace.dump_tail()
                 );
+                if t.acked && !t.optimistic {
+                    assert!(
+                        in_from,
+                        "DURABILITY violated: acked pessimistic transfer {} vanished.\ntrace tail:\n{}",
+                        t.key,
+                        self.trace.dump_tail()
+                    );
+                }
             }
         }
-        drop(transfers);
 
-        // Wills.
-        let grave_rows = self.read("graveyard", "SELECT k FROM g").await;
-        let graveyard: Set<String> = grave_rows
-            .iter()
-            .map(|r| r["k"].as_str().expect("k").to_string())
-            .collect();
+        // Wills. Every armed will's connection is now dead — polite ones
+        // closed, doomed ones rode a node crash. Each must have fired
+        // exactly one graveyard row. Crash-orphaned wills fire on the
+        // sweeper's schedule, so wait a few TTLs of virtual time for them
+        // before declaring one lost (the wait itself is virtually free).
+        let expected: Set<String> =
+            self.model.wills.lock().unwrap().iter().map(|w| w.key.clone()).collect();
+        let will_deadline =
+            tokio::time::Instant::now() + Duration::from_millis(self.cfg.will_ttl_ms * 6);
+        let graveyard = loop {
+            let rows = self.read("graveyard", "SELECT k FROM g").await;
+            let graveyard: Set<String> =
+                rows.iter().map(|r| r["k"].as_str().expect("k").to_string()).collect();
+            if expected.iter().all(|k| graveyard.contains(k))
+                || tokio::time::Instant::now() > will_deadline
+            {
+                break graveyard;
+            }
+            sleep(Duration::from_millis(self.cfg.will_ttl_ms / 2)).await;
+        };
         for w in self.model.wills.lock().unwrap().iter() {
             if w.node_crashed && !self.cfg.wills_survive_node_crash {
-                // Known gap: a will is process memory; the node took it
-                // down. Recorded, not fatal — until the fix ships.
+                // Oracle silenced by config: record, don't fail.
                 self.trace
-                    .record(format!("will {} orphaned by crash of n{} (known gap)", w.key, w.node));
+                    .record(format!("will {} orphaned by crash of n{} (oracle off)", w.key, w.node));
                 continue;
             }
             assert!(
@@ -893,6 +933,18 @@ impl World {
                 w.key,
                 w.node,
                 w.node_crashed,
+                self.trace.dump_tail()
+            );
+        }
+        // No phantom fires: the graveyard holds exactly the wills we
+        // armed, nothing a bug conjured. (At-most-once double-fire is
+        // masked by the idempotent INSERT OR IGNORE and neutralized by the
+        // claim; this catches the opposite failure — a will that ran but
+        // was never armed.)
+        for k in &graveyard {
+            assert!(
+                expected.contains(k),
+                "WILL violated: graveyard holds {k}, which no session armed.\ntrace tail:\n{}",
                 self.trace.dump_tail()
             );
         }
@@ -1047,7 +1099,7 @@ pub fn run_blocking(cfg: DstConfig) -> RunReport {
             std::process::abort();
         });
     }
-    let report = std::thread::Builder::new()
+    std::thread::Builder::new()
         .name("dst-world".into())
         .stack_size(256 << 20)
         .spawn({
@@ -1069,6 +1121,5 @@ pub fn run_blocking(cfg: DstConfig) -> RunReport {
         })
         .expect("world thread")
         .join()
-        .expect("world thread must not panic quietly");
-    report
+        .expect("world thread must not panic quietly")
 }
