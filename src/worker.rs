@@ -902,17 +902,32 @@ impl Worker {
             }
             let object = p.participants[p.acquired].clone();
             let is_owner = {
+                // `owned` is this worker's local truth: if the object is in
+                // it, we durably admitted it and we ARE the owner — routing
+                // is only ever a hint. Two ways the hint lies about us, both
+                // fatal if trusted:
+                //   - it says we own an object we never admitted (a stale
+                //     self-hint): serving it is the forged deed.
+                //   - it says SOMEONE ELSE owns an object we do: our own
+                //     txns then take-chase a peer who bounces us back with
+                //     NotMine{hint:self}, the self-heal Adopt is refused
+                //     (we already own it at that generation), and the take
+                //     loops forever (mined seed 8614294886503471524).
+                // Reconcile toward `owned` in both directions.
                 let mut routing = self.node.routing.write().unwrap();
-                match routing.exceptions.get(&object) {
-                    // Our own map says we own it, but the durable ledger
-                    // says we never admitted it: a stale hint about
-                    // ourselves. Serving it would be the forged deed;
-                    // chasing it would AlreadyLocal-loop. Drop the lie.
-                    Some(&w) if w == self.id && !self.owned.contains_key(&object) => {
-                        routing.exceptions.remove(&object);
-                        routing.owner_of(&object) == self.id
+                if self.owned.contains_key(&object) {
+                    if routing.owner_of(&object) != self.id {
+                        routing.exceptions.insert(object.clone(), self.id);
                     }
-                    _ => routing.owner_of(&object) == self.id,
+                    true
+                } else {
+                    match routing.exceptions.get(&object) {
+                        Some(&w) if w == self.id => {
+                            routing.exceptions.remove(&object);
+                            routing.owner_of(&object) == self.id
+                        }
+                        _ => routing.owner_of(&object) == self.id,
+                    }
                 }
             };
             let p = self.parked.get_mut(&txn).unwrap();

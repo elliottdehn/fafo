@@ -10,8 +10,11 @@ seed replays it bit for bit.
 Baseline before the campaign: **18 of 50 seeds failing.** After: **0 of 50,
 three consecutive sweeps**, 140/140 example tests green — including with the
 will oracle live (bug 22), the specific bug the harness was built to catch.
-The endless miner (`dst mine`) then found one more in ~1,500 fresh seeds
-(bug 23). All of these survived the example suite; none survived the dice.
+The endless miner (`dst mine`) then found bug 23 in ~1,500 fresh seeds, and
+bug 24 the moment a **multi-workload** battery (ERC20 supply, escrow
+settlement races, idempotent counters, three-way watched feeds — all racing
+at once) cranked cross-object contention past what plain transfers reach.
+All of these survived the example suite; none survived the dice.
 
 Format: what the oracle saw → what was actually wrong → the fix — plus an
 ELI5 and a nastiness score (severity × subtlety × blast radius; 10 means
@@ -282,3 +285,34 @@ inside the fix that taught it.
   above went: failing seed → `FAFO_DST_LOG=1` replay → read the object's
   lifecycle → the bug names itself. No bug took longer to *find* than to
   fix.
+
+---
+
+## Appendix: what the multi-workload simulator guards
+
+`dst` runs these workloads **concurrently in one world**, both phases,
+under the same crashes / partitions / storage faults. Each was chosen so
+that a specific ACID guarantee has an invariant pointed straight at it — a
+forked object, a torn transaction, or a lost durable write trips at least
+one of them.
+
+| Workload | Guards | Invariant the oracle checks |
+|---|---|---|
+| Transfers (A↔B) | **A**tomicity, **C**onsistency | money conserved; every transfer's debit and credit exist together or not at all |
+| ERC20 (mint / burn / transfer + supply) | Atomicity with a **moving** total | Σ balances = supply = supply ledger; every multi-leg op is all-legs-or-none |
+| Escrow sagas (open → settle, half racing both ways) | **I**solation, exactly-once | a saga settles once or never — never both directions; capital = parties + funds still held |
+| Idempotent counters (retry-safe increments) | **D**urability under lost-ack | `n` == COUNT(distinct inc keys): a retry that double-applied would overshoot |
+| Watched feeds — cursor poll | watch completeness | every durable message reaches a consumer; ids strictly increase; no key twice |
+| Watched feeds — **durable** cursor poll | durable delivery contract | a row a durable poll delivered still exists after every later crash |
+| Watched feeds — change-detection (hash) | poll semantics | every fire presents a genuinely different result hash |
+| Last-wills (durable, sweeper-fired) | liveness of promises | a will armed on a node that *crashes* still fires |
+
+Plus the always-on oracles: **liveness** (any single op hung past the
+virtual timeout is a deadlock) and **recovery** (every audit re-runs on a
+cold node booted from the blob store alone).
+
+The optimistic contract is honored throughout: an optimistically-acked
+write may vanish if its boat sinks in a crash — so the oracles audit
+against *surviving durable state*, never against the ack flag. That
+distinction is itself load-bearing; getting it wrong makes an oracle cry
+wolf at correct behavior (it did, twice, while these were being written).

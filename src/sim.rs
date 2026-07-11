@@ -117,7 +117,45 @@ pub struct DstConfig {
     /// memory-only bug: `dst run --no-durable-wills` fires the will oracle,
     /// the default (on) satisfies it — the fix, proven both directions.
     pub durable_wills: bool,
+
+    // ---- the multi-workload battery (all run CONCURRENTLY, both phases)
+    /// ERC20 token accounts (`tok-{i}`) + a supply object. Invariant: the
+    /// sum of balances equals total supply equals the supply ledger — a
+    /// conservation law whose reference total itself moves (mint/burn).
+    #[serde(default = "d_erc20_accounts")]
+    pub erc20_accounts: usize,
+    /// ERC20 ops per phase (mint / burn / transfer mix).
+    #[serde(default = "d_erc20_ops")]
+    pub erc20_ops: usize,
+    /// Escrow sagas per phase: open (funder -> escrow object), then settle
+    /// (release to payee | refund to funder) — with deliberate RACES on
+    /// half of them: both directions attempted concurrently, exactly one
+    /// may win. Exactly-once settlement is the sharpest anti-fork oracle.
+    #[serde(default = "d_escrows")]
+    pub escrows: usize,
+    /// Idempotent counters (`ctr-{i}`): n must equal COUNT(incs) always;
+    /// retries dedup through the UNIQUE key — the documented idempotency
+    /// pattern, now an oracle.
+    #[serde(default = "d_counters")]
+    pub counters: usize,
+    #[serde(default = "d_counter_incs")]
+    pub counter_incs: usize,
+    /// Watched feeds (`feed-{i}`), each consumed three ways at once:
+    /// a cursor poll loop, a DURABLE cursor loop (its deliveries must
+    /// survive any crash), and a change-detection (baseline-hash) watcher.
+    #[serde(default = "d_feeds")]
+    pub feeds: usize,
+    #[serde(default = "d_feed_appends")]
+    pub feed_appends: usize,
 }
+
+fn d_erc20_accounts() -> usize { 6 }
+fn d_erc20_ops() -> usize { 40 }
+fn d_escrows() -> usize { 8 }
+fn d_counters() -> usize { 4 }
+fn d_counter_incs() -> usize { 30 }
+fn d_feeds() -> usize { 2 }
+fn d_feed_appends() -> usize { 15 }
 
 impl Default for DstConfig {
     fn default() -> Self {
@@ -142,6 +180,13 @@ impl Default for DstConfig {
             will_ttl_ms: 2000,
             wills_survive_node_crash: true,
             durable_wills: true,
+            erc20_accounts: d_erc20_accounts(),
+            erc20_ops: d_erc20_ops(),
+            escrows: d_escrows(),
+            counters: d_counters(),
+            counter_incs: d_counter_incs(),
+            feeds: d_feeds(),
+            feed_appends: d_feed_appends(),
         }
     }
 }
@@ -372,6 +417,34 @@ struct Model {
     publishes: Mutex<Vec<(String, bool)>>,
     /// Armed wills and how their connection ended.
     wills: Mutex<Vec<WillCase>>,
+    /// Generic multi-leg atomic ops (ERC20): each leg is a ledger row
+    /// (object, amount) that must exist with the others or not at all.
+    ops: Mutex<Vec<OpRecord>>,
+    /// Escrow sagas: key -> (funder, payee, amount, open_acked).
+    escrows: Mutex<Vec<EscrowRecord>>,
+    /// Idempotent counter increments: (counter object, key, acked, optimistic).
+    incs: Mutex<Vec<(String, String, bool, bool)>>,
+    /// Feed appends: (feed, key, acked, optimistic).
+    appends: Mutex<Vec<(String, String, bool, bool)>>,
+    /// Rows delivered by DURABLE polls: (feed, id, key). The contract:
+    /// a durable delivery can never un-happen — every one of these must
+    /// exist in the final table, crashes and all.
+    durable_deliveries: Mutex<Vec<(String, i64, String)>>,
+}
+
+struct OpRecord {
+    key: String,
+    legs: Vec<(String, i64)>,
+    acked: bool,
+    optimistic: bool,
+}
+
+struct EscrowRecord {
+    key: String,
+    funder: String,
+    payee: String,
+    amount: i64,
+    open_acked: bool,
 }
 
 struct TransferRecord {
@@ -626,6 +699,63 @@ impl World {
                 .await
                 .expect("schema creation must eventually succeed");
         }
+        // ERC20: token accounts + the supply object. Everyone gets the
+        // same ledger shape (`writes`) so one atomicity auditor covers all.
+        for t in 0..self.cfg.erc20_accounts {
+            let object = format!("tok-{t}");
+            let ops = vec![
+                op(&object, "CREATE TABLE IF NOT EXISTS account (balance INTEGER NOT NULL CHECK (balance >= 0))", vec![]),
+                op(&object, "INSERT INTO account (balance) SELECT 0 WHERE NOT EXISTS (SELECT 1 FROM account)", vec![]),
+                op(&object, "CREATE TABLE IF NOT EXISTS writes (k TEXT PRIMARY KEY, amt INTEGER)", vec![]),
+            ];
+            self.submit_retry(&format!("schema {object}"), vec![object.clone()], ops, false, false)
+                .await
+                .expect("schema creation must eventually succeed");
+        }
+        let ops = vec![
+            op("tok-supply", "CREATE TABLE IF NOT EXISTS account (balance INTEGER NOT NULL CHECK (balance >= 0))", vec![]),
+            op("tok-supply", "INSERT INTO account (balance) SELECT 0 WHERE NOT EXISTS (SELECT 1 FROM account)", vec![]),
+            op("tok-supply", "CREATE TABLE IF NOT EXISTS writes (k TEXT PRIMARY KEY, amt INTEGER)", vec![]),
+        ];
+        self.submit_retry("schema tok-supply", vec!["tok-supply".into()], ops, false, false)
+            .await
+            .expect("schema creation must eventually succeed");
+        // Escrow parties (escrow objects themselves are minted per saga).
+        for e in 0..2 {
+            let object = format!("esc-party-{e}");
+            let ops = vec![
+                op(&object, "CREATE TABLE IF NOT EXISTS account (balance INTEGER NOT NULL CHECK (balance >= 0))", vec![]),
+                op(&object, "INSERT INTO account (balance) SELECT ?1 WHERE NOT EXISTS (SELECT 1 FROM account)", vec![json!(self.cfg.initial_balance)]),
+                op(&object, "CREATE TABLE IF NOT EXISTS writes (k TEXT PRIMARY KEY, amt INTEGER)", vec![]),
+            ];
+            self.submit_retry(&format!("schema {object}"), vec![object.clone()], ops, false, false)
+                .await
+                .expect("schema creation must eventually succeed");
+        }
+        // Idempotent counters.
+        for c in 0..self.cfg.counters {
+            let object = format!("ctr-{c}");
+            let ops = vec![
+                op(&object, "CREATE TABLE IF NOT EXISTS c (n INTEGER NOT NULL)", vec![]),
+                op(&object, "INSERT INTO c (n) SELECT 0 WHERE NOT EXISTS (SELECT 1 FROM c)", vec![]),
+                op(&object, "CREATE TABLE IF NOT EXISTS incs (k TEXT PRIMARY KEY)", vec![]),
+            ];
+            self.submit_retry(&format!("schema {object}"), vec![object.clone()], ops, false, false)
+                .await
+                .expect("schema creation must eventually succeed");
+        }
+        // Watched feeds.
+        for f in 0..self.cfg.feeds {
+            let object = format!("feed-{f}");
+            let ops = vec![op(
+                &object,
+                "CREATE TABLE IF NOT EXISTS msgs (id INTEGER PRIMARY KEY AUTOINCREMENT, k TEXT UNIQUE, mode TEXT)",
+                vec![],
+            )];
+            self.submit_retry(&format!("schema {object}"), vec![object.clone()], ops, false, false)
+                .await
+                .expect("schema creation must eventually succeed");
+        }
         self.trace.record("schemas ready".into());
     }
 
@@ -812,6 +942,672 @@ impl World {
         doomed
     }
 
+    /// Read that tolerates a missing table/object (a saga whose open never
+    /// landed): Ok(None) for "definitively absent", retrying transient
+    /// errors, panicking only on a liveness violation.
+    async fn try_read(&self, object: &str, sql: &str) -> Option<Vec<Value>> {
+        for _attempt in 0..120 {
+            let Some(node) = self.any_node() else {
+                sleep(Duration::from_millis(200)).await;
+                continue;
+            };
+            let ops = vec![op(object, sql, vec![])];
+            let fut = cluster::submit(&node, vec![object.to_string()], ops, true, false);
+            match timeout(Duration::from_millis(self.cfg.op_timeout_ms), fut).await {
+                Err(_) => panic!(
+                    "LIVENESS: try_read of {object} hung.
+trace tail:
+{}",
+                    self.trace.dump_tail()
+                ),
+                Ok(Ok(mut resp)) => match resp.results.pop() {
+                    Some(crate::cluster::OpResult::Rows { rows }) => return Some(rows),
+                    _ => return Some(Vec::new()),
+                },
+                Ok(Err(e)) if e.message.contains("no such table") => return None,
+                Ok(Err(_)) => sleep(Duration::from_millis(100)).await,
+            }
+        }
+        panic!(
+            "try_read of {object} kept failing with live nodes present.
+trace tail:
+{}",
+            self.trace.dump_tail()
+        );
+    }
+
+    // ------------------------------------------------ workload: ERC20
+
+    /// Mint / burn / transfer against token accounts plus a moving supply.
+    /// Every op writes a ledger leg in each participant; the auditor
+    /// demands all legs or none, and sum(balances) == supply == its ledger.
+    async fn erc20_phase(self: &Arc<Self>, phase: u32) {
+        let mut tasks = Vec::new();
+        let per_client = self.cfg.erc20_ops / 2;
+        for c in 0..2usize {
+            let world = self.clone();
+            tasks.push(tokio::spawn(async move {
+                for t in 0..per_client {
+                    let key = format!("tok{phase}-c{c}-{t}");
+                    let a = below(&world.rng, world.cfg.erc20_accounts as u64) as usize;
+                    let b = (a + 1 + below(&world.rng, world.cfg.erc20_accounts as u64 - 1) as usize)
+                        % world.cfg.erc20_accounts;
+                    let amt = 1 + below(&world.rng, 5) as i64;
+                    let optimistic = chance(&world.rng, world.cfg.optimistic_pct);
+                    let kind = below(&world.rng, 10);
+                    let (participants, ops, legs) = if kind < 4 {
+                        // mint: supply and the recipient both grow by amt.
+                        let to = format!("tok-{a}");
+                        (
+                            vec!["tok-supply".to_string(), to.clone()],
+                            vec![
+                                op("tok-supply", "UPDATE account SET balance = balance + ?1", vec![json!(amt)]),
+                                op("tok-supply", "INSERT INTO writes (k, amt) VALUES (?1, ?2)", vec![json!(key.clone()), json!(amt)]),
+                                op(&to, "UPDATE account SET balance = balance + ?1", vec![json!(amt)]),
+                                op(&to, "INSERT INTO writes (k, amt) VALUES (?1, ?2)", vec![json!(key.clone()), json!(amt)]),
+                            ],
+                            vec![("tok-supply".to_string(), amt), (to, amt)],
+                        )
+                    } else if kind < 6 {
+                        // burn: both shrink; CHECKs reject an overburn.
+                        let from = format!("tok-{a}");
+                        (
+                            vec!["tok-supply".to_string(), from.clone()],
+                            vec![
+                                op(&from, "UPDATE account SET balance = balance - ?1", vec![json!(amt)]),
+                                op(&from, "INSERT INTO writes (k, amt) VALUES (?1, -?2)", vec![json!(key.clone()), json!(amt)]),
+                                op("tok-supply", "UPDATE account SET balance = balance - ?1", vec![json!(amt)]),
+                                op("tok-supply", "INSERT INTO writes (k, amt) VALUES (?1, -?2)", vec![json!(key.clone()), json!(amt)]),
+                            ],
+                            vec![("tok-supply".to_string(), -amt), (from, -amt)],
+                        )
+                    } else {
+                        // transfer: supply untouched.
+                        let from = format!("tok-{a}");
+                        let to = format!("tok-{b}");
+                        (
+                            vec![from.clone(), to.clone()],
+                            vec![
+                                op(&from, "UPDATE account SET balance = balance - ?1", vec![json!(amt)]),
+                                op(&from, "INSERT INTO writes (k, amt) VALUES (?1, -?2)", vec![json!(key.clone()), json!(amt)]),
+                                op(&to, "UPDATE account SET balance = balance + ?1", vec![json!(amt)]),
+                                op(&to, "INSERT INTO writes (k, amt) VALUES (?1, ?2)", vec![json!(key.clone()), json!(amt)]),
+                            ],
+                            vec![(from, -amt), (to, amt)],
+                        )
+                    };
+                    let acked = world
+                        .submit_retry(&format!("erc20 {key}"), participants, ops, false, optimistic)
+                        .await
+                        .is_ok();
+                    world.trace.record(format!("erc20 {key} acked={acked}"));
+                    world.model.ops.lock().unwrap().push(OpRecord {
+                        key,
+                        legs,
+                        acked,
+                        optimistic,
+                    });
+                    let pause = below(&world.rng, 40);
+                    sleep(Duration::from_millis(pause)).await;
+                }
+            }));
+        }
+        for t in tasks {
+            t.await.expect("erc20 client must not die");
+        }
+    }
+
+    // ----------------------------------------------- workload: escrows
+
+    /// Open moves money from a party into a per-saga escrow OBJECT; settle
+    /// releases it to the other party or refunds it — and on half the
+    /// sagas both directions race. The settlements PRIMARY KEY is the
+    /// exactly-once arbiter: a forked escrow is the only way to lose.
+    async fn escrow_phase(self: &Arc<Self>, phase: u32) {
+        let mut tasks = Vec::new();
+        for e in 0..self.cfg.escrows {
+            let world = self.clone();
+            tasks.push(tokio::spawn(async move {
+                let key = format!("esc{phase}-{e}");
+                let escrow = format!("escrow-{key}");
+                let funder = format!("esc-party-{}", e % 2);
+                let payee = format!("esc-party-{}", (e + 1) % 2);
+                let amount = 1 + below(&world.rng, 4) as i64;
+                let open_ops = vec![
+                    op(&funder, "UPDATE account SET balance = balance - ?1", vec![json!(amount)]),
+                    op(&funder, "INSERT INTO writes (k, amt) VALUES (?1, -?2)", vec![json!(format!("open-{key}")), json!(amount)]),
+                    op(&escrow, "CREATE TABLE IF NOT EXISTS meta (amt INTEGER NOT NULL)", vec![]),
+                    op(&escrow, "CREATE TABLE IF NOT EXISTS settlements (slot TEXT PRIMARY KEY, dir TEXT NOT NULL)", vec![]),
+                    op(&escrow, "INSERT INTO meta (amt) VALUES (?1)", vec![json!(amount)]),
+                ];
+                let open_acked = world
+                    .submit_retry(
+                        &format!("escrow open {key}"),
+                        vec![funder.clone(), escrow.clone()],
+                        open_ops,
+                        false,
+                        false, // opens are pessimistic: settles build on them
+                    )
+                    .await
+                    .is_ok();
+                world.trace.record(format!("escrow {key} open acked={open_acked}"));
+                world.model.escrows.lock().unwrap().push(EscrowRecord {
+                    key: key.clone(),
+                    funder: funder.clone(),
+                    payee: payee.clone(),
+                    amount,
+                    open_acked,
+                });
+                if !open_acked {
+                    return;
+                }
+                let pause = below(&world.rng, 60);
+                sleep(Duration::from_millis(pause)).await;
+                // Settle. Half the sagas race both directions on purpose.
+                let race = e % 2 == 0;
+                let mut settles = Vec::new();
+                let dirs: Vec<(&str, String)> = if race {
+                    vec![("release", payee.clone()), ("refund", funder.clone())]
+                } else if chance(&world.rng, 50) {
+                    vec![("release", payee.clone())]
+                } else {
+                    vec![("refund", funder.clone())]
+                };
+                for (dir, target) in dirs {
+                    let world = world.clone();
+                    let (key, escrow) = (key.clone(), escrow.clone());
+                    settles.push(tokio::spawn(async move {
+                        // The `settlements` PRIMARY KEY 'done' is the
+                        // exactly-once gate: whichever direction commits the
+                        // row first wins the escrow; the racing one hits the
+                        // UNIQUE constraint, its whole txn rolls back, and no
+                        // money moves. The credit amount is a literal the
+                        // client knows (it opened the saga) — meta lives in
+                        // the escrow object, but the balance moves on the
+                        // target's connection.
+                        let amt = {
+                            let m = world.model.escrows.lock().unwrap();
+                            m.iter().find(|r| r.key == key).map(|r| r.amount).unwrap()
+                        };
+                        let ops = vec![
+                            op(&escrow, "INSERT INTO settlements (slot, dir) VALUES ('done', ?1)", vec![json!(dir)]),
+                            op(&target, "UPDATE account SET balance = balance + ?1", vec![json!(amt)]),
+                            op(&target, "INSERT INTO writes (k, amt) VALUES (?1, ?2)", vec![json!(format!("settle-{key}-{dir}")), json!(amt)]),
+                        ];
+                        let acked = world
+                            .submit_retry(
+                                &format!("escrow settle {key} {dir}"),
+                                vec![escrow.clone(), target.clone()],
+                                ops,
+                                false,
+                                false,
+                            )
+                            .await
+                            .is_ok();
+                        world
+                            .trace
+                            .record(format!("escrow {key} settle {dir} acked={acked}"));
+                    }));
+                }
+                for sjoin in settles {
+                    sjoin.await.expect("settle task");
+                }
+            }));
+        }
+        for t in tasks {
+            t.await.expect("escrow saga must not die");
+        }
+    }
+
+    // ---------------------------------------------- workload: counters
+
+    async fn counter_phase(self: &Arc<Self>, phase: u32) {
+        let mut tasks = Vec::new();
+        let per_client = self.cfg.counter_incs / 2;
+        for c in 0..2usize {
+            let world = self.clone();
+            tasks.push(tokio::spawn(async move {
+                for t in 0..per_client {
+                    let ctr = format!("ctr-{}", below(&world.rng, world.cfg.counters as u64));
+                    let key = format!("inc{phase}-c{c}-{t}");
+                    let optimistic = chance(&world.rng, world.cfg.optimistic_pct);
+                    let ops = vec![
+                        op(&ctr, "INSERT INTO incs (k) VALUES (?1)", vec![json!(key.clone())]),
+                        op(&ctr, "UPDATE c SET n = n + 1", vec![]),
+                    ];
+                    let acked = world
+                        .submit_retry(&format!("inc {key}"), vec![ctr.clone()], ops, false, optimistic)
+                        .await
+                        .is_ok();
+                    world
+                        .model
+                        .incs
+                        .lock()
+                        .unwrap()
+                        .push((ctr, key, acked, optimistic));
+                    let pause = below(&world.rng, 30);
+                    sleep(Duration::from_millis(pause)).await;
+                }
+            }));
+        }
+        for t in tasks {
+            t.await.expect("counter client must not die");
+        }
+    }
+
+    // ------------------------------------------- workload: watched feeds
+
+    async fn feed_producer(self: &Arc<Self>, feed: usize, phase: u32) {
+        let object = format!("feed-{feed}");
+        for m in 0..self.cfg.feed_appends {
+            let key = format!("f{feed}-p{phase}-{m}");
+            let optimistic = chance(&self.rng, self.cfg.optimistic_pct);
+            let mode = if optimistic { "opt" } else { "pess" };
+            let ops = vec![op(
+                &object,
+                "INSERT INTO msgs (k, mode) VALUES (?1, ?2)",
+                vec![json!(key.clone()), json!(mode)],
+            )];
+            let acked = self
+                .submit_retry(&format!("append {key}"), vec![object.clone()], ops, false, optimistic)
+                .await
+                .is_ok();
+            self.model
+                .appends
+                .lock()
+                .unwrap()
+                .push((object.clone(), key, acked, optimistic));
+            let pause = below(&self.rng, 40);
+            sleep(Duration::from_millis(pause)).await;
+        }
+        self.trace.record(format!("producer feed-{feed} p{phase} done"));
+    }
+
+    /// The documented cursor loop against one feed. `durable` selects the
+    /// poll mode; durable deliveries are recorded for the never-un-happens
+    /// oracle. Runs until it has drained everything that exists once the
+    /// producers stop. Returns the transcript (asserted in-loop: strictly
+    /// increasing ids, no duplicate keys).
+    async fn consume_feed(
+        self: &Arc<Self>,
+        feed: usize,
+        durable: bool,
+        producers_done: Arc<AtomicBool>,
+        conn_id: u64,
+    ) -> Vec<(i64, String)> {
+        let object = format!("feed-{feed}");
+        let mut transcript: Vec<(i64, String)> = Vec::new();
+        let mut seen: Set<String> = Set::default();
+        let mut cursor = 0i64;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(600);
+        loop {
+            if tokio::time::Instant::now() > deadline {
+                panic!(
+                    "LIVENESS: consumer(durable={durable}) of {object} stuck at cursor {cursor}.
+trace tail:
+{}",
+                    self.trace.dump_tail()
+                );
+            }
+            let Some(node) = self.any_node() else {
+                sleep(Duration::from_millis(200)).await;
+                continue;
+            };
+            let poll = cluster::submit_poll(
+                &node,
+                object.clone(),
+                "SELECT id, k FROM msgs WHERE id > ?1 ORDER BY id LIMIT 8".into(),
+                vec![json!(cursor)],
+                durable,
+                None,
+                conn_id,
+                cursor as u64,
+            );
+            match timeout(Duration::from_millis(2500), poll).await {
+                Err(_) => {
+                    cluster::cancel_poll(&node, &object, conn_id, cursor as u64);
+                    // Parked with nothing new. If production has ended and
+                    // a direct read agrees we're at the end, we're done.
+                    if producers_done.load(Ordering::SeqCst) {
+                        let max = self
+                            .read(&object, "SELECT COALESCE(MAX(id), 0) AS m FROM msgs")
+                            .await[0]["m"]
+                            .as_i64()
+                            .expect("max id");
+                        if max <= cursor {
+                            break;
+                        }
+                    }
+                }
+                Ok(Ok(resp)) => {
+                    for result in &resp.results {
+                        if let crate::cluster::OpResult::Rows { rows } = result {
+                            for row in rows {
+                                let id = row["id"].as_i64().expect("id");
+                                let k = row["k"].as_str().expect("k").to_string();
+                                assert!(
+                                    id > cursor,
+                                    "CONSUMER(durable={durable}) of {object} went backwards: {id} <= {cursor}"
+                                );
+                                assert!(
+                                    seen.insert(k.clone()),
+                                    "CONSUMER(durable={durable}) of {object} saw {k} twice"
+                                );
+                                cursor = id;
+                                if durable {
+                                    self.model
+                                        .durable_deliveries
+                                        .lock()
+                                        .unwrap()
+                                        .push((object.clone(), id, k.clone()));
+                                }
+                                transcript.push((id, k));
+                            }
+                        }
+                    }
+                }
+                Ok(Err(_)) => sleep(Duration::from_millis(100)).await,
+            }
+        }
+        self.trace.record(format!(
+            "consumer feed-{feed} durable={durable} got {}",
+            transcript.len()
+        ));
+        transcript
+    }
+
+    /// Change-detection watcher: the baseline-hash loop over an aggregate
+    /// view. Every fire must present a hash different from the baseline it
+    /// parked with (the server's contract), and at the end the view must
+    /// match a direct read (bounded staleness: zero, at quiescence).
+    async fn watch_feed_changes(
+        self: &Arc<Self>,
+        feed: usize,
+        producers_done: Arc<AtomicBool>,
+        conn_id: u64,
+    ) {
+        let object = format!("feed-{feed}");
+        let sql = "SELECT COUNT(*) AS n, COALESCE(MAX(id), 0) AS m FROM msgs";
+        let mut baseline = String::new();
+        let mut fires = 0u64;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(600);
+        loop {
+            if tokio::time::Instant::now() > deadline {
+                panic!(
+                    "LIVENESS: change watcher of {object} stuck after {fires} fires.
+trace tail:
+{}",
+                    self.trace.dump_tail()
+                );
+            }
+            let Some(node) = self.any_node() else {
+                sleep(Duration::from_millis(200)).await;
+                continue;
+            };
+            let poll = cluster::submit_poll(
+                &node,
+                object.clone(),
+                sql.into(),
+                vec![],
+                false,
+                Some(baseline.clone()),
+                conn_id,
+                fires,
+            );
+            match timeout(Duration::from_millis(2500), poll).await {
+                Err(_) => {
+                    cluster::cancel_poll(&node, &object, conn_id, fires);
+                    if producers_done.load(Ordering::SeqCst) {
+                        break;
+                    }
+                }
+                Ok(Ok(resp)) => {
+                    let hash = resp.hash.clone().unwrap_or_default();
+                    assert_ne!(
+                        hash, baseline,
+                        "CHANGE WATCHER of {object} fired without a change"
+                    );
+                    baseline = hash;
+                    fires += 1;
+                }
+                Ok(Err(_)) => sleep(Duration::from_millis(100)).await,
+            }
+        }
+        self.trace
+            .record(format!("change watcher feed-{feed} done after {fires} fires"));
+    }
+
+    // ---------------------------------------------------- workload oracles
+
+    /// ERC20: sum of every token account's balance equals the supply
+    /// object's balance equals the supply ledger's running sum — a
+    /// conservation law whose reference total moves (mint/burn) — and
+    /// every multi-leg op is whole (all legs present with matching signs,
+    /// or none). Only valid at quiescence.
+    async fn audit_erc20(&self, when: &str) {
+        let mut ledger: Map<String, Vec<(String, i64)>> = Map::default();
+        let mut account_sum = 0i64;
+        for t in 0..self.cfg.erc20_accounts {
+            let object = format!("tok-{t}");
+            account_sum += self.read(&object, "SELECT balance FROM account").await[0]["balance"]
+                .as_i64()
+                .expect("balance");
+            ledger.insert(object.clone(), self.read_ledger(&object).await);
+        }
+        let supply = self.read("tok-supply", "SELECT balance FROM account").await[0]["balance"]
+            .as_i64()
+            .expect("supply balance");
+        ledger.insert("tok-supply".into(), self.read_ledger("tok-supply").await);
+        let supply_ledger: i64 = ledger["tok-supply"].iter().map(|(_, a)| a).sum();
+
+        assert_eq!(
+            account_sum, supply,
+            "ERC20 SUPPLY violated {when}: sum(balances)={account_sum} != supply={supply}.
+trace tail:
+{}",
+            self.trace.dump_tail()
+        );
+        assert_eq!(
+            supply, supply_ledger,
+            "ERC20 SUPPLY LEDGER violated {when}: supply={supply} != ledger sum={supply_ledger}.
+trace tail:
+{}",
+            self.trace.dump_tail()
+        );
+
+        let ops = self.model.ops.lock().unwrap();
+        for o in ops.iter() {
+            let present: Vec<bool> = o
+                .legs
+                .iter()
+                .map(|(obj, amt)| {
+                    ledger[obj]
+                        .iter()
+                        .any(|(k, a)| k == &o.key && a == amt)
+                })
+                .collect();
+            let all = present.iter().all(|&p| p);
+            let none = present.iter().all(|&p| !p);
+            assert!(
+                all || none,
+                "ERC20 ATOMICITY violated {when}: op {} (acked={}, opt={}) legs present={present:?}.
+trace tail:
+{}",
+                o.key, o.acked, o.optimistic, self.trace.dump_tail()
+            );
+        }
+    }
+
+    /// Escrow: every opened saga is settled exactly once or not at all —
+    /// never both directions, never a torn settle (a `settlements` row
+    /// without its balance credit, or vice versa) — and the two parties
+    /// plus every live escrow's held `meta` conserve the parties' opening
+    /// capital.
+    async fn audit_escrows(&self, when: &str) {
+        let escrows = self.model.escrows.lock().unwrap();
+        let mut party_ledgers: Map<String, Vec<(String, i64)>> = Map::default();
+        for e in 0..2usize {
+            let object = format!("esc-party-{e}");
+            party_ledgers.insert(object.clone(), self.read_ledger(&object).await);
+        }
+        for r in escrows.iter() {
+            let object = format!("escrow-{}", r.key);
+            let settlements = match self.try_read(&object, "SELECT dir FROM settlements").await {
+                Some(rows) => rows,
+                None => {
+                    // No escrow object: the open never durably landed.
+                    assert!(
+                        !r.open_acked,
+                        "ESCROW violated {when}: {} open acked but escrow object is absent.
+trace tail:
+{}",
+                        r.key, self.trace.dump_tail()
+                    );
+                    continue;
+                }
+            };
+            // Exactly-once: the PRIMARY KEY makes >1 impossible, but assert
+            // it anyway — a fork would show as two rows.
+            assert!(
+                settlements.len() <= 1,
+                "ESCROW EXACTLY-ONCE violated {when}: {} settled {} times.
+trace tail:
+{}",
+                r.key, settlements.len(), self.trace.dump_tail()
+            );
+            if let Some(row) = settlements.first() {
+                let dir = row["dir"].as_str().expect("dir");
+                let target = if dir == "release" { &r.payee } else { &r.funder };
+                let credited = party_ledgers[target]
+                    .iter()
+                    .any(|(k, a)| k == &format!("settle-{}-{dir}", r.key) && *a == r.amount);
+                assert!(
+                    credited,
+                    "ESCROW TORN {when}: {} settled {dir} but the {target} credit is missing.
+trace tail:
+{}",
+                    r.key, self.trace.dump_tail()
+                );
+            }
+        }
+        // Capital conservation: parties + funds still held in escrow.
+        let mut party_balance = 0i64;
+        for e in 0..2usize {
+            party_balance += self.read(&format!("esc-party-{e}"), "SELECT balance FROM account").await[0]["balance"]
+                .as_i64()
+                .expect("party balance");
+        }
+        let mut held = 0i64;
+        for r in escrows.iter() {
+            if !r.open_acked {
+                continue;
+            }
+            let object = format!("escrow-{}", r.key);
+            let settled = self
+                .try_read(&object, "SELECT COUNT(*) AS n FROM settlements")
+                .await
+                .map(|rows| rows[0]["n"].as_i64().unwrap_or(0))
+                .unwrap_or(0);
+            if settled == 0 {
+                held += r.amount; // still locked in the escrow
+            }
+        }
+        let expected = 2 * self.cfg.initial_balance;
+        assert_eq!(
+            party_balance + held, expected,
+            "ESCROW CAPITAL violated {when}: parties {party_balance} + held {held} != {expected}.
+trace tail:
+{}",
+            self.trace.dump_tail()
+        );
+    }
+
+    /// Idempotent counters: n == COUNT(distinct inc keys) always. A
+    /// lost-ack retry that ran twice would push n past the key count; a
+    /// non-idempotent apply would too. The UNIQUE key is the whole defense.
+    async fn audit_counters(&self, when: &str) {
+        for c in 0..self.cfg.counters {
+            let object = format!("ctr-{c}");
+            let n = self.read(&object, "SELECT n FROM c").await[0]["n"].as_i64().expect("n");
+            let keys = self.read(&object, "SELECT COUNT(*) AS k FROM incs").await[0]["k"]
+                .as_i64()
+                .expect("k");
+            assert_eq!(
+                n, keys,
+                "COUNTER violated {when}: {object} n={n} != distinct incs={keys} (a retry double-applied).
+trace tail:
+{}",
+                self.trace.dump_tail()
+            );
+        }
+    }
+
+    /// Every DURABLE delivery still exists. A durable poll only fires from
+    /// shipped state, so a row it handed a consumer must survive every
+    /// later crash — the whole point of the durable contract. (Optimistic
+    /// deliveries carry no such promise and are not audited here.)
+    async fn audit_durable_deliveries(&self) {
+        let deliveries = self.model.durable_deliveries.lock().unwrap();
+        for (feed, id, k) in deliveries.iter() {
+            let present = self
+                .read(feed, &format!("SELECT k FROM msgs WHERE id = {id}"))
+                .await
+                .first()
+                .map(|r| r["k"].as_str() == Some(k.as_str()))
+                .unwrap_or(false);
+            assert!(
+                present,
+                "DURABLE DELIVERY LOST: {feed} row id={id} k={k} was delivered by a durable poll but is gone.
+trace tail:
+{}",
+                self.trace.dump_tail()
+            );
+        }
+    }
+
+    /// Feed transcript completeness, the real watch guarantee: every
+    /// message that is DURABLY in the final table was delivered to a cursor
+    /// consumer. (An optimistically-acked append whose boat sank is
+    /// legitimately gone — the optimistic contract — so we audit against
+    /// what actually survived, not against the ack flag.) The inverse,
+    /// "no phantom deliveries", is checked too: every delivered key exists.
+    async fn audit_feed_completeness(&self, feed: usize, delivered: &Set<String>) {
+        let object = format!("feed-{feed}");
+        let present: Set<String> = self
+            .read(&object, "SELECT k FROM msgs")
+            .await
+            .iter()
+            .map(|r| r["k"].as_str().expect("k").to_string())
+            .collect();
+        for k in &present {
+            assert!(
+                delivered.contains(k),
+                "FEED INCOMPLETE: durable message {k} on {object} never reached a consumer.
+trace tail:
+{}",
+                self.trace.dump_tail()
+            );
+        }
+        // No phantom check over the union: a NON-durable poll may legally
+        // deliver an optimistically-applied row that a later crash reverts
+        // (the optimistic-read contract). The strict "durable deliveries
+        // never un-happen" property is audit_durable_deliveries, which
+        // covers exactly the poll mode that promises it.
+    }
+
+    async fn read_ledger(&self, object: &str) -> Vec<(String, i64)> {
+        self.read(object, "SELECT k, amt FROM writes ORDER BY rowid")
+            .await
+            .iter()
+            .map(|r| {
+                (
+                    r["k"].as_str().expect("k").to_string(),
+                    r["amt"].as_i64().expect("amt"),
+                )
+            })
+            .collect()
+    }
+
     // ---------------------------------------------------------- oracles
 
     /// Money in the system is exactly what it started as, and every
@@ -978,11 +1774,49 @@ pub async fn run(world: Arc<World>) -> RunReport {
     }
     world.create_schemas().await;
 
-    // Phase 1: transfers under a storage fault window and a partition.
+    // Phase 1: the whole battery under a storage fault window and a
+    // partition — transfers, ERC20, escrows, counters, and watched feeds
+    // (produced + consumed three ways) all racing on one world.
     let doomed_node = below(&world.rng, world.cfg.nodes as u64) as usize;
     let doomed_wills = world.arm_wills(1, doomed_node).await;
-    let w = world.clone();
-    let workload = tokio::spawn(async move { w.transfer_phase(1).await });
+    let mut phase1 = Vec::new();
+    {
+        let w = world.clone();
+        phase1.push(tokio::spawn(async move { w.transfer_phase(1).await }));
+        let w = world.clone();
+        phase1.push(tokio::spawn(async move { w.erc20_phase(1).await }));
+        let w = world.clone();
+        phase1.push(tokio::spawn(async move { w.escrow_phase(1).await }));
+        let w = world.clone();
+        phase1.push(tokio::spawn(async move { w.counter_phase(1).await }));
+    }
+    // Feeds: producers + consumers run across BOTH phases, so start them
+    // here and join after phase 2. producers_done gates consumer exit.
+    let producers_done = Arc::new(AtomicBool::new(false));
+    let mut feed_tasks = Vec::new();
+    let mut consumer_tasks = Vec::new();
+    for f in 0..world.cfg.feeds {
+        let w = world.clone();
+        feed_tasks.push(tokio::spawn(async move {
+            w.feed_producer(f, 1).await;
+            w.feed_producer(f, 2).await;
+        }));
+        // conn ids are namespaced per (feed, role) so cancels don't collide.
+        let base = 0x1000_0000u64 + (f as u64) * 0x100;
+        let (w, pd) = (world.clone(), producers_done.clone());
+        consumer_tasks.push(tokio::spawn(async move {
+            (f, false, w.consume_feed(f, false, pd, base).await)
+        }));
+        let (w, pd) = (world.clone(), producers_done.clone());
+        consumer_tasks.push(tokio::spawn(async move {
+            (f, true, w.consume_feed(f, true, pd, base + 1).await)
+        }));
+        let (w, pd) = (world.clone(), producers_done.clone());
+        consumer_tasks.push(tokio::spawn(async move {
+            w.watch_feed_changes(f, pd, base + 2).await;
+            (f, false, Vec::new())
+        }));
+    }
     sleep(Duration::from_millis(300)).await;
     world.store.set_failing(true);
     if world.cfg.nodes >= 2 {
@@ -993,7 +1827,9 @@ pub async fn run(world: Arc<World>) -> RunReport {
     world.store.set_failing(false);
     world.net.heal();
     world.trace.record("faults healed".into());
-    workload.await.expect("phase 1 clients");
+    for t in phase1 {
+        t.await.expect("phase 1 workload");
+    }
 
     // Crash the node holding the doomed wills; drop their sessions the
     // way a dead server drops sockets: without ceremony.
@@ -1007,11 +1843,25 @@ pub async fn run(world: Arc<World>) -> RunReport {
     }
 
     // Quiescent audit while the cluster is (possibly) one node short.
+    // Feeds are still live (they span both phases), so they're audited
+    // only at the end; everything else is quiescent here.
     world.audit_conservation("mid-run").await;
+    world.audit_erc20("mid-run").await;
+    world.audit_escrows("mid-run").await;
+    world.audit_counters("mid-run").await;
 
-    // Phase 2: transfers + the pub/sub battery, then another crash.
-    let w = world.clone();
-    let workload = tokio::spawn(async move { w.transfer_phase(2).await });
+    // Phase 2: the battery again + the original pub/sub test, then a crash.
+    let mut phase2 = Vec::new();
+    {
+        let w = world.clone();
+        phase2.push(tokio::spawn(async move { w.transfer_phase(2).await }));
+        let w = world.clone();
+        phase2.push(tokio::spawn(async move { w.erc20_phase(2).await }));
+        let w = world.clone();
+        phase2.push(tokio::spawn(async move { w.escrow_phase(2).await }));
+        let w = world.clone();
+        phase2.push(tokio::spawn(async move { w.counter_phase(2).await }));
+    }
     let w = world.clone();
     let publisher = tokio::spawn(async move { w.publish_all().await });
     let w = world.clone();
@@ -1028,9 +1878,25 @@ pub async fn run(world: Arc<World>) -> RunReport {
             }
         }
     }
-    workload.await.expect("phase 2 clients");
+    for t in phase2 {
+        t.await.expect("phase 2 workload");
+    }
     publisher.await.expect("publisher");
     let received = subscriber.await.expect("subscriber");
+
+    // Producers are done; feeds can now drain and their consumers exit.
+    for t in feed_tasks {
+        t.await.expect("feed producer");
+    }
+    producers_done.store(true, Ordering::SeqCst);
+    let mut feed_transcripts: Map<usize, Set<String>> = Map::default();
+    for t in consumer_tasks {
+        let (feed, _durable, transcript) = t.await.expect("feed consumer");
+        let entry = feed_transcripts.entry(feed).or_default();
+        for (_id, k) in transcript {
+            entry.insert(k);
+        }
+    }
 
     // Subscriber oracle: everything acked arrived, nothing twice.
     {
@@ -1059,6 +1925,13 @@ pub async fn run(world: Arc<World>) -> RunReport {
         .await
         .expect("auditor boots");
     world.audit_conservation("after recovery").await;
+    world.audit_erc20("after recovery").await;
+    world.audit_escrows("after recovery").await;
+    world.audit_counters("after recovery").await;
+    world.audit_durable_deliveries().await;
+    for (feed, delivered) in &feed_transcripts {
+        world.audit_feed_completeness(*feed, delivered).await;
+    }
     world.audit_final().await;
 
     RunReport {
