@@ -254,6 +254,7 @@ mod tests {
         assert_eq!(page_size(&fake_db(2, 512, 1, 0)), 512);
         assert_eq!(page_size(&fake_db(1, 65536, 1, 0)), 65536, "64 KiB is encoded as 1");
         assert_eq!(page_size(b"short"), 4096, "headerless files get the default");
+        assert_eq!(page_size(&[0u8; 100]), 4096, "a zeroed header gets the default too");
     }
 
     #[test]

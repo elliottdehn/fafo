@@ -110,8 +110,11 @@ pub fn materialize(
     // trade its crash-safety away for speed. cache_size is capped tight
     // (256 KB) because a node may hold hundreds of live connections and
     // SQLite's 2 MB default would quietly eat the container's RAM.
+    // foreign_keys must be set HERE: "invariants live in SQL" is the
+    // contract, SQLite defaults enforcement off, and a PRAGMA inside a
+    // transaction (the only place API ops run) is a silent no-op.
     let _mode: String = conn.query_row("PRAGMA journal_mode=MEMORY", [], |r| r.get(0))?;
-    conn.execute_batch("PRAGMA synchronous=OFF; PRAGMA cache_size=-256")?;
+    conn.execute_batch("PRAGMA synchronous=OFF; PRAGMA cache_size=-256; PRAGMA foreign_keys=ON")?;
     objects.insert(id.to_string(), LiveObject { conn, live_path });
     Ok(())
 }
@@ -216,6 +219,9 @@ mod tests {
             .await
             .unwrap();
 
+        // A key in delta position that isn't a delta is skipped, not fatal.
+        store.put("objects/t.d.not-a-counter", b"junk").await.unwrap();
+
         let (image, chain) = fetch_image(&store, "t", &dir.path().join("t.db"))
             .await
             .unwrap();
@@ -261,16 +267,35 @@ mod tests {
         inner.put(&object_key("t"), &fake_db(5, 0xaa)).await.unwrap();
         let store: Arc<dyn BlobStore> = Arc::new(NoBaseDownload(inner));
 
-        // Cache exactly at the base counter: good enough, no download.
+        // Cache PAST the base counter: good enough, no download — and a
+        // delta the cache already reflects (counter 6 ≤ cached 7) is
+        // skipped rather than re-applied.
+        store
+            .put(
+                &delta_key("t", 6),
+                &encode(&Delta {
+                    counter: 6,
+                    file_len: 4096,
+                    page_size: 4096,
+                    pages: vec![(0, fake_db(6, 0x66))],
+                }),
+            )
+            .await
+            .unwrap();
         let live = dir.path().join("t.db");
-        std::fs::write(&live, fake_db(5, 0xcc)).unwrap();
+        std::fs::write(&live, fake_db(7, 0xcc)).unwrap();
         let (image, _) = fetch_image(&store, "t", &live).await.unwrap();
-        assert_eq!(image, fake_db(5, 0xcc));
+        assert_eq!(image, fake_db(7, 0xcc), "cached bytes served untouched");
 
         // A stale cache (counter behind the base) must NOT be trusted.
         std::fs::write(&live, fake_db(3, 0xdd)).unwrap();
         let err = fetch_image(&store, "t", &live).await.unwrap_err();
         assert!(err.to_string().contains("base download"), "stale cache forces a download");
+
+        // The wrapper's pass-throughs exist only to satisfy the trait.
+        store.put("scratch", b"1").await.unwrap();
+        assert!(store.create("scratch2", b"1").await.unwrap());
+        store.delete("scratch").await.unwrap();
     }
 
     #[tokio::test]
@@ -316,6 +341,12 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("vanished"), "got: {err}");
+
+        // The wrapper's pass-throughs exist only to satisfy the trait.
+        store.put("scratch", b"1").await.unwrap();
+        assert!(store.create("scratch2", b"1").await.unwrap());
+        store.delete("scratch").await.unwrap();
+        assert_eq!(store.get_range("scratch2", 0, 1).await.unwrap().unwrap(), b"1");
     }
 
     #[tokio::test]

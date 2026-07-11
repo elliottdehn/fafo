@@ -66,24 +66,18 @@ fn env_bytes(name: &str) -> Option<u64> {
 }
 
 fn cgroup_memory_limit() -> Option<u64> {
-    for path in [
-        "/sys/fs/cgroup/memory.max",                    // cgroup v2
-        "/sys/fs/cgroup/memory/memory.limit_in_bytes",  // cgroup v1
-    ] {
-        if let Ok(raw) = std::fs::read_to_string(path) {
-            let raw = raw.trim();
-            if raw == "max" {
-                continue;
-            }
-            if let Ok(v) = raw.parse::<u64>() {
-                // Absurd v1 sentinel values mean "unlimited".
-                if v < 1 << 46 {
-                    return Some(v);
-                }
-            }
-        }
-    }
-    None
+    [
+        "/sys/fs/cgroup/memory.max",                   // cgroup v2
+        "/sys/fs/cgroup/memory/memory.limit_in_bytes", // cgroup v1
+    ]
+    .iter()
+    .find_map(|path| parse_cgroup_limit(&std::fs::read_to_string(path).ok()?))
+}
+
+/// "max" (v2) and the absurd v1 sentinels both mean "unlimited": None.
+fn parse_cgroup_limit(raw: &str) -> Option<u64> {
+    let v = raw.trim().parse::<u64>().ok()?;
+    (v < 1 << 46).then_some(v)
 }
 
 // ------------------------------------------------------------- disk ledger
@@ -293,6 +287,24 @@ mod tests {
         assert_eq!(e.deleted_cache_bytes, 0);
         assert!(e.shed_from_worker.is_none());
         assert!(p.exists(), "under budget, nothing is touched");
+    }
+
+    #[test]
+    fn cgroup_limits_parse_and_sentinels_mean_unlimited() {
+        assert_eq!(parse_cgroup_limit("268435456\n"), Some(256 * 1024 * 1024));
+        assert_eq!(parse_cgroup_limit("max"), None, "cgroup v2 unlimited");
+        assert_eq!(parse_cgroup_limit("9223372036854771712"), None, "v1 sentinel");
+        assert_eq!(parse_cgroup_limit("banana"), None);
+    }
+
+    #[test]
+    fn env_overrides_are_read_in_mebibytes() {
+        // SAFETY: a uniquely named variable no other test reads.
+        unsafe { std::env::set_var("FAFO_TEST_LIMITS_MB", "64") };
+        assert_eq!(env_bytes("FAFO_TEST_LIMITS_MB"), Some(64 * 1024 * 1024));
+        unsafe { std::env::set_var("FAFO_TEST_LIMITS_MB", "not-a-number") };
+        assert_eq!(env_bytes("FAFO_TEST_LIMITS_MB"), None);
+        assert_eq!(env_bytes("FAFO_TEST_LIMITS_UNSET"), None);
     }
 
     #[test]

@@ -1089,6 +1089,57 @@ mod tests {
         let v = frame(&node, &appender, &outstanding, &will,
             r#"{"id":3,"read_only":true,"ops":[{"object":"wslog","sql":"SELECT n FROM t"}]}"#).await.unwrap();
         assert_eq!(v["status"], 403, "insert does not imply read: {v}");
+
+        // A will outside the grant is refused at arm time...
+        let v = frame(&node, &appender, &outstanding, &will,
+            r#"{"id":4,"will":{"ops":[{"object":"other","sql":"DELETE FROM t"}]}}"#).await.unwrap();
+        assert_eq!(v["status"], 403, "will must stay inside the grant: {v}");
+        assert!(will.lock().unwrap().is_none());
+        // ...and polls need the poll verb explicitly.
+        let v = frame(&node, &appender, &outstanding, &will,
+            r#"{"id":5,"poll":{"object":"wslog","sql":"SELECT n FROM t"}}"#).await.unwrap();
+        assert_eq!(v["status"], 403, "insert does not imply poll: {v}");
+        node.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn ws_teardown_sweeps_polls_and_survives_a_failing_will() {
+        let (_dir, node, base) = serve(None).await;
+        post(&format!("{base}/objects/sweep/exec"), None,
+            exec_body("CREATE TABLE msgs (id INTEGER PRIMARY KEY AUTOINCREMENT, body TEXT)")).await;
+        post(&format!("{base}/objects/quiet/exec"), None,
+            exec_body("CREATE TABLE msgs (id INTEGER PRIMARY KEY AUTOINCREMENT, body TEXT)")).await;
+
+        let mut ws = ws_connect(&base, Some("fafo"), None).await.unwrap();
+        // Park a poll on an object nothing will touch — only the socket
+        // teardown can clean it up — and arm a will that is doomed: its
+        // table will be gone by the time the socket dies.
+        ws.send(Message::Text(json!({
+            "id": 5, "poll": { "object": "quiet", "sql": "SELECT * FROM msgs WHERE id > 99" }
+        }).to_string().into())).await.unwrap();
+        let v = ws_roundtrip(&mut ws, json!({
+            "id": 6, "will": { "ops": [{ "object": "sweep", "sql": "DELETE FROM msgs" }] }
+        })).await;
+        assert_eq!(v["result"]["will"], "armed");
+        post(&format!("{base}/objects/sweep/exec"), None, exec_body("DROP TABLE msgs")).await;
+
+        // Say goodbye properly this time (a Close frame, not a vanish).
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        ws.close(None).await.unwrap();
+        drop(ws);
+
+        // The will fails (table dropped) without wedging teardown, and the
+        // parked poll is canceled rather than left to rot.
+        let mut swept = false;
+        for _ in 0..100 {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            let parked: usize = node.stats().await.per_worker.iter().map(|w| w.parked_polls).sum();
+            if parked == 0 {
+                swept = true;
+                break;
+            }
+        }
+        assert!(swept, "socket teardown must sweep its parked polls");
         node.shutdown().await;
     }
 
@@ -1132,6 +1183,209 @@ mod tests {
         // Canceling something unknown is a quiet no-op.
         let reply = frame(&node, &Auth::Root, &outstanding, &will, r#"{"id":404,"cancel":true}"#).await;
         assert!(reply.is_none());
+        node.shutdown().await;
+    }
+
+    // ---------------------------------------------------------- live WS
+    //
+    // Real sockets via tungstenite: the upgrade handshake (auth lives
+    // there), pipelined frames, and the teardown promises (wills, poll
+    // sweeps) that only firing a disconnect can prove.
+
+    use futures::{SinkExt, StreamExt};
+    use tokio_tungstenite::connect_async;
+    use tokio_tungstenite::tungstenite::{client::IntoClientRequest, protocol::Message};
+
+    type WsClient = tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >;
+
+    async fn ws_connect(base: &str, subprotocol: Option<&str>, bearer: Option<&str>) -> anyhow::Result<WsClient> {
+        let url = format!("{}/ws", base.replace("http://", "ws://"));
+        let mut req = url.into_client_request()?;
+        if let Some(p) = subprotocol {
+            req.headers_mut().insert("sec-websocket-protocol", p.parse()?);
+        }
+        if let Some(t) = bearer {
+            req.headers_mut().insert("authorization", format!("Bearer {t}").parse()?);
+        }
+        let (ws, resp) = connect_async(req).await?;
+        if subprotocol.is_some() {
+            assert_eq!(
+                resp.headers().get("sec-websocket-protocol").unwrap(),
+                "fafo",
+                "the server selects the plain protocol back"
+            );
+        }
+        Ok(ws)
+    }
+
+    async fn ws_roundtrip(ws: &mut WsClient, frame: Value) -> Value {
+        ws.send(Message::Text(frame.to_string().into())).await.unwrap();
+        ws_recv(ws).await
+    }
+
+    async fn ws_recv(ws: &mut WsClient) -> Value {
+        loop {
+            match tokio::time::timeout(std::time::Duration::from_secs(5), ws.next())
+                .await
+                .expect("reply within 5s")
+                .expect("socket open")
+                .unwrap()
+            {
+                Message::Text(t) => return serde_json::from_str(&t).unwrap(),
+                _ => continue, // pings etc.
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn ws_upgrade_authenticates_via_subprotocol_or_bearer() {
+        let (_dir, node, base) = serve(Some("root")).await;
+
+        assert!(ws_connect(&base, None, None).await.is_err(), "no credentials");
+        assert!(
+            ws_connect(&base, Some("fafo, fafo-token.wrong"), None).await.is_err(),
+            "bad token in the subprotocol slot"
+        );
+
+        // The browser path: token smuggled through the subprotocol header.
+        let mut ws = ws_connect(&base, Some("fafo, fafo-token.root"), None).await.unwrap();
+        let v = ws_roundtrip(&mut ws, json!({
+            "id": 1, "ops": [{ "object": "wsup", "sql": "CREATE TABLE t (n INTEGER)" }]
+        })).await;
+        assert!(v["result"]["txn_id"].is_string(), "got: {v}");
+
+        // The backend path: a plain Authorization header.
+        let mut ws = ws_connect(&base, None, Some("root")).await.unwrap();
+        let v = ws_roundtrip(&mut ws, json!({
+            "id": 2, "read_only": true,
+            "ops": [{ "object": "wsup", "sql": "SELECT COUNT(*) AS c FROM t" }]
+        })).await;
+        assert_eq!(v["result"]["results"][0]["rows"][0]["c"], 0);
+        node.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn ws_polls_park_fire_and_cancel_over_a_live_socket() {
+        let (_dir, node, base) = serve(None).await;
+        let mut ws = ws_connect(&base, Some("fafo"), None).await.unwrap();
+        ws_roundtrip(&mut ws, json!({
+            "id": 1,
+            "ops": [{ "object": "wschan", "sql": "CREATE TABLE msgs (id INTEGER PRIMARY KEY AUTOINCREMENT, body TEXT)" }]
+        })).await;
+
+        // Park a poll; the socket stays fully usable (pipelining) while it
+        // waits; a write from elsewhere fires it.
+        ws.send(Message::Text(json!({
+            "id": 2,
+            "poll": { "object": "wschan", "sql": "SELECT body FROM msgs WHERE id > ?1", "params": [0] }
+        }).to_string().into())).await.unwrap();
+        let v = ws_roundtrip(&mut ws, json!({
+            "id": 3, "read_only": true,
+            "ops": [{ "object": "wschan", "sql": "SELECT COUNT(*) AS c FROM msgs" }]
+        })).await;
+        assert_eq!(v["id"], 3, "later frames overtake a parked poll");
+
+        post(&format!("{base}/objects/wschan/exec"), None,
+            exec_body("INSERT INTO msgs (body) VALUES ('wake')")).await;
+        let v = ws_recv(&mut ws).await;
+        assert_eq!(v["id"], 2);
+        assert_eq!(v["result"]["results"][0]["rows"][0]["body"], "wake");
+
+        // Cancel: the canceled poll's own reply slot reports it.
+        ws.send(Message::Text(json!({
+            "id": 9,
+            "poll": { "object": "wschan", "sql": "SELECT * FROM msgs WHERE id > 99" }
+        }).to_string().into())).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        ws.send(Message::Text(json!({ "id": 9, "cancel": true }).to_string().into())).await.unwrap();
+        let v = ws_recv(&mut ws).await;
+        assert_eq!(v["id"], 9);
+        assert!(v["error"].as_str().unwrap().contains("canceled"), "got: {v}");
+        node.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn ws_will_fires_when_the_socket_dies() {
+        let (_dir, node, base) = serve(None).await;
+        post(&format!("{base}/objects/room/exec"), None, json!({ "ops": [
+            { "sql": "CREATE TABLE presence (session TEXT PRIMARY KEY)" },
+            { "sql": "INSERT INTO presence VALUES ('s-1')" }
+        ]})).await;
+
+        let mut ws = ws_connect(&base, Some("fafo"), None).await.unwrap();
+        // Binary frames are ignored; the connection shrugs and continues.
+        ws.send(Message::Binary(vec![1, 2, 3].into())).await.unwrap();
+        let v = ws_roundtrip(&mut ws, json!({
+            "id": 1,
+            "will": { "ops": [{ "object": "room", "sql": "DELETE FROM presence WHERE session = ?1", "params": ["s-1"] }] }
+        })).await;
+        assert_eq!(v["result"]["will"], "armed");
+
+        // Die without saying goodbye. The will must run anyway.
+        drop(ws);
+        let mut deleted = false;
+        for _ in 0..100 {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            let (_, v) = post(&format!("{base}/objects/room/query"), None,
+                exec_body("SELECT COUNT(*) AS c FROM presence")).await;
+            if v["rows"][0]["c"] == 0 {
+                deleted = true;
+                break;
+            }
+        }
+        assert!(deleted, "the armed will must delete the presence row");
+        node.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn api_errors_wrap_foreign_errors_as_500s() {
+        let e = ApiError::from(anyhow::anyhow!("boom"));
+        assert_eq!(e.status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(e.message, "boom");
+        let bad_json: Result<Value, _> = serde_json::from_str("{");
+        let e = ApiError::from(bad_json.unwrap_err());
+        assert_eq!(e.status, StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[tokio::test]
+    async fn internal_rpc_take_and_adopt_answer_for_unowned_workers() {
+        let (_dir, node, base) = serve(None).await;
+        let client = reqwest::Client::new();
+        let rpc = |body: Value| {
+            let client = client.clone();
+            let url = format!("{base}/internal/rpc");
+            async move {
+                let resp = client
+                    .post(url)
+                    .header(crate::rpc::SECRET_HEADER, "cluster-secret")
+                    .json(&body)
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(resp.status().as_u16(), 200);
+                resp.json::<Value>().await.unwrap()
+            }
+        };
+
+        // Owned worker, unknown object: the take still resolves (transfer
+        // of an object that has never been written is just metadata).
+        let owned = crate::cluster::id_on_worker(0, 4, "take");
+        let v = rpc(json!({ "Take": { "worker": 0, "object": owned, "taker": 1 } })).await;
+        assert!(v["Take"]["Ok"].is_object(), "got: {v}");
+
+        // A worker this node holds no lease for: NotMine, with a hint.
+        let v = rpc(json!({ "Take": { "worker": 99, "object": "whatever", "taker": 1 } })).await;
+        assert!(v["Take"]["Err"]["NotMine"].is_object(), "got: {v}");
+
+        // Adopt: accepted for an owned worker, refused for a foreign one.
+        let meta = json!({ "settled": false, "home": 0, "visit": null });
+        let v = rpc(json!({ "Adopt": { "worker": 0, "object": owned, "meta": meta } })).await;
+        assert_eq!(v.as_str(), Some("Ok"), "got: {v}");
+        let meta = json!({ "settled": false, "home": 99, "visit": null });
+        let v = rpc(json!({ "Adopt": { "worker": 99, "object": "whatever", "meta": meta } })).await;
+        assert!(v["Err"].is_string(), "got: {v}");
         node.shutdown().await;
     }
 

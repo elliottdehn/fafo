@@ -192,6 +192,105 @@ mod tests {
         assert_eq!(ApiError::from(alien).status, axum::http::StatusCode::INTERNAL_SERVER_ERROR);
     }
 
+    /// Scripted replies: (status, body) pairs served in order.
+    type Script = std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<(u16, String)>>>;
+
+    /// A peer that answers /internal/rpc from a script — wrong statuses,
+    /// wrong variants — to prove every mismatch degrades to a clean error.
+    async fn scripted_peer(script: Script) -> String {
+        use axum::extract::State;
+        async fn answer(
+            State(script): State<Script>,
+        ) -> (axum::http::StatusCode, [(&'static str, &'static str); 1], String) {
+            let (status, body) = script.lock().unwrap().pop_front().expect("scripted reply");
+            (
+                axum::http::StatusCode::from_u16(status).unwrap(),
+                [("content-type", "application/json")],
+                body,
+            )
+        }
+        let app = axum::Router::new()
+            .route("/internal/rpc", axum::routing::post(answer))
+            .with_state(script);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn wire_failures_and_mismatches_become_clean_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = crate::cluster::start(crate::cluster::NodeConfig {
+            store: std::sync::Arc::new(
+                crate::store::FsBlobStore::new(dir.path().join("blobs")).unwrap(),
+            ),
+            live_dir: dir.path().join("live"),
+            logical: 4,
+            claim: crate::cluster::ClaimSpec::All,
+            bind: "127.0.0.1:0".into(),
+            advertise: None,
+            hysteresis: 200,
+            secret: "s".into(),
+            api_token: None,
+            max_unshipped: crate::cluster::DEFAULT_MAX_UNSHIPPED,
+            limits: crate::limits::Limits::detect(),
+            fence_ttl: Duration::from_secs(60),
+        })
+        .await
+        .unwrap();
+        let script = Script::default();
+        let peer = scripted_peer(script.clone()).await;
+        let push = |status: u16, body: &str| {
+            script.lock().unwrap().push_back((status, body.to_string()));
+        };
+        let meta = || TransferMeta {
+            settled: false,
+            home: 0,
+            visit: None,
+        };
+
+        // HTTP-level failure: the status is in the error, per call site.
+        push(500, "{}");
+        let err = forward_txn(&node, &peer, None, vec!["a".into()], vec![], false, false)
+            .await
+            .unwrap_err();
+        assert!(err.message.contains("rpc to"), "{}", err.message);
+        push(500, "{}");
+        assert!(take(&node, &peer, 0, "o", 1).await.is_err());
+        push(500, "{}");
+        assert!(adopt(&node, &peer, 0, "o".into(), meta()).await.is_err());
+
+        // Application-level Err payloads map to each call's error shape.
+        push(200, r#"{"Err":"boom"}"#);
+        let err = forward_txn(&node, &peer, None, vec!["a".into()], vec![], false, false)
+            .await
+            .unwrap_err();
+        assert_eq!(err.message, "boom");
+        push(200, r#"{"Err":"boom"}"#);
+        match take(&node, &peer, 0, "o", 1).await.unwrap() {
+            Err(TakeError::Failed(e)) => assert_eq!(e, "boom"),
+            other => panic!("expected Failed, got {other:?}"),
+        }
+        push(200, r#"{"Err":"boom"}"#);
+        let err = adopt(&node, &peer, 0, "o".into(), meta()).await.unwrap_err();
+        assert!(err.to_string().contains("boom"));
+
+        // Wrong-variant replies are protocol mismatches, never panics.
+        push(200, r#""Ok""#);
+        let err = forward_txn(&node, &peer, None, vec!["a".into()], vec![], false, false)
+            .await
+            .unwrap_err();
+        assert!(err.message.contains("protocol mismatch"), "{}", err.message);
+        push(200, r#"{"Txn":{"Ok":{"txn_id":"x","results":[]}}}"#);
+        assert!(take(&node, &peer, 0, "o", 1).await.is_err());
+        push(200, r#"{"Take":{"Err":{"Failed":"x"}}}"#);
+        assert!(adopt(&node, &peer, 0, "o".into(), meta()).await.is_err());
+        node.shutdown().await;
+    }
+
     #[test]
     fn requests_survive_json_and_old_peers_can_omit_new_fields() {
         // A Txn from a peer built before `optimistic`/`cap` existed.

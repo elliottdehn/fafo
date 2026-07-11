@@ -631,21 +631,9 @@ impl Worker {
                     .unwrap()
                     .remove(&self.live_dir.join(format!("{id}.db")));
             }
-            // Their unshipped txns died with the boat: drop pending entries
-            // touching reverted objects. These applied AFTER the doomed
-            // boat launched, so their waiters never rode it — fail them
-            // explicitly rather than dropping the reply slot silently.
-            let reverted: HashSet<&String> = objects.iter().collect();
-            self.pending_txns.retain_mut(|t| {
-                if t.participants.iter().any(|p| reverted.contains(p)) {
-                    if let Some((resp, _)) = t.waiter.take() {
-                        let _ = resp.send(Err(ApiError::internal("state reverted; retry")));
-                    }
-                    false
-                } else {
-                    true
-                }
-            });
+            // Their unshipped txns died with the boat: these applied AFTER
+            // the doomed boat launched, so their waiters never rode it.
+            self.drop_pending_touching(&objects);
         }
         // Freshly shipped objects just became sheddable; give the disk
         // ledger a chance to reclaim if it's over budget.
@@ -662,6 +650,24 @@ impl Worker {
         }
         self.maybe_finish_closing();
         self.pump(ready).await;
+    }
+
+    /// Objects just reverted to durable state: pending txns touching them
+    /// describe writes that no longer exist locally. Drop the entries and
+    /// tell their waiters plainly rather than letting the reply slot die
+    /// silently (or worse, letting a later boat snapshot a purged object).
+    fn drop_pending_touching(&mut self, reverted: &[String]) {
+        let reverted: HashSet<&String> = reverted.iter().collect();
+        self.pending_txns.retain_mut(|t| {
+            if t.participants.iter().any(|p| reverted.contains(p)) {
+                if let Some((resp, _)) = t.waiter.take() {
+                    let _ = resp.send(Err(ApiError::internal("state reverted; retry")));
+                }
+                false
+            } else {
+                true
+            }
+        });
     }
 
     /// Drive txns forward until everything is parked or done.
@@ -1309,14 +1315,26 @@ impl Worker {
         clear_authorizers(&self.objects);
 
         let mut commit_err = None;
-        for id in participants {
+        for (i, id) in participants.iter().enumerate() {
             if let Err(e) = conn_of(&self.objects, id).execute_batch("COMMIT") {
-                commit_err = Some(e);
+                commit_err = Some((i, e));
                 break;
             }
         }
-        if let Some(e) = commit_err {
-            for id in participants {
+        if let Some((failed_at, e)) = commit_err {
+            // COMMIT can itself fail (a DEFERRED constraint, checked only
+            // now). The failing participant and everyone after it still
+            // hold an OPEN transaction: ROLLBACK erases exactly this txn
+            // and preserves everything before it, acked-unshipped writes
+            // included.
+            for id in &participants[failed_at..] {
+                let _ = conn_of(&self.objects, id).execute_batch("ROLLBACK");
+            }
+            // Participants before it already committed and cannot be
+            // uncommitted: erase the txn atomically by reverting them to
+            // durable state. Their unshipped writes revert too — the
+            // sunk-boat contract, applied locally.
+            for id in &participants[..failed_at] {
                 self.fail_polls(id, "state reverted; re-poll");
                 purge(&mut self.objects, id);
                 self.manifests.remove(id);
@@ -1329,6 +1347,7 @@ impl Worker {
                     .unwrap()
                     .remove(&self.live_dir.join(format!("{id}.db")));
             }
+            self.drop_pending_touching(&participants[..failed_at]);
             return Err(ApiError::internal(format!("local commit failed: {e}")));
         }
 
@@ -2068,10 +2087,14 @@ mod tests {
         })
         .unwrap();
         store.put("txns/t3.json", &record).await.unwrap();
-        // ...and staging from a boat that never reached its commit point.
+        // ...and staging from a boat that never reached its commit point,
+        // plus a record too corrupt to parse (dropped, not fatal).
         store.put("staging/t2/bob.snap", b"JUNK").await.unwrap();
+        store.put("txns/garbage.json", b"not json").await.unwrap();
 
         recover(store.as_ref()).await.unwrap();
+
+        assert!(store.get("txns/garbage.json").await.unwrap().is_none());
 
         assert_eq!(store.get("objects/alice.db").await.unwrap().unwrap(), b"NEW");
         assert_eq!(store.get("objects/dave.db").await.unwrap().unwrap(), b"INLINE");
@@ -2084,6 +2107,72 @@ mod tests {
         assert!(store.get("staging/t1/alice.snap").await.unwrap().is_none());
         assert!(store.get("staging/t2/bob.snap").await.unwrap().is_none());
         assert!(store.get("objects/bob.db").await.unwrap().is_none());
+    }
+
+    /// A store that lists keys it can no longer produce — the shape of a
+    /// concurrent recoverer (or GC) winning a race between list and get.
+    struct Ghostly {
+        inner: FsBlobStore,
+        ghosts: Vec<String>,
+    }
+
+    #[async_trait::async_trait]
+    impl BlobStore for Ghostly {
+        async fn get(&self, key: &str) -> anyhow::Result<Option<Vec<u8>>> {
+            if self.ghosts.iter().any(|g| g == key) {
+                return Ok(None);
+            }
+            self.inner.get(key).await
+        }
+        async fn put(&self, key: &str, bytes: &[u8]) -> anyhow::Result<()> {
+            self.inner.put(key, bytes).await
+        }
+        async fn delete(&self, key: &str) -> anyhow::Result<()> {
+            self.inner.delete(key).await
+        }
+        async fn list(&self, prefix: &str) -> anyhow::Result<Vec<String>> {
+            let mut keys = self.inner.list(prefix).await?;
+            keys.extend(self.ghosts.iter().filter(|g| g.starts_with(prefix)).cloned());
+            keys.sort();
+            Ok(keys)
+        }
+        async fn create(&self, key: &str, bytes: &[u8]) -> anyhow::Result<bool> {
+            self.inner.create(key, bytes).await
+        }
+    }
+
+    #[tokio::test]
+    async fn recovery_tolerates_ghost_keys_and_bad_inline_hex() {
+        let dir = tempfile::tempdir().unwrap();
+        let inner = FsBlobStore::new(dir.path().join("blobs")).unwrap();
+        // A real record whose staged blob is a ghost, and a record with
+        // inline payload that doesn't decode: both are skipped politely.
+        let record = |id: &str, inline: Vec<(String, String)>| {
+            serde_json::to_vec(&TxnRecord {
+                txn_id: id.into(),
+                objects: vec!["erin".into()],
+                inline,
+            })
+            .unwrap()
+        };
+        inner.put("txns/tg.json", &record("tg", vec![])).await.unwrap();
+        inner
+            .put("txns/tbad.json", &record("tbad", vec![("erin.snap".into(), "zz".into())]))
+            .await
+            .unwrap();
+        let store = Ghostly {
+            inner,
+            ghosts: vec!["txns/ghost.json".into(), "staging/tg/erin.snap".into()],
+        };
+
+        recover(&store).await.unwrap();
+
+        assert!(store.get("txns/tg.json").await.unwrap().is_none());
+        assert!(store.get("txns/tbad.json").await.unwrap().is_none());
+        assert!(
+            store.get("objects/erin.db").await.unwrap().is_none(),
+            "neither a ghost nor bad hex may fabricate object state"
+        );
     }
 
     #[tokio::test]

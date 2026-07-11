@@ -290,5 +290,20 @@ mod tests {
             );
         }
         assert_eq!(d.get_range("missing", 0, 4).await.unwrap(), None);
+        // The pass-throughs exist only to satisfy the trait; touch them.
+        d.put("g", b"1").await.unwrap();
+        assert!(d.create("h", b"1").await.unwrap());
+        assert_eq!(d.list("g").await.unwrap(), vec!["g"]);
+        d.delete("g").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn create_surfaces_real_io_errors() {
+        let (_dir, s) = store();
+        s.put("f", b"x").await.unwrap();
+        // The parent of the new key is an existing FILE: not a race we can
+        // resolve, so it must be an error, not a quiet false.
+        assert!(s.create("f/child", b"x").await.is_err());
+        assert!(s.put("f/child", b"x").await.is_err());
     }
 }

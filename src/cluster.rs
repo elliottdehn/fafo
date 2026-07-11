@@ -1093,7 +1093,13 @@ mod tests {
     use super::*;
     use crate::store::FsBlobStore;
 
-    async fn boot(root: &std::path::Path, logical: usize, claim: ClaimSpec, tag: &str) -> Node {
+    async fn boot_hyst(
+        root: &std::path::Path,
+        logical: usize,
+        claim: ClaimSpec,
+        tag: &str,
+        hysteresis: u64,
+    ) -> Node {
         let store: Arc<dyn BlobStore> = Arc::new(FsBlobStore::new(root.join("blobs")).unwrap());
         start(NodeConfig {
             store,
@@ -1102,7 +1108,7 @@ mod tests {
             claim,
             bind: "127.0.0.1:0".into(),
             advertise: None,
-            hysteresis: 200,
+            hysteresis,
             secret: "test-secret".into(),
             api_token: None,
             max_unshipped: DEFAULT_MAX_UNSHIPPED,
@@ -1111,6 +1117,10 @@ mod tests {
         })
         .await
         .unwrap()
+    }
+
+    async fn boot(root: &std::path::Path, logical: usize, claim: ClaimSpec, tag: &str) -> Node {
+        boot_hyst(root, logical, claim, tag, 200).await
     }
 
     async fn exec_mode(
@@ -1976,6 +1986,899 @@ mod tests {
         assert_eq!(all, (0..8).collect::<Vec<_>>(), "no overlap, full coverage");
         node_a.shutdown().await;
         node_b.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn migration_and_return_ride_the_rpc_between_nodes() {
+        let dir = tempfile::tempdir().unwrap();
+        // Low hysteresis so the displaced object earns "settled" fast and
+        // goes home within the test.
+        let node_a = boot_hyst(dir.path(), 4, ClaimSpec::Workers(vec![0, 1]), "a", 3).await;
+        let node_b = boot_hyst(dir.path(), 4, ClaimSpec::Workers(vec![2, 3]), "b", 3).await;
+        let a1 = id_on_worker(1, 4, "a1");
+        let a2 = id_on_worker(1, 4, "a2");
+        let b1 = id_on_worker(2, 4, "b1");
+        make_account(&node_a, &a1).await;
+        make_account(&node_a, &a2).await;
+        make_account(&node_b, &b1).await;
+        // Tenure for b1 at its home worker, past the hysteresis bar.
+        for _ in 0..5 {
+            exec(&node_b, &[&b1], &[(&b1, "UPDATE account SET balance = balance + 0")])
+                .await
+                .unwrap();
+        }
+
+        // Plurality at A's worker 1: b1 is TAKEN from node B over the RPC,
+        // the txn runs at A, and hysteresis then sends b1 home — an Adopt
+        // over the RPC in the other direction.
+        exec(
+            &node_a,
+            &[&a1, &a2, &b1],
+            &[
+                (&a1, "UPDATE account SET balance = balance - 5"),
+                (&a2, "UPDATE account SET balance = balance - 5"),
+                (&b1, "UPDATE account SET balance = balance + 10"),
+            ],
+        )
+        .await
+        .unwrap();
+        assert!(node_a.stats().await.takes >= 1, "the take crossed nodes");
+
+        let mut home = false;
+        for _ in 0..250 {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            if node_b.routing.read().unwrap().owner_of(&b1) == 2
+                && node_a.stats().await.returns >= 1
+            {
+                home = true;
+                break;
+            }
+        }
+        assert!(home, "hysteresis must return b1 to worker 2 via RPC adopt");
+        assert_eq!(balance(&node_b, &b1).await, 110, "state followed the round trip");
+        node_a.shutdown().await;
+        node_b.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_partial_cluster_reports_unroutable_workers() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = boot(dir.path(), 4, ClaimSpec::Workers(vec![0]), "a").await;
+        let local = id_on_worker(0, 4, "mine");
+        let foreign = id_on_worker(3, 4, "theirs");
+        make_account(&node, &local).await;
+
+        // Routing to a worker nobody holds: said plainly, not hung.
+        let err = exec(&node, &[&foreign], &[(&foreign, "SELECT 1")]).await.unwrap_err();
+        assert!(err.message.contains("no live node holds logical worker"), "{}", err.message);
+
+        // A txn that must ACQUIRE the unroutable participant fails after
+        // the take retries drain, releasing what it already held — and a
+        // good txn queued behind it on the same object runs the moment the
+        // doomed one lets go.
+        let n2 = node.clone();
+        let (l2, f2) = (local.clone(), foreign.clone());
+        let doomed = tokio::spawn(async move {
+            exec(
+                &n2,
+                &[&l2, &f2],
+                &[(&l2, "UPDATE account SET balance = balance - 1")],
+            )
+            .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let queued_objects = [local.as_str()];
+        let queued_ops = [(local.as_str(), "UPDATE account SET balance = balance + 5")];
+        let queued = exec(&node, &queued_objects, &queued_ops);
+        let (doomed, queued) = tokio::join!(doomed, queued);
+        let err = doomed.unwrap().unwrap_err();
+        assert!(err.message.contains("acquisition failed"), "{}", err.message);
+        queued.unwrap();
+        assert_eq!(balance(&node, &local).await, 105, "released cleanly, queue served");
+
+        // Polls are node-local: the owning instance must be asked.
+        let err = poll_q(&node, &foreign, "SELECT 1", vec![], false, None).await.unwrap_err();
+        assert!(err.message.contains("poll the owning instance"), "{}", err.message);
+        cancel_poll(&node, &foreign, 1, 1); // fire-and-forget, even unrouted
+        node.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_stale_peer_address_heals_on_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FsBlobStore::new(dir.path().join("blobs")).unwrap();
+        // A dead-but-fast address: bind an ephemeral port, then drop the
+        // listener so connections are refused instead of hanging.
+        let dead = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            format!("http://{}", l.local_addr().unwrap())
+        };
+        // A corpse lease for block 3 at that address: node A will boot
+        // with it cached in its routing.
+        store
+            .put(
+                "_lease/b3/e1.json",
+                serde_json::to_vec(&Lease { addr: dead }).unwrap().as_slice(),
+            )
+            .await
+            .unwrap();
+        // Short fence TTL: B's takeover of the corpse's (non-tombstoned)
+        // lease must wait it out before its first write.
+        let boot_short = |claim: Vec<usize>, tag: &'static str| {
+            let root = dir.path().to_path_buf();
+            async move {
+                let store: Arc<dyn BlobStore> =
+                    Arc::new(FsBlobStore::new(root.join("blobs")).unwrap());
+                start(NodeConfig {
+                    store,
+                    live_dir: root.join(format!("live-{tag}")),
+                    logical: 4,
+                    claim: ClaimSpec::Workers(claim),
+                    bind: "127.0.0.1:0".into(),
+                    advertise: None,
+                    hysteresis: 200,
+                    secret: "test-secret".into(),
+                    api_token: None,
+                    max_unshipped: DEFAULT_MAX_UNSHIPPED,
+                    limits: crate::limits::Limits::detect(),
+                    fence_ttl: std::time::Duration::from_millis(300),
+                })
+                .await
+                .unwrap()
+            }
+        };
+        let node_a = boot_short(vec![0], "a").await;
+        // B health-checks the corpse, finds it dead, and claims block 3 at
+        // a bumped epoch — a takeover A hears nothing about.
+        let node_b = boot_short(vec![3], "b").await;
+        assert_eq!(node_b.claimed_workers(), 1);
+
+        // A's first forward goes to the dead address, fails at transport,
+        // re-reads the lease, and retries once at the fresh holder.
+        let obj = id_on_worker(3, 4, "healed");
+        exec(&node_a, &[&obj], &[(&obj, "CREATE TABLE t (n INTEGER)")])
+            .await
+            .unwrap();
+        let res = exec(&node_b, &[&obj], &[(&obj, "SELECT COUNT(*) AS c FROM t")])
+            .await
+            .unwrap();
+        let v = serde_json::to_value(&res.results).unwrap();
+        assert_eq!(v[0]["rows"][0]["c"], 0, "the txn landed at the real holder");
+        node_a.shutdown().await;
+        node_b.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn live_holders_keep_their_leases() {
+        let dir = tempfile::tempdir().unwrap();
+        let node_a = boot(dir.path(), 4, ClaimSpec::All, "a").await;
+        // B wants everything, but every block's holder answers /healthz.
+        let node_b = boot(dir.path(), 4, ClaimSpec::All, "b").await;
+        assert_eq!(node_b.claimed_workers(), 0, "may not steal from the living");
+        assert_eq!(node_a.claimed_workers(), 4);
+        node_a.shutdown().await;
+        node_b.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn legacy_cluster_meta_defaults_to_64_blocks() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FsBlobStore::new(dir.path().join("blobs")).unwrap();
+        // A cluster created before lease blocks existed: no `blocks` field.
+        store
+            .create("_meta/cluster.json", br#"{"logical_workers":8}"#)
+            .await
+            .unwrap();
+        let node = boot(dir.path(), 8, ClaimSpec::All, "a").await;
+        {
+            let routing = node.routing.read().unwrap();
+            assert_eq!(routing.blocks, 64, "legacy clusters ran per-worker leases at W=64");
+            assert_eq!(routing.logical, 8, "and the stored W wins over the env");
+        }
+        node.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn boot_keeps_the_lower_worker_on_dual_claimed_objects() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FsBlobStore::new(dir.path().join("blobs")).unwrap();
+        // A crash between the two transfer writes can leave an object in
+        // two checkpoints. Boot must pick one deterministically.
+        let obj = id_on_worker(0, 4, "dual");
+        store.put("_worker/2.json", format!(r#"{{"owned":["{obj}"]}}"#).as_bytes()).await.unwrap();
+        store.put("_worker/1.json", format!(r#"{{"owned":["{obj}"]}}"#).as_bytes()).await.unwrap();
+        store.put("_worker/3.json", b"not even json").await.unwrap(); // ignored
+        store.put("_worker/stray-file", b"{}").await.unwrap(); // not a worker: ignored
+        let node = boot(dir.path(), 4, ClaimSpec::All, "a").await;
+        assert_eq!(node.routing.read().unwrap().owner_of(&obj), 1, "lower id wins");
+        node.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn claimed_ranges_merge_only_adjacent_blocks() {
+        let dir = tempfile::tempdir().unwrap();
+        // 99 is out of range and silently dropped; 0 and 2 don't touch.
+        let node = boot(dir.path(), 4, ClaimSpec::Workers(vec![0, 2, 99]), "a").await;
+        assert_eq!(node.claimed_ranges(), vec![(0, 1), (2, 3)]);
+        assert_eq!(node.claimed_workers(), 2);
+        assert_eq!(node.claimed(), vec![0, 2]);
+        node.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn the_lease_guard_shrugs_at_junk_keys_and_store_blips() {
+        /// A store whose LIST can be told to fail (one guard sweep's view
+        /// of a transient outage).
+        struct FlakyList(FsBlobStore, std::sync::atomic::AtomicBool);
+        #[async_trait::async_trait]
+        impl BlobStore for FlakyList {
+            async fn get(&self, key: &str) -> anyhow::Result<Option<Vec<u8>>> {
+                self.0.get(key).await
+            }
+            async fn put(&self, key: &str, bytes: &[u8]) -> anyhow::Result<()> {
+                self.0.put(key, bytes).await
+            }
+            async fn delete(&self, key: &str) -> anyhow::Result<()> {
+                self.0.delete(key).await
+            }
+            async fn list(&self, prefix: &str) -> anyhow::Result<Vec<String>> {
+                anyhow::ensure!(!self.1.load(Ordering::Relaxed), "injected list outage");
+                self.0.list(prefix).await
+            }
+            async fn create(&self, key: &str, bytes: &[u8]) -> anyhow::Result<bool> {
+                self.0.create(key, bytes).await
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let flaky = Arc::new(FlakyList(
+            FsBlobStore::new(dir.path().join("blobs")).unwrap(),
+            std::sync::atomic::AtomicBool::new(false),
+        ));
+        let store: Arc<dyn BlobStore> = flaky.clone();
+        let node = boot_with_store(dir.path(), store, 4).await;
+        for junk in [
+            "_lease/loose-file",
+            "_lease/bnope/e1.json",
+            "_lease/b1/not-an-epoch.json",
+            "_lease/b1/e1.released", // tombstones are not epochs
+        ] {
+            node.store.put(junk, b"junk").await.unwrap();
+        }
+        assert!(verify_leases(&node).await, "junk must not read as supersession");
+        assert!(!node.fenced.load(Ordering::SeqCst));
+
+        // A transient store outage keeps the old stamp and retries later —
+        // it must not fence a healthy node.
+        flaky.1.store(true, Ordering::Relaxed);
+        assert!(verify_leases(&node).await, "an outage is not a supersession");
+        assert!(!node.fenced.load(Ordering::SeqCst));
+        flaky.1.store(false, Ordering::Relaxed);
+        node.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_corrupt_delta_fails_activation_not_the_process() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = boot(dir.path(), 4, ClaimSpec::All, "a").await;
+        let obj = id_on_worker(1, 4, "victim");
+        make_account(&node, &obj).await;
+
+        // Poison the chain with a delta newer than every valid state, then
+        // force a cold activation.
+        node.store
+            .put(&crate::delta::delta_key(&obj, u32::MAX), b"garbage")
+            .await
+            .unwrap();
+        local_sender(&node, 1).unwrap().send(WorkerMsg::Shed).unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let err = exec(&node, &[&obj], &[(&obj, "SELECT 1")]).await.unwrap_err();
+        assert!(err.message.contains("activation failed"), "{}", err.message);
+
+        // The documented recovery: remove the poison, retry, all is well.
+        node.store.delete(&crate::delta::delta_key(&obj, u32::MAX)).await.unwrap();
+        assert_eq!(balance(&node, &obj).await, 100);
+        node.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn racing_takers_converge_without_a_second_transfer() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = boot(dir.path(), 4, ClaimSpec::All, "a").await;
+        let l1 = id_on_worker(1, 4, "left");
+        let l2 = id_on_worker(1, 4, "right");
+        let shared = id_on_worker(2, 4, "shared");
+        exec(&node, &[&l1], &[(&l1, "CREATE TABLE t (n INTEGER)")]).await.unwrap();
+        exec(&node, &[&l2], &[(&l2, "CREATE TABLE t (n INTEGER)")]).await.unwrap();
+        exec(&node, &[&shared], &[(&shared, "CREATE TABLE t (n INTEGER)")]).await.unwrap();
+
+        // Two txns at worker 1 race to take the same object from worker 2.
+        // One take wins; the loser's take chases the NotMine hint, finds
+        // the object already local, and rides the queue like anyone else.
+        let objects_a = [l1.as_str(), shared.as_str()];
+        let ops_a = [
+            (l1.as_str(), "INSERT INTO t (n) VALUES (1)"),
+            (shared.as_str(), "INSERT INTO t (n) VALUES (1)"),
+        ];
+        let objects_b = [l2.as_str(), shared.as_str()];
+        let ops_b = [
+            (l2.as_str(), "INSERT INTO t (n) VALUES (1)"),
+            (shared.as_str(), "INSERT INTO t (n) VALUES (1)"),
+        ];
+        let (ra, rb) = tokio::join!(
+            exec(&node, &objects_a, &ops_a),
+            exec(&node, &objects_b, &ops_b),
+        );
+        ra.unwrap();
+        rb.unwrap();
+
+        let res = exec(&node, &[&shared], &[(&shared, "SELECT COUNT(*) AS c FROM t")])
+            .await
+            .unwrap();
+        let v = serde_json::to_value(&res.results).unwrap();
+        assert_eq!(v[0]["rows"][0]["c"], 2, "both racers committed exactly once");
+        node.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn takes_and_returns_survive_a_dead_peer() {
+        let dir = tempfile::tempdir().unwrap();
+        let store: Arc<dyn BlobStore> = Arc::new(SlowStore(
+            FsBlobStore::new(dir.path().join("blobs")).unwrap(),
+            std::time::Duration::from_millis(300),
+        ));
+        let node_a = start(NodeConfig {
+            store: store.clone(),
+            live_dir: dir.path().join("live-a"),
+            logical: 4,
+            claim: ClaimSpec::Workers(vec![0, 1]),
+            bind: "127.0.0.1:0".into(),
+            advertise: None,
+            hysteresis: 3,
+            secret: "test".into(),
+            api_token: None,
+            max_unshipped: DEFAULT_MAX_UNSHIPPED,
+            limits: crate::limits::Limits::detect(),
+            fence_ttl: std::time::Duration::from_secs(60),
+        })
+        .await
+        .unwrap();
+        let node_b = start(NodeConfig {
+            store,
+            live_dir: dir.path().join("live-b"),
+            logical: 4,
+            claim: ClaimSpec::Workers(vec![2, 3]),
+            bind: "127.0.0.1:0".into(),
+            advertise: None,
+            hysteresis: 3,
+            secret: "test".into(),
+            api_token: None,
+            max_unshipped: DEFAULT_MAX_UNSHIPPED,
+            limits: crate::limits::Limits::detect(),
+            fence_ttl: std::time::Duration::from_secs(60),
+        })
+        .await
+        .unwrap();
+
+        let a1 = id_on_worker(1, 4, "pa");
+        let a2 = id_on_worker(1, 4, "pb");
+        let b1 = id_on_worker(2, 4, "pc");
+        make_account(&node_a, &a1).await;
+        make_account(&node_a, &a2).await;
+        make_account(&node_b, &b1).await;
+        for _ in 0..5 {
+            exec(&node_b, &[&b1], &[(&b1, "UPDATE account SET balance = balance + 0")])
+                .await
+                .unwrap();
+        }
+
+        // Drag b1 to node A (a live cross-node take), then kill B while
+        // A's boat is still in flight — the hysteresis return that follows
+        // has nowhere to go. The object is orphaned, not corrupted.
+        exec(
+            &node_a,
+            &[&a1, &a2, &b1],
+            &[(&b1, "UPDATE account SET balance = balance + 1")],
+        )
+        .await
+        .unwrap();
+        node_b.shutdown().await;
+        tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+
+        // A fresh take toward the dead node's worker: the cached address
+        // fails, the lease re-read finds a tombstone, and the txn reports
+        // acquisition failure instead of hanging.
+        let cold = id_on_worker(3, 4, "cold");
+        let err = exec(
+            &node_a,
+            &[&a1, &cold],
+            &[(&a1, "UPDATE account SET balance = balance + 0")],
+        )
+        .await
+        .unwrap_err();
+        assert!(err.message.contains("acquisition failed"), "{}", err.message);
+        node_a.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn three_quick_visits_earn_a_rehome() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = boot_hyst(dir.path(), 4, ClaimSpec::All, "a", 3).await;
+        let anchor1 = id_on_worker(2, 4, "anch");
+        let anchor2 = id_on_worker(2, 4, "anchb");
+        let commuter = id_on_worker(1, 4, "commuter");
+        make_account(&node, &anchor1).await;
+        make_account(&node, &anchor2).await;
+        make_account(&node, &commuter).await;
+        // Build tenure so every displacement reads as "settled elsewhere".
+        for _ in 0..5 {
+            exec(&node, &[&commuter], &[(&commuter, "UPDATE account SET balance = balance + 0")])
+                .await
+                .unwrap();
+        }
+
+        // Drag the commuter to worker 2 three times inside the visit
+        // window. Visits 1 and 2 bounce home; visit 3 moves it in.
+        for visit in 1..=3 {
+            exec(
+                &node,
+                &[&anchor1, &anchor2, &commuter],
+                &[(&commuter, "UPDATE account SET balance = balance + 1")],
+            )
+            .await
+            .unwrap();
+            if visit < 3 {
+                let mut returned = false;
+                for _ in 0..250 {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    if node.routing.read().unwrap().owner_of(&commuter) == 1 {
+                        returned = true;
+                        break;
+                    }
+                }
+                assert!(returned, "visit {visit} should bounce home");
+                // Rebuild tenure at home: only a SETTLED object's next
+                // displacement counts as a fresh visit.
+                for _ in 0..4 {
+                    exec(
+                        &node,
+                        &[&commuter],
+                        &[(&commuter, "UPDATE account SET balance = balance + 0")],
+                    )
+                    .await
+                    .unwrap();
+                }
+            }
+        }
+        // Give any (wrong) return a chance to happen, then check it moved in.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert_eq!(
+            node.routing.read().unwrap().owner_of(&commuter),
+            2,
+            "third visit inside the window rehomes the object"
+        );
+        assert_eq!(balance(&node, &commuter).await, 103);
+        node.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_fenced_node_refuses_the_commit_point() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = boot(dir.path(), 4, ClaimSpec::All, "a").await;
+        let obj = id_on_worker(1, 4, "fenceme");
+        make_account(&node, &obj).await;
+
+        // The lease guard flips this when a lease is superseded; the commit
+        // gate is the last line of defense even with fresh recency stamps.
+        node.fenced.store(true, Ordering::SeqCst);
+        let err = exec(&node, &[&obj], &[(&obj, "UPDATE account SET balance = 0")])
+            .await
+            .unwrap_err();
+        assert!(err.message.contains("fenced"), "{}", err.message);
+    }
+
+    #[tokio::test]
+    async fn takes_queue_fairly_behind_unshipped_boats() {
+        let dir = tempfile::tempdir().unwrap();
+        let store: Arc<dyn BlobStore> = Arc::new(SlowStore(
+            FsBlobStore::new(dir.path().join("blobs")).unwrap(),
+            std::time::Duration::from_millis(200),
+        ));
+        let node = boot_with_store(dir.path(), store, 4).await;
+        let obj = id_on_worker(1, 4, "contested");
+        exec(&node, &[&obj], &[(&obj, "CREATE TABLE t (n INTEGER)")]).await.unwrap();
+
+        // Dirty the object; its boat is now in flight for ~200ms.
+        exec_mode(&node, &[&obj], &[(&obj, "INSERT INTO t (n) VALUES (1)")], true)
+            .await
+            .unwrap();
+
+        // Two takes and a txn pile up behind the unshipped state, FIFO.
+        let w1 = local_sender(&node, 1).unwrap();
+        let (t1_tx, t1_rx) = oneshot::channel();
+        w1.send(WorkerMsg::Take { object: obj.clone(), taker: 2, resp: t1_tx }).unwrap();
+        let (t2_tx, t2_rx) = oneshot::channel();
+        w1.send(WorkerMsg::Take { object: obj.clone(), taker: 3, resp: t2_tx }).unwrap();
+        let n2 = node.clone();
+        let o2 = obj.clone();
+        let txn = tokio::spawn(async move {
+            exec(&n2, &[&o2], &[(&o2, "INSERT INTO t (n) VALUES (2)")]).await
+        });
+
+        // Boat lands: the first take wins, the second is bounced to the new
+        // owner, and the queued txn chases the object and still commits.
+        let meta = t1_rx.await.unwrap().unwrap();
+        assert_eq!(meta.home, 1, "first visit away from home");
+        match t2_rx.await.unwrap().unwrap_err() {
+            TakeError::NotMine { hint } => assert_eq!(hint, Some(2), "bounced to the winner"),
+            other => panic!("expected NotMine, got {other:?}"),
+        }
+        txn.await.unwrap().unwrap();
+
+        // A late take to the old owner gets the message-level NotMine.
+        let (t3_tx, t3_rx) = oneshot::channel();
+        let owner_now = node.routing.read().unwrap().owner_of(&obj);
+        let old = if owner_now == 1 { 2 } else { 1 };
+        local_sender(&node, old)
+            .unwrap()
+            .send(WorkerMsg::Take { object: obj.clone(), taker: 3, resp: t3_tx })
+            .unwrap();
+        assert!(matches!(t3_rx.await.unwrap(), Err(TakeError::NotMine { .. })));
+
+        let res = exec(&node, &[&obj], &[(&obj, "SELECT COUNT(*) AS c FROM t")]).await.unwrap();
+        let v = serde_json::to_value(&res.results).unwrap();
+        assert_eq!(v[0]["rows"][0]["c"], 2, "no write was lost in the shuffle");
+        node.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn the_byte_cap_defers_whole_components_to_the_next_boat() {
+        let dir = tempfile::tempdir().unwrap();
+        let store: Arc<dyn BlobStore> = Arc::new(SlowStore(
+            FsBlobStore::new(dir.path().join("blobs")).unwrap(),
+            std::time::Duration::from_millis(150),
+        ));
+        let mut limits = crate::limits::Limits::derive(4 << 30, 8 << 30);
+        limits.max_boat_bytes = 1; // every component alone busts the cap
+        let node = start(NodeConfig {
+            store,
+            live_dir: dir.path().join("live"),
+            logical: 4,
+            claim: ClaimSpec::All,
+            bind: "127.0.0.1:0".into(),
+            advertise: None,
+            hysteresis: 200,
+            secret: "test".into(),
+            api_token: None,
+            max_unshipped: DEFAULT_MAX_UNSHIPPED,
+            limits,
+            fence_ttl: std::time::Duration::from_secs(60),
+        })
+        .await
+        .unwrap();
+        let a = id_on_worker(2, 4, "defa");
+        let b = id_on_worker(2, 4, "defb");
+        let c = id_on_worker(2, 4, "defc");
+        for id in [&a, &b, &c] {
+            exec(&node, &[id], &[(id, "CREATE TABLE t (n INTEGER)")]).await.unwrap();
+        }
+
+        // One optimistic write launches a boat; while it flies (150ms), two
+        // MORE independent writes accumulate. The next maybe_launch sees two
+        // components against a 1-byte cap: it must take one and defer the
+        // other whole, never splitting or dropping either.
+        exec_mode(&node, &[&a], &[(&a, "INSERT INTO t (n) VALUES (1)")], true).await.unwrap();
+        let objects_b = [b.as_str()];
+        let ops_b = [(b.as_str(), "INSERT INTO t (n) VALUES (1)")];
+        let objects_c = [c.as_str()];
+        let ops_c = [(c.as_str(), "INSERT INTO t (n) VALUES (1)")];
+        let (rb, rc) = tokio::join!(
+            exec_mode(&node, &objects_b, &ops_b, true),
+            exec_mode(&node, &objects_c, &ops_c, true),
+        );
+        rb.unwrap();
+        rc.unwrap();
+        // A pessimistic barrier: acked only once everything before it landed.
+        exec(&node, &[&a], &[(&a, "INSERT INTO t (n) VALUES (2)")]).await.unwrap();
+        node.shutdown().await;
+
+        let node2 = boot(dir.path(), 4, ClaimSpec::All, "b").await;
+        for (id, expect) in [(&a, 2), (&b, 1), (&c, 1)] {
+            let res = exec(&node2, &[id], &[(id, "SELECT COUNT(*) AS c FROM t")]).await.unwrap();
+            let v = serde_json::to_value(&res.results).unwrap();
+            assert_eq!(v[0]["rows"][0]["c"], expect, "{id} durable");
+        }
+        node2.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_vanished_live_file_reverts_instead_of_shipping_garbage() {
+        let dir = tempfile::tempdir().unwrap();
+        let store: Arc<dyn BlobStore> = Arc::new(SlowStore(
+            FsBlobStore::new(dir.path().join("blobs")).unwrap(),
+            std::time::Duration::from_millis(200),
+        ));
+        let node = boot_with_store(dir.path(), store, 4).await;
+        let a = id_on_worker(1, 4, "solid");
+        let b = id_on_worker(1, 4, "doomed");
+        exec(&node, &[&a], &[(&a, "CREATE TABLE t (n INTEGER)")]).await.unwrap();
+        exec(&node, &[&b], &[(&b, "CREATE TABLE t (n INTEGER)")]).await.unwrap();
+
+        // Boat 1 in flight for `a`; a pessimistic write to `b` becomes
+        // pending. Sabotage b's live file before its boat can snapshot it.
+        exec_mode(&node, &[&a], &[(&a, "INSERT INTO t (n) VALUES (1)")], true).await.unwrap();
+        let n2 = node.clone();
+        let b2 = b.clone();
+        let pending = tokio::spawn(async move {
+            exec(&n2, &[&b2], &[(&b2, "INSERT INTO t (n) VALUES (1)")]).await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        std::fs::remove_file(node.live_dir.join("w1").join(format!("{b}.db"))).unwrap();
+
+        let err = pending.await.unwrap().unwrap_err();
+        assert!(err.message.contains("snapshot failed"), "{}", err.message);
+        // The object reverted to its durable state and works again.
+        let res = exec(&node, &[&b], &[(&b, "SELECT COUNT(*) AS c FROM t")]).await.unwrap();
+        let v = serde_json::to_value(&res.results).unwrap();
+        assert_eq!(v[0]["rows"][0]["c"], 0, "reverted to the empty durable table");
+        node.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_sinking_boat_fails_the_writes_that_followed_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let flaky = Arc::new(FlakyStore(
+            FsBlobStore::new(dir.path().join("blobs")).unwrap(),
+            std::sync::atomic::AtomicBool::new(false),
+        ));
+        // Slow it down so followers reliably pile up behind the doomed boat.
+        struct SlowFlaky(Arc<FlakyStore>, std::time::Duration);
+        #[async_trait::async_trait]
+        impl BlobStore for SlowFlaky {
+            async fn get(&self, key: &str) -> anyhow::Result<Option<Vec<u8>>> {
+                self.0.get(key).await
+            }
+            async fn put(&self, key: &str, bytes: &[u8]) -> anyhow::Result<()> {
+                tokio::time::sleep(self.1).await;
+                self.0.put(key, bytes).await
+            }
+            async fn delete(&self, key: &str) -> anyhow::Result<()> {
+                self.0.delete(key).await
+            }
+            async fn list(&self, prefix: &str) -> anyhow::Result<Vec<String>> {
+                self.0.list(prefix).await
+            }
+            async fn create(&self, key: &str, bytes: &[u8]) -> anyhow::Result<bool> {
+                self.0.create(key, bytes).await
+            }
+            async fn get_range(&self, key: &str, o: u64, l: u64) -> anyhow::Result<Option<Vec<u8>>> {
+                self.0.get_range(key, o, l).await
+            }
+        }
+        let store: Arc<dyn BlobStore> =
+            Arc::new(SlowFlaky(flaky.clone(), std::time::Duration::from_millis(200)));
+        let node = boot_with_store(dir.path(), store, 4).await;
+        let chan = id_on_worker(1, 4, "chan");
+        let bystander = id_on_worker(1, 4, "bystander");
+        make_channel(&node, &chan).await;
+        exec(&node, &[&bystander], &[(&bystander, "CREATE TABLE t (n INTEGER)")]).await.unwrap();
+        // Acks land at the commit record; give the (slow) promotions
+        // behind them time to finish before the store starts failing.
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+        // The doomed boat: an optimistic ack, store now failing.
+        flaky.1.store(true, Ordering::Relaxed);
+
+        // Disk pressure during the outage: unshipped objects are exempt
+        // from shedding (their live file is ahead of the blob store).
+        local_sender(&node, 1).unwrap().send(WorkerMsg::Shed).unwrap();
+
+        // A take granted while the store is down still transfers (the
+        // checkpoint write fails and is logged; placement is a hint).
+        let (ttx, trx) = oneshot::channel();
+        local_sender(&node, 1)
+            .unwrap()
+            .send(WorkerMsg::Take { object: bystander.clone(), taker: 2, resp: ttx })
+            .unwrap();
+        trx.await.unwrap().unwrap();
+        publish(&node, &chan, "doomed", true).await;
+        // A pessimistic follower applies onto state that is about to
+        // un-happen; it must hear "reverted", not hang on a dead reply slot.
+        let n2 = node.clone();
+        let c2 = chan.clone();
+        let follower = tokio::spawn(async move {
+            exec(&n2, &[&c2], &[(&c2, "INSERT INTO msgs (body) VALUES ('follower')")]).await
+        });
+        let err = follower.await.unwrap().unwrap_err();
+        assert!(
+            err.message.contains("reverted") || err.message.contains("commit failed"),
+            "{}",
+            err.message
+        );
+
+        flaky.1.store(false, Ordering::Relaxed);
+        let res = exec(&node, &[&chan], &[(&chan, "SELECT COUNT(*) AS c FROM msgs")]).await.unwrap();
+        let v = serde_json::to_value(&res.results).unwrap();
+        assert_eq!(v[0]["rows"][0]["c"], 0, "both writes un-happened together");
+        node.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn shutdown_fails_parked_polls_so_clients_repoll_elsewhere() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = boot(dir.path(), 4, ClaimSpec::All, "a").await;
+        let chan = id_on_worker(1, 4, "chan");
+        make_channel(&node, &chan).await;
+        let n2 = node.clone();
+        let c2 = chan.clone();
+        let parked = tokio::spawn(async move {
+            poll_q(&n2, &c2, "SELECT * FROM msgs WHERE id > 99", vec![], false, None).await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        node.shutdown().await;
+        let err = parked.await.unwrap().unwrap_err();
+        assert!(err.message.contains("shutting down"), "{}", err.message);
+    }
+
+    #[tokio::test]
+    async fn a_deferred_constraint_fails_at_commit_and_poisons_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let store: Arc<dyn BlobStore> = Arc::new(SlowStore(
+            FsBlobStore::new(dir.path().join("blobs")).unwrap(),
+            std::time::Duration::from_millis(200),
+        ));
+        let node = boot_with_store(dir.path(), store, 4).await;
+        let obj = id_on_worker(1, 4, "fk");
+        // A DEFERRED constraint is checked only at COMMIT: the failure
+        // arrives after every op succeeded, on the commit path itself.
+        exec(
+            &node,
+            &[&obj],
+            &[
+                (&obj, "CREATE TABLE parent (id INTEGER PRIMARY KEY)"),
+                (
+                    &obj,
+                    "CREATE TABLE child (p INTEGER REFERENCES parent(id) \
+                     DEFERRABLE INITIALLY DEFERRED)",
+                ),
+            ],
+        )
+        .await
+        .unwrap();
+
+        // Let the schema boat finish promoting before anything fails, so
+        // "revert to durable" reverts to a state WITH the tables.
+        tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+
+        // An acked-optimistic parent sits alongside when the poisoned txn
+        // arrives. COMMIT refuses the deferred constraint; a plain
+        // ROLLBACK erases exactly the poisoned txn — the parent survives.
+        exec_mode(&node, &[&obj], &[(&obj, "INSERT INTO parent (id) VALUES (1)")], true)
+            .await
+            .unwrap();
+        let err = exec(
+            &node,
+            &[&obj],
+            // The parent for 999 never arrives; COMMIT is where SQLite notices.
+            &[(&obj, "INSERT INTO child (p) VALUES (999)")],
+        )
+        .await
+        .unwrap_err();
+        assert!(err.message.contains("local commit failed"), "{}", err.message);
+        let res = exec(
+            &node,
+            &[&obj],
+            &[
+                (&obj, "SELECT COUNT(*) AS c FROM child"),
+                (&obj, "SELECT COUNT(*) AS c FROM parent"),
+            ],
+        )
+        .await
+        .unwrap();
+        let v = serde_json::to_value(&res.results).unwrap();
+        assert_eq!(v[0]["rows"][0]["c"], 0, "the poisoned insert un-happened");
+        assert_eq!(v[1]["rows"][0]["c"], 1, "the acked parent survived the rollback");
+
+        // Cross-object: the first participant COMMITS before the second's
+        // deferred constraint fires. It cannot be uncommitted, so it
+        // reverts to durable state — the txn vanishes atomically from both,
+        // taking any unshipped optimistic writes on it along (the sunk-boat
+        // contract). ("early" sorts before "fk"; commits run sorted.)
+        let other = id_on_worker(1, 4, "early");
+        exec(&node, &[&other], &[(&other, "CREATE TABLE log (n INTEGER)")]).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(700)).await; // promotion lands
+        // Two optimistic writes: the first launches a boat, the second is
+        // still DIRTY when the poison lands — its accounting must clear.
+        exec_mode(&node, &[&other], &[(&other, "INSERT INTO log (n) VALUES (7)")], true)
+            .await
+            .unwrap();
+        exec_mode(&node, &[&other], &[(&other, "INSERT INTO log (n) VALUES (7)")], true)
+            .await
+            .unwrap();
+        let err = exec(
+            &node,
+            &[&other, &obj],
+            &[
+                (&other, "INSERT INTO log (n) VALUES (99)"),
+                (&obj, "INSERT INTO child (p) VALUES (999)"),
+            ],
+        )
+        .await
+        .unwrap_err();
+        assert!(err.message.contains("local commit failed"), "{}", err.message);
+        let res = exec(
+            &node,
+            &[&other],
+            &[(&other, "SELECT COUNT(*) AS c FROM log WHERE n = 99")],
+        )
+        .await
+        .unwrap();
+        let v = serde_json::to_value(&res.results).unwrap();
+        assert_eq!(v[0]["rows"][0]["c"], 0, "the committed half reverted with the txn");
+        node.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn big_boats_stage_and_clean_up_when_the_commit_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let flaky = Arc::new(FlakyStore(
+            FsBlobStore::new(dir.path().join("blobs")).unwrap(),
+            std::sync::atomic::AtomicBool::new(false),
+        ));
+        let store: Arc<dyn BlobStore> = flaky.clone();
+        let node = boot_with_store(dir.path(), store, 4).await;
+        let big = id_on_worker(1, 4, "bigfail");
+        exec(&node, &[&big], &[(&big, "CREATE TABLE docs (body TEXT)")]).await.unwrap();
+
+        // >96 KB of payload forces the staged (non-inline) commit path;
+        // with every put failing, staging must be attempted AND swept.
+        flaky.1.store(true, Ordering::Relaxed);
+        let blob = "x".repeat(200_000);
+        let err = submit(
+            &node,
+            vec![big.clone()],
+            vec![Op {
+                object: big.clone(),
+                sql: "INSERT INTO docs (body) VALUES (?1)".into(),
+                params: vec![serde_json::json!(blob)],
+            }],
+            false,
+            false,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.message.contains("commit failed"), "{}", err.message);
+
+        flaky.1.store(false, Ordering::Relaxed);
+        assert!(
+            node.store.list("staging/").await.unwrap().is_empty(),
+            "failed boats must not leak staging blobs"
+        );
+        node.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn dropping_a_table_under_a_parked_poll_reports_the_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = boot(dir.path(), 4, ClaimSpec::All, "a").await;
+        let chan = id_on_worker(1, 4, "chan");
+        make_channel(&node, &chan).await;
+
+        let n2 = node.clone();
+        let c2 = chan.clone();
+        let parked = tokio::spawn(async move {
+            poll_q(&n2, &c2, "SELECT * FROM msgs WHERE id > 99", vec![], false, None).await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // The schema changes under the query: the poll can never run again,
+        // so it must error out rather than park forever.
+        exec(&node, &[&chan], &[(&chan, "DROP TABLE msgs")]).await.unwrap();
+        let err = parked.await.unwrap().unwrap_err();
+        assert!(err.message.contains("msgs"), "names the vanished table: {}", err.message);
+        node.shutdown().await;
     }
 
     // ================================================================ polls

@@ -387,6 +387,8 @@ Reading the signs:
 ```sh
 cargo test                       # full suite: atomicity, serializability,
                                  # cross-node RPC, crash recovery, SigV4
+cargo llvm-cov --lib             # line coverage (held at ~98.5%; the rest
+                                 # is defensive arms and benign races)
 ./cluster.sh                     # 4 processes -> kill -9 -> resume as 2
 cargo run --release --bin anneal # watch placement learning converge
 ```

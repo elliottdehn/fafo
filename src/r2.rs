@@ -492,6 +492,245 @@ mod tests {
         assert!(extract_tags("", "Key").is_empty());
     }
 
+    // -------------------------------------------------------- fake S3 end
+    //
+    // A minimal in-process S3: enough of the dialect (statuses, Range,
+    // If-None-Match, ListObjectsV2 pagination) to drive every path of the
+    // client — including the ones only a misbehaving server can reach.
+
+    use axum::extract::State as AxState;
+    use axum::http::{HeaderMap, StatusCode as AxStatus};
+    use std::collections::BTreeMap;
+    use std::sync::Mutex as StdMutex;
+    use std::sync::atomic::{AtomicBool, AtomicU16, AtomicUsize, Ordering};
+
+    #[derive(Default)]
+    struct FakeS3 {
+        blobs: StdMutex<BTreeMap<String, Vec<u8>>>,
+        /// Respond with this status for the next N requests (fault injection).
+        fail_status: AtomicU16,
+        fail_remaining: AtomicUsize,
+        saw_sigv4: AtomicBool,
+    }
+
+    impl FakeS3 {
+        fn fail_next(&self, status: u16, times: usize) {
+            self.fail_status.store(status, Ordering::SeqCst);
+            self.fail_remaining.store(times, Ordering::SeqCst);
+        }
+
+        fn injected(&self) -> Option<AxStatus> {
+            if self
+                .fail_remaining
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                .is_ok()
+            {
+                return AxStatus::from_u16(self.fail_status.load(Ordering::SeqCst)).ok();
+            }
+            None
+        }
+
+        fn note_headers(&self, headers: &HeaderMap) {
+            let signed = headers
+                .get("authorization")
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(|a| a.starts_with("AWS4-HMAC-SHA256 Credential=key/"))
+                && headers.contains_key("x-amz-date")
+                && headers.contains_key("x-amz-content-sha256");
+            if signed {
+                self.saw_sigv4.store(true, Ordering::SeqCst);
+            }
+        }
+    }
+
+    async fn serve_fake_s3(state: Arc<FakeS3>) -> String {
+        use axum::routing::get;
+        async fn object(
+            AxState(s): AxState<Arc<FakeS3>>,
+            method: axum::http::Method,
+            axum::extract::Path(key): axum::extract::Path<String>,
+            headers: HeaderMap,
+            body: axum::body::Bytes,
+        ) -> (AxStatus, Vec<u8>) {
+            s.note_headers(&headers);
+            if let Some(status) = s.injected() {
+                return (status, b"injected".to_vec());
+            }
+            let mut blobs = s.blobs.lock().unwrap();
+            match method.as_str() {
+                "PUT" => {
+                    if headers.get("if-none-match").is_some_and(|v| v == "*")
+                        && blobs.contains_key(&key)
+                    {
+                        return (AxStatus::PRECONDITION_FAILED, Vec::new());
+                    }
+                    blobs.insert(key, body.to_vec());
+                    (AxStatus::OK, Vec::new())
+                }
+                "DELETE" => match blobs.remove(&key) {
+                    Some(_) => (AxStatus::NO_CONTENT, Vec::new()),
+                    None => (AxStatus::NOT_FOUND, Vec::new()),
+                },
+                _ => {
+                    let Some(bytes) = blobs.get(&key) else {
+                        return (AxStatus::NOT_FOUND, Vec::new());
+                    };
+                    match headers.get("range").and_then(|v| v.to_str().ok()) {
+                        Some(spec) => {
+                            let (a, b) = spec
+                                .strip_prefix("bytes=")
+                                .and_then(|r| r.split_once('-'))
+                                .unwrap();
+                            let (a, b): (usize, usize) = (a.parse().unwrap(), b.parse().unwrap());
+                            if a >= bytes.len() {
+                                return (AxStatus::RANGE_NOT_SATISFIABLE, Vec::new());
+                            }
+                            let end = (b + 1).min(bytes.len());
+                            (AxStatus::PARTIAL_CONTENT, bytes[a..end].to_vec())
+                        }
+                        None => (AxStatus::OK, bytes.clone()),
+                    }
+                }
+            }
+        }
+
+        async fn list(
+            AxState(s): AxState<Arc<FakeS3>>,
+            axum::extract::RawQuery(query): axum::extract::RawQuery,
+            headers: HeaderMap,
+        ) -> (AxStatus, String) {
+            s.note_headers(&headers);
+            if let Some(status) = s.injected() {
+                return (status, "injected".into());
+            }
+            let query = query.unwrap_or_default();
+            let param = |name: &str| {
+                query.split('&').find_map(|kv| {
+                    kv.strip_prefix(&format!("{name}="))
+                        .map(|v| v.replace("%2F", "/"))
+                })
+            };
+            let prefix = param("prefix").unwrap_or_default();
+            let after = param("continuation-token").unwrap_or_default();
+            let blobs = s.blobs.lock().unwrap();
+            let matching: Vec<&String> = blobs
+                .keys()
+                .filter(|k| k.starts_with(&prefix) && **k > after)
+                .collect();
+            let page = &matching[..matching.len().min(2)]; // tiny pages force pagination
+            let truncated = matching.len() > page.len();
+            let mut xml = String::from("<ListBucketResult>");
+            for key in page {
+                xml.push_str(&format!("<Contents><Key>{key}</Key></Contents>"));
+            }
+            xml.push_str(&format!("<IsTruncated>{truncated}</IsTruncated>"));
+            if truncated {
+                xml.push_str(&format!(
+                    "<NextContinuationToken>{}</NextContinuationToken>",
+                    page.last().unwrap()
+                ));
+            }
+            xml.push_str("</ListBucketResult>");
+            (AxStatus::OK, xml)
+        }
+
+        let app = axum::Router::new()
+            .route("/bucket", get(list))
+            .route("/bucket/{*key}", axum::routing::any(object))
+            .with_state(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        format!("http://{addr}")
+    }
+
+    async fn fake_store() -> (Arc<FakeS3>, R2BlobStore) {
+        let state = Arc::<FakeS3>::default();
+        let endpoint = serve_fake_s3(state.clone()).await;
+        (state, R2BlobStore::new(endpoint, "bucket", "key", "secret").unwrap())
+    }
+
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn r2_store_speaks_s3_end_to_end() {
+        let (s3, store) = fake_store().await;
+
+        // put / get / delete, with SigV4 on the wire.
+        assert_eq!(store.get("objects/a.db").await.unwrap(), None);
+        store.put("objects/a.db", b"alpha").await.unwrap();
+        assert_eq!(store.get("objects/a.db").await.unwrap().unwrap(), b"alpha");
+        assert!(s3.saw_sigv4.load(Ordering::SeqCst), "requests must be signed");
+        store.delete("objects/a.db").await.unwrap();
+        store.delete("objects/a.db").await.unwrap(); // 404 is fine
+        assert_eq!(store.get("objects/a.db").await.unwrap(), None);
+
+        // create-if-absent: 200 then 412.
+        assert!(store.create("lease", b"one").await.unwrap());
+        assert!(!store.create("lease", b"two").await.unwrap());
+        assert_eq!(store.get("lease").await.unwrap().unwrap(), b"one");
+
+        // Ranged reads: inside, spanning EOF, past EOF (416 -> empty).
+        store.put("f", b"0123456789").await.unwrap();
+        assert_eq!(store.get_range("f", 2, 4).await.unwrap().unwrap(), b"2345");
+        assert_eq!(store.get_range("f", 8, 100).await.unwrap().unwrap(), b"89");
+        assert_eq!(store.get_range("f", 50, 4).await.unwrap().unwrap(), b"");
+        assert_eq!(store.get_range("missing", 0, 4).await.unwrap(), None);
+
+        // Listing paginates through continuation tokens (page size 2).
+        for i in 0..5 {
+            store.put(&format!("objects/k{i}"), b"x").await.unwrap();
+        }
+        let keys = store.list("objects/k").await.unwrap();
+        assert_eq!(keys.len(), 5, "all pages collected: {keys:?}");
+        assert!(store.list("nomatch/").await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn r2_store_retries_5xx_and_reports_hard_errors() {
+        let (s3, store) = fake_store().await;
+        store.put("k", b"v").await.unwrap();
+
+        // One 500 before each op: every path must retry to success.
+        s3.fail_next(500, 1);
+        assert_eq!(store.get("k").await.unwrap().unwrap(), b"v");
+        s3.fail_next(503, 1);
+        store.put("k2", b"v2").await.unwrap();
+        s3.fail_next(500, 1);
+        store.delete("k2").await.unwrap();
+        s3.fail_next(500, 1);
+        assert!(!store.list("k").await.unwrap().is_empty());
+        s3.fail_next(500, 1);
+        assert_eq!(store.get_range("k", 0, 1).await.unwrap().unwrap(), b"v");
+        s3.fail_next(500, 1);
+        assert!(store.create("fresh", b"x").await.unwrap());
+
+        // Persistent client errors surface with the status in the message.
+        for (op, expect) in [("GET", "403"), ("PUT", "403")] {
+            s3.fail_next(403, RETRIES);
+            let err = match op {
+                "GET" => store.get("k").await.unwrap_err(),
+                _ => store.put("k", b"v").await.unwrap_err(),
+            };
+            assert!(err.to_string().contains(expect), "{op}: {err}");
+        }
+        s3.fail_next(403, RETRIES);
+        assert!(store.delete("k").await.is_err());
+        s3.fail_next(403, RETRIES);
+        assert!(store.list("k").await.is_err());
+        s3.fail_next(403, RETRIES);
+        assert!(store.get_range("k", 0, 1).await.is_err());
+        s3.fail_next(403, RETRIES);
+        assert!(store.create("k9", b"x").await.is_err());
+    }
+
+    #[test]
+    fn endpoint_must_carry_a_scheme() {
+        assert!(R2BlobStore::new("acct.r2.example.com", "b", "k", "s").is_err());
+    }
+
     #[tokio::test]
     async fn retries_stop_at_first_success_and_give_up_after_three() {
         use std::sync::atomic::{AtomicUsize, Ordering};
