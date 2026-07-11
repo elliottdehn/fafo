@@ -1,11 +1,14 @@
 # bugs.md — the ledger of found bugs
 
-Every entry below was found by `dst` — deterministic simulation testing
-(`cargo run --bin dst -- run --seed N`): a whole cluster in one thread on
-virtual time, with seeded fault injection (crashes, partitions, delayed and
-lost RPC, failing storage) and oracles that check conservation of money,
-transfer atomicity, and liveness after every phase. A crash IS a repro: the
-seed replays it bit for bit.
+Every *numbered* entry below was found by `dst` — deterministic simulation
+testing (`cargo run --bin dst -- run --seed N`): a whole cluster in one
+thread on virtual time, with seeded fault injection (crashes, partitions,
+delayed and lost RPC, failing storage) and oracles that check conservation
+of money, transfer atomicity, and liveness after every phase. A crash IS a
+repro: the seed replays it bit for bit. (The lettered T-series near the end
+is a separate lineage: bugs the plain example suite caught before the dice
+campaign began — kept here because a ledger of found bugs should own the
+ones that didn't need the fancy tool.)
 
 Baseline before the campaign: **18 of 50 seeds failing.** After: **0 of 50,
 three consecutive sweeps**, 140/140 example tests green — including with the
@@ -261,6 +264,68 @@ inside the fix that taught it.
 
 > ELI5: The "now serving" bell rings when a shipment arrives — but when a shipment gets cancelled the counter also frees up, and nobody ever rang the bell. **Nastiness: 7/10.**
 
+## Before the dice: what the example suite caught
+
+Not everything needed the simulator. These four surfaced earlier, during
+the coverage push that took the hand-written suite from ~47 tests to 140 —
+each one flushed out by *writing a test and watching it disagree with the
+code*. Lettered, not numbered, because they predate the campaign: the
+counter above is the dice's kill list, and these are the ones the plain
+tests got to first.
+
+**T1. Off-by-a-block at the seams.** `block_of` (worker → lease block) and
+`block_range` (block → worker range) are inverses that must agree on every
+boundary. When the block count doesn't divide the worker space evenly —
+1,000,000 workers over 256 blocks is 3906.25 each — they disagreed at the
+edges: `block_of(3906)` said block 0 while the old floor-division
+`block_range` filed 3906 under block 1. Lease coverage and routing could
+then disagree about who owns a boundary worker. The shipped default
+(4096 / 256) divides evenly, so it never bit in practice — but the
+million-worker config, which the README advertises, would. Found by an
+exhaustive tiling test: every worker must land in exactly one block's
+range, checked across five W/B combos including 1M / 256. Fix:
+`block_range` uses the ceiling form that inverts `block_of` exactly.
+
+> ELI5: The floor plan and the room directory disagreed about which room the closet belonged to — but only in buildings whose floors don't divide evenly, which nobody had built yet. **Nastiness: 6/10.**
+
+**T2. The decode allocation bomb.** `delta::decode` read a 4-byte page
+count out of a blob and handed it straight to `Vec::with_capacity`. A
+corrupt or hostile delta claiming four billion pages aborts the process on
+the allocation, before a single bounds check runs — a one-blob denial of
+service, and the R2 store's contents are not all self-authored. Found by a
+decode-fuzzing test throwing truncated and absurd headers at it. Fix: the
+page count is checked against what the buffer could physically hold before
+anything is allocated.
+
+> ELI5: A form declared "enclosed: 4 billion pages," so the clerk began clearing four billion desks to lay them out — and only *then* would have noticed the envelope was empty. **Nastiness: 6/10.**
+
+**T3. Invariants that weren't.** "Invariants live in SQL" is the product's
+pitch: `CHECK` constraints and foreign keys enforce your business rules
+inside the engine, atomically, across a cross-object transaction. But
+SQLite defaults foreign-key enforcement *off*, and `PRAGMA
+foreign_keys=ON` issued inside a transaction — the only place API ops ever
+run — is a silent no-op. So no client could actually turn it on: every
+foreign key was decoration. Found by writing a deferred-constraint test
+and watching it pass when it should have failed. Fix: `materialize` sets
+`foreign_keys=ON` per connection at activation, the one place the pragma
+takes.
+
+> ELI5: The bank advertised "we enforce your rules," but the rule-checker shipped switched off, and the only switch was inside a room that's locked whenever anyone's working. **Nastiness: 7/10.**
+
+**T4. COMMIT can refuse — caught here first.** A deferred constraint is
+checked only at COMMIT, so a transaction whose every op succeeded can still
+fail *at commit*, after earlier participants already committed. The
+original handler `purge`d every participant on any commit error —
+destroying unrelated already-acked writes on some, leaving torn state on
+others — and a boat sinking between a txn's acquisition and its execution
+could `.expect()`-panic the whole worker. A coverage test that forced a
+deferred FK violation surfaced it; the first fix (ROLLBACK the still-open
+participants, revert the committed prefix) later hardened under the dice
+into bugs **11** and **12** with `revert_closure`. The example suite found
+the hole; the simulator found how deep it went.
+
+> ELI5: On signing day the last signer's pen died — and the first version of the office shredded everyone's folder. The tests caught the shredding; the dice caught the pen dying mid-signature across three different desks. **Nastiness: 7/10.**
+
 ## Lessons, paid for
 
 - **Guards lose to structure.** The twice-spent deed was "fixed" twice
@@ -278,9 +343,15 @@ inside the fix that taught it.
   broke no invariant — money conserved, nothing torn — it just made the
   placement learner permanently inert. Some things only a behavioral test
   (or a benchmark regression) will ever catch.
-- **The oracle beats the example suite ~19-0.** All of these passed 100+
-  hand-written tests. The examples check the paths we imagined; the dice
-  check the paths we didn't.
+- **The oracle beats the example suite, but the suite isn't zero.** Every
+  numbered bug above passed 100+ hand-written tests before the dice found
+  it — the examples check the paths we imagined, the dice check the ones we
+  didn't. But the suite earns its keep on the paths we *can* imagine and
+  simply hadn't exercised: T1–T4 fell to nothing more than writing the
+  missing test and reading its disagreement. Fuzz the decoder, tile the
+  whole worker space, force the constraint that fires late — cheap tests,
+  real bugs, no simulator required. Write those first; spend the dice on
+  what's left.
 - **One seed = one repro** is the entire debugging experience. Every entry
   above went: failing seed → `FAFO_DST_LOG=1` replay → read the object's
   lifecycle → the bug names itself. No bug took longer to *find* than to
