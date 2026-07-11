@@ -10,7 +10,8 @@ seed replays it bit for bit.
 Baseline before the campaign: **18 of 50 seeds failing.** After: **0 of 50,
 three consecutive sweeps**, 140/140 example tests green — including with the
 will oracle live (bug 22), the specific bug the harness was built to catch.
-All of these survived the ~100-test example suite; none survived the dice.
+The endless miner (`dst mine`) then found one more in ~1,500 fresh seeds
+(bug 23). All of these survived the example suite; none survived the dice.
 
 Format: what the oracle saw → what was actually wrong → the fix — plus an
 ELI5 and a nastiness score (severity × subtlety × blast radius; 10 means
@@ -243,6 +244,19 @@ reproduces the original loss, persistence on satisfies the oracle.
 > ELI5: You left a note with the doorman — "if I don't come back, water my plants." Then the whole building burned down, doorman and note with it, and your plants died. Now the note is filed at city hall with a timer; when your check-ins stop, the next building over waters the plants. **Nastiness: 9/10.**
 
 ---
+
+**23. The orphaned queue** *(found by `dst mine`: 3 crashes in ~1,500
+endless seeds, one root cause — living inside fix #10).* Takes wait at an
+object's queue head while its state is unshipped, and queues get
+re-serviced when the boat lands. But `revert_closure` can make an object
+clean by *reverting* — beyond the sinking boat's own object list — and
+nothing re-serviced those queues: the take slept forever, with a growing
+line of transactions starving behind it. Fix: reverts flag their objects'
+queues and `pump()` — the funnel every mutation path exits through —
+drains the flags. "Every fix ships with a new failure mode," shipping
+inside the fix that taught it.
+
+> ELI5: The "now serving" bell rings when a shipment arrives — but when a shipment gets cancelled the counter also frees up, and nobody ever rang the bell. **Nastiness: 7/10.**
 
 ## Lessons, paid for
 

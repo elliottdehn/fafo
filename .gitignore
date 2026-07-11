@@ -8,3 +8,4 @@ deploy/.wrangler/
 deploy/node_modules/
 deploy/.secrets
 deploy/.r2-creds
+crashes/
