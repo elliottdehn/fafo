@@ -11,7 +11,9 @@ Baseline before the campaign: **18 of 50 seeds failing.** After: **0 of 50,
 three consecutive sweeps**, 137/137 example tests green. All of these
 survived the ~100-test example suite; none survived the dice.
 
-Format: what the oracle saw → what was actually wrong → the fix.
+Format: what the oracle saw → what was actually wrong → the fix — plus an
+ELI5 and a nastiness score (severity × subtlety × blast radius; 10 means
+"silently forks customer data and no test on earth was going to catch it").
 
 ---
 
@@ -29,15 +31,21 @@ checkpoint no-oped (the object wasn't in `owned`), so the giver's old claim
 survived to be resurrected at the next boot. Fix: grants consult the
 durable ownership ledger (checkpoints), never hints.
 
+> ELI5: The doorman was handing out apartment keys based on an old sticky note instead of checking the deed registry. **Nastiness: 8/10.**
+
 **2. Hint poisoning.** `NotMine { hint }` replies were written into the
 global routing map. A stale hint recorded there convinced a giver mid-adopt
 that the object was "already local" — resurrecting ownership it had just
 released. Fix: hints steer the requesting chase privately; only real
 handshakes (grant, adopt, release) move routing.
 
+> ELI5: Someone wrote overheard gossip straight into the official phone book, and everyone dialed it. **Nastiness: 7/10.**
+
 **3. The self-lie.** A routing exception claiming *we* own an object the
 durable ledger says we don't: serving it is bug 1, chasing it is an
 AlreadyLocal livelock. Fix: `advance()` drops the lie on sight.
+
+> ELI5: Your own address book says you live in a house you sold; acting on it either squats the house or mails letters to yourself forever. **Nastiness: 5/10.**
 
 **4. Renounce-then-fail.** `checkpoint()` logged write failures and carried
 on — so a transfer could "durably renounce" without durability. A restart
@@ -46,11 +54,15 @@ release that cannot write its remove-side checkpoint **aborts the
 transfer**; the takers get a retryable refusal and the object stays put.
 Corollary: takes are refused during storage outages, by design.
 
+> ELI5: You "sold" your car but the DMV paperwork bounced — and months later both of you were driving it. **Nastiness: 8/10.**
+
 **5. The invisible gap.** Between the giver's renounce and the receiver's
 add-side checkpoint, the object looked durably unclaimed — and the
 hash-default fallback would manufacture a second owner. Fix: **transit
 markers** — the giver's checkpoint durably records `object -> destination`,
 so mid-handoff is a visible state.
+
+> ELI5: While a package is between houses, nobody officially owns it — and the city, seeing an ownerless address, helpfully builds a second package. **Nastiness: 7/10.**
 
 **6. The twice-spent deed** — the boss bug, and the reason generations
 exist. One renunciation (a transit marker) could be consumed twice: once by
@@ -67,10 +79,14 @@ different door. Two rounds of guards failed before the structural fix:
 > the highest generation. Staleness everywhere becomes an integer compare.
 > One renunciation, one spend.
 
+> ELI5: One "I'm giving up the house" note got photocopied into two keys, and both keyholders redecorated. Generations put a serial number on the note. **Nastiness: 10/10.**
+
 **7. Arbitrary dual-claim resolution.** Boot found an object in two
 checkpoints and kept... the lower worker id. Deterministic, and wrong half
 the time — resurrecting the stale claim with full confidence. Fix: highest
 generation wins (it is definitionally the later handoff).
+
+> ELI5: Two people claim one house; the judge rules for whoever's name sorts first alphabetically. Confidently. Every time. **Nastiness: 6/10.**
 
 **8. Blind reclaim on failed returns.** A hysteresis return whose RPC
 failed was reclaimed at the giver — but "failed" includes "the ACK was
@@ -80,11 +96,15 @@ generations: no blind reclaim; the object rests in transit and heals at the
 home on next access. Correctness never leaves; liveness resumes with the
 next touch.
 
+> ELI5: Your thank-you card didn't arrive, so you took the gift back. The card had arrived. Now there are two gifts and one is counterfeit. **Nastiness: 8/10.**
+
 **9. Upgrade amnesia.** The generation change altered the checkpoint wire
 format — and old-format checkpoints (bare `owned` arrays, which production
 R2 holds right now) silently failed to parse, i.e. every pre-upgrade claim
 would evaporate at boot. Fix: a wire shim deserializes legacy checkpoints
 at generation 1, outbid by any post-upgrade handoff.
+
+> ELI5: The office's new filing system couldn't read old folders — so it concluded those customers never existed. This one was headed for production. **Nastiness: 9/10.**
 
 ## The durability pipeline
 
@@ -95,11 +115,15 @@ txn un-happened; the other half shipped on the next boat. Fix:
 `revert_closure` — reverts take the transitive txn-connected blast radius,
 and dropped pessimistic waiters are failed loudly.
 
+> ELI5: The bank undid your transfer on one side only: the money left your account AND never arrived — or arrived AND never left. An eraser that only erases half a line. **Nastiness: 9/10.**
+
 **11. COMMIT can fail too.** A deferred constraint fails at COMMIT time,
 after earlier participants already committed. The old handler purged *all*
 participants — destroying unrelated acked writes on some, leaving torn
 state on others. Fix: ROLLBACK the still-open participants (erasing exactly
 this txn), revert-closure the already-committed prefix.
+
+> ELI5: On signing day the third signer's pen exploded, so the office shredded everyone's entire folders — including documents from other deals. **Nastiness: 7/10.**
 
 **12. Death by purged participant.** A boat sinking between a txn's
 acquisition and its execution purged an object out from under it;
@@ -107,19 +131,27 @@ acquisition and its execution purged an object out from under it;
 every later submission to it hung forever (seed 1's liveness fire). Fix:
 detect and fail retryably.
 
+> ELI5: A cashier found their register missing and fainted — and the whole store stopped serving everyone, forever, over one fainted cashier. **Nastiness: 8/10.**
+
 **13. Committed but unpromoted.** The commit record landed; the final
 object PUT didn't. Boot recovery would roll it forward eventually — but a
 live take activates the stale base *now*. Fix: the worker self-heals
 immediately (drop the manifest, re-dirty, sail a repair boat), and —
+
+> ELI5: The receipt printed but the shelf never got restocked; the sale is official and the shelf is lying about it. **Nastiness: 6/10.**
 
 **14. Activation-time roll-forward.** Before any cold activation, committed
 records touching the object are rolled forward, whole-record (atomicity),
 so a taker can never activate state older than a durable commit. The
 conservation oracle had caught this as money off by exactly one unit.
 
+> ELI5: You moved into a house while the courthouse's approved-but-unfiled renovation order sat in its inbox — so you furnished last year's floor plan. **Nastiness: 8/10.**
+
 **15. Promotion going backwards.** A stale commit record retried its
 promotion after newer state had shipped, rolling the base snapshot
 backwards. Fix: promotion is monotone in the SQLite change counter.
+
+> ELI5: An old sticky note got re-applied on top of a newer one, and everyone trusted the top of the stack. **Nastiness: 6/10.**
 
 ## Liveness
 
@@ -131,6 +163,8 @@ livelock, bug 2's cousin). The one correction that could ever arrive was
 being thrown away, forever (seed 34). Fix: a self-naming hint triggers a
 ledger check; if the ledger confirms us, the worker heals its own memory.
 
+> ELI5: The city clerk keeps mailing you "this house is yours" and you keep replying "impossible, ask him" — about yourself — and shredding the letter. **Nastiness: 7/10.**
+
 **17. The tenure wipe.** The Take handler's home-adoption (formalizing
 implicit hash-default ownership) stamped `arrived_at = now` — so every
 object's first grant read as "unsettled," no displacement ever bounced
@@ -138,15 +172,21 @@ home, and the entire hysteresis mechanism was quietly dead. Only a
 placement test noticed; every correctness oracle was happy. Fix:
 formalizing what you already owned is not an arrival; genesis tenure.
 
+> ELI5: The residency clock deciding "does this object live here?" got reset every time somebody knocked on the door — so nothing ever qualified as home, and the whole learn-your-placement feature quietly played dead. **Nastiness: 7/10.**
+
 **18. The eternal checkpoint.** `admit` retried its add-side checkpoint
 forever, wedging the whole worker behind a storage outage. Under
 generations the add side is safely best-effort — the giver's transit marker
 already names us as the only valid owner — so: try once, log, move on.
 
+> ELI5: The clerk refused to serve anyone until one form was filed — and the filing office was closed indefinitely. The line was the entire town. **Nastiness: 7/10.**
+
 **19. The clobbered queue.** `on_taken` installed a fresh one-entry queue
 for the arrived object unconditionally — flattening any queue that already
 existed and dropping its parked txns and takes on the floor (seed 32's
 queue-pop assertion). Fix: only when no queue exists.
+
+> ELI5: Installing the new customer's ticket dispenser by throwing away the existing line of people. **Nastiness: 6/10.**
 
 ## Bugs in the mirror (the harness finding itself)
 
@@ -158,11 +198,15 @@ perfectly healthy node. Symptom: exactly one failure per parallel sweep, a
 different seed each time, none reproducible alone. Fix: `wall_fence:
 false` under simulation; unchanged in production.
 
+> ELI5: On a film set where a year passes per minute, the security guard fired the actors for "being late" — by checking his real wristwatch. Once per sweep, different actor each time, never on the replay. **Nastiness: 8/10.**
+
 **21. Entropy leaks** (fixed while building the harness, listed for
 completeness): std HashMap's per-process seed randomized iteration order —
 and therefore boat composition — across runs; a UUID in the ship path; raw
 `std::time::Instant` in the ship gate. Determinism is the simulator's first
 product; every one of these had to die before seed-replay meant anything.
+
+> ELI5: You can't study the game tape if the dice secretly roll differently every time you rewatch it. **Nastiness: 5/10.**
 
 ---
 
