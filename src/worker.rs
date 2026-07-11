@@ -240,6 +240,13 @@ struct Worker {
     /// Parked long-polls per object, re-checked after every write txn
     /// (durable ones at boat launch, riding the waiter list to landing).
     polls: Map<String, Vec<PendingPoll>>,
+    /// Objects whose queues may have become serviceable outside the
+    /// normal pop/ship-done flow (closure reverts beyond a boat's own
+    /// objects). Drained by pump(): a take parked behind "unshipped" state
+    /// that a REVERT (not a landing) cleared would otherwise sleep forever
+    /// (mined seed 13615326625233353280: deadlock cascade behind one
+    /// orphaned queue head).
+    needs_service: Vec<String>,
     /// Set while draining for shutdown; answered when the last boat lands.
     closing: Option<oneshot::Sender<()>>,
     done: bool,
@@ -282,6 +289,7 @@ pub fn spawn(node: Node, id: usize, live_dir: PathBuf) -> anyhow::Result<mpsc::U
         manifests: Map::default(),
         inflight: None,
         polls: Map::default(),
+        needs_service: Vec::new(),
         closing: None,
         done: false,
     };
@@ -658,6 +666,9 @@ impl Worker {
         if snap_err {
             // Local disk failure: revert to last durable, fail the waiters.
             for id in &objects {
+                if self.queues.contains_key(id.as_str()) {
+                    self.needs_service.push(id.clone());
+                }
                 self.fail_polls(id, "state reverted; re-poll");
                 purge(&mut self.objects, id);
                 self.node
@@ -843,12 +854,32 @@ impl Worker {
                 .lock()
                 .unwrap()
                 .remove(&self.live_dir.join(format!("{id}.db")));
+            // The revert just made this object clean: a take waiting out
+            // "unshipped" at its queue head is now grantable, and no
+            // ShipDone will ever come to say so.
+            if self.queues.contains_key(id.as_str()) {
+                self.needs_service.push(id.clone());
+            }
         }
     }
 
-    /// Drive txns forward until everything is parked or done.
+    /// Drive txns forward until everything is parked or done. Also drains
+    /// queues flagged serviceable by out-of-band state changes (reverts):
+    /// every mutation path ends in a pump, so nothing flagged waits long.
     async fn pump(&mut self, mut ready: Vec<u64>) {
-        while let Some(txn) = ready.pop() {
+        loop {
+            let mut flagged = std::mem::take(&mut self.needs_service);
+            flagged.sort_unstable();
+            flagged.dedup();
+            for object in flagged {
+                ready.extend(self.service_front(&object).await);
+            }
+            let Some(txn) = ready.pop() else {
+                if self.needs_service.is_empty() {
+                    return;
+                }
+                continue;
+            };
             if self.advance(txn) {
                 let unblocked = self.run_and_complete(txn).await;
                 ready.extend(unblocked);

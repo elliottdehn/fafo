@@ -1,0 +1,22 @@
+{
+  "seed": 1,
+  "nodes": 3,
+  "logical_workers": 16,
+  "accounts": 10,
+  "initial_balance": 100,
+  "transfers": 120,
+  "optimistic_pct": 50,
+  "clients": 4,
+  "channel_msgs": 30,
+  "wills": 4,
+  "store_latency_ms": 4,
+  "net_latency_ms": 4,
+  "store_fail_pct": 20,
+  "crashes": 2,
+  "restarts": true,
+  "fence_ttl_ms": 1000,
+  "op_timeout_ms": 120000,
+  "will_ttl_ms": 2000,
+  "wills_survive_node_crash": true,
+  "durable_wills": true
+}
