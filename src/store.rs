@@ -24,6 +24,39 @@ pub trait BlobStore: Send + Sync {
     /// with `If-None-Match: *`.
     async fn create(&self, key: &str, bytes: &[u8]) -> anyhow::Result<bool>;
 
+    /// Opaque monotone version of a blob — its etag, as a number. 0 means
+    /// the key is absent. It advances on EVERY mutation (put/create/put_cas)
+    /// and never repeats for a key, even across delete, which is exactly the
+    /// property an R2 etag gives and that CAS relies on. The default is a
+    /// coarse present/absent stand-in for wrapper and test stores; the real
+    /// stores override with a true monotone version.
+    async fn version(&self, key: &str) -> anyhow::Result<u64> {
+        Ok(u64::from(self.get(key).await?.is_some()))
+    }
+
+    /// Compare-and-swap: write `bytes` only if the blob's current version
+    /// equals `expected` (0 = "must not exist"). On a match, writes and
+    /// returns the new version; on mismatch — another writer advanced it, or
+    /// the key already existed when absence was expected — writes NOTHING and
+    /// returns None. Maps to R2's `If-Match: <etag>` / `If-None-Match: *`.
+    ///
+    /// This is the system's second consensus primitive alongside `create`. A
+    /// promoting writer CASes an object's base against the version it read at
+    /// activation, so two forked owners can never both win the same base at a
+    /// colliding SQLite change counter — the loser's CAS fails, and its
+    /// (still-unacked) pessimistic txn repairs instead of vanishing.
+    ///
+    /// The default is a NON-atomic read-check-write, correct only under the
+    /// simulator's single thread when the underlying store is atomic; real
+    /// stores and fault-injecting wrappers override to stay atomic.
+    async fn put_cas(&self, key: &str, expected: u64, bytes: &[u8]) -> anyhow::Result<Option<u64>> {
+        if self.version(key).await? != expected {
+            return Ok(None);
+        }
+        self.put(key, bytes).await?;
+        Ok(Some(self.version(key).await?))
+    }
+
     /// Read `len` bytes at `offset`. Used to peek a snapshot's SQLite
     /// change counter (4 bytes) without downloading the file — the cheap
     /// staleness check behind delta-aware activation. Default falls back to
@@ -152,31 +185,55 @@ impl BlobStore for FsBlobStore {
 /// atomicity a real object store gives — and the BTreeMap keeps listings
 /// sorted and iteration deterministic.
 #[derive(Default)]
+struct MemInner {
+    blobs: std::collections::BTreeMap<String, Vec<u8>>,
+    /// Monotone version per key, RETAINED across delete so a key's etag
+    /// never repeats — a stale CAS after a delete+recreate must not match.
+    /// `version()` reports 0 for an absent key; this is the high-water the
+    /// next write advances from.
+    versions: std::collections::BTreeMap<String, u64>,
+}
+
+impl MemInner {
+    /// Advance and return a key's version. Monotone even if the key was
+    /// deleted (the tombstone lives in `versions`).
+    fn bump(&mut self, key: &str) -> u64 {
+        let v = self.versions.get(key).copied().unwrap_or(0) + 1;
+        self.versions.insert(key.to_string(), v);
+        v
+    }
+}
+
+#[derive(Default)]
 pub struct MemBlobStore {
-    blobs: std::sync::Mutex<std::collections::BTreeMap<String, Vec<u8>>>,
+    inner: std::sync::Mutex<MemInner>,
 }
 
 #[async_trait]
 impl BlobStore for MemBlobStore {
     async fn get(&self, key: &str) -> anyhow::Result<Option<Vec<u8>>> {
-        Ok(self.blobs.lock().unwrap().get(key).cloned())
+        Ok(self.inner.lock().unwrap().blobs.get(key).cloned())
     }
 
     async fn put(&self, key: &str, bytes: &[u8]) -> anyhow::Result<()> {
-        self.blobs.lock().unwrap().insert(key.to_string(), bytes.to_vec());
+        let mut inner = self.inner.lock().unwrap();
+        inner.bump(key);
+        inner.blobs.insert(key.to_string(), bytes.to_vec());
         Ok(())
     }
 
     async fn delete(&self, key: &str) -> anyhow::Result<()> {
-        self.blobs.lock().unwrap().remove(key);
+        // Keep the version tombstone; only the blob goes.
+        self.inner.lock().unwrap().blobs.remove(key);
         Ok(())
     }
 
     async fn list(&self, prefix: &str) -> anyhow::Result<Vec<String>> {
         Ok(self
-            .blobs
+            .inner
             .lock()
             .unwrap()
+            .blobs
             .range(prefix.to_string()..)
             .take_while(|(k, _)| k.starts_with(prefix))
             .map(|(k, _)| k.clone())
@@ -184,16 +241,41 @@ impl BlobStore for MemBlobStore {
     }
 
     async fn create(&self, key: &str, bytes: &[u8]) -> anyhow::Result<bool> {
-        let mut blobs = self.blobs.lock().unwrap();
-        if blobs.contains_key(key) {
+        let mut inner = self.inner.lock().unwrap();
+        if inner.blobs.contains_key(key) {
             return Ok(false);
         }
-        blobs.insert(key.to_string(), bytes.to_vec());
+        inner.bump(key);
+        inner.blobs.insert(key.to_string(), bytes.to_vec());
         Ok(true)
     }
 
+    async fn version(&self, key: &str) -> anyhow::Result<u64> {
+        let inner = self.inner.lock().unwrap();
+        Ok(if inner.blobs.contains_key(key) {
+            inner.versions.get(key).copied().unwrap_or(0)
+        } else {
+            0
+        })
+    }
+
+    async fn put_cas(&self, key: &str, expected: u64, bytes: &[u8]) -> anyhow::Result<Option<u64>> {
+        let mut inner = self.inner.lock().unwrap();
+        let current = if inner.blobs.contains_key(key) {
+            inner.versions.get(key).copied().unwrap_or(0)
+        } else {
+            0
+        };
+        if current != expected {
+            return Ok(None);
+        }
+        let v = inner.bump(key);
+        inner.blobs.insert(key.to_string(), bytes.to_vec());
+        Ok(Some(v))
+    }
+
     async fn get_range(&self, key: &str, offset: u64, len: u64) -> anyhow::Result<Option<Vec<u8>>> {
-        Ok(self.blobs.lock().unwrap().get(key).map(|bytes| {
+        Ok(self.inner.lock().unwrap().blobs.get(key).map(|bytes| {
             let start = (offset as usize).min(bytes.len());
             let end = ((offset + len) as usize).min(bytes.len());
             bytes[start..end].to_vec()
@@ -252,6 +334,38 @@ mod tests {
             b"alpha",
             "the loser must not clobber the winner's content"
         );
+    }
+
+    #[tokio::test]
+    async fn cas_fences_a_stale_writer() {
+        let s = MemBlobStore::default();
+        // Absent: version 0. CAS-create at expected 0 wins.
+        assert_eq!(s.version("obj/x.db").await.unwrap(), 0);
+        let v1 = s.put_cas("obj/x.db", 0, b"base@1").await.unwrap().unwrap();
+        assert_eq!(s.version("obj/x.db").await.unwrap(), v1);
+        // A second create-attempt at expected 0 is now fenced.
+        assert_eq!(s.put_cas("obj/x.db", 0, b"forked").await.unwrap(), None);
+        assert_eq!(s.get("obj/x.db").await.unwrap().unwrap(), b"base@1");
+
+        // Two writers both read v1; only the first CAS(v1) wins, the other
+        // (the forked/superseded owner) is fenced — no lost-update clobber.
+        let v2 = s.put_cas("obj/x.db", v1, b"credit").await.unwrap().unwrap();
+        assert!(v2 > v1);
+        assert_eq!(s.put_cas("obj/x.db", v1, b"debit").await.unwrap(), None);
+        assert_eq!(s.get("obj/x.db").await.unwrap().unwrap(), b"credit");
+    }
+
+    #[tokio::test]
+    async fn version_never_repeats_across_delete() {
+        let s = MemBlobStore::default();
+        let v1 = s.put_cas("k", 0, b"a").await.unwrap().unwrap();
+        s.delete("k").await.unwrap();
+        assert_eq!(s.version("k").await.unwrap(), 0, "absent after delete");
+        // Recreate: the new version must exceed the pre-delete one, so a
+        // stale CAS(v1) after the recreate cannot match.
+        let v2 = s.put_cas("k", 0, b"b").await.unwrap().unwrap();
+        assert!(v2 > v1, "etag must not be reused across delete");
+        assert_eq!(s.put_cas("k", v1, b"stale").await.unwrap(), None);
     }
 
     #[tokio::test]

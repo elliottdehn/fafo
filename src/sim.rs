@@ -411,6 +411,19 @@ impl BlobStore for SimStore {
         self.inner.create(key, bytes).await
     }
 
+    async fn version(&self, key: &str) -> anyhow::Result<u64> {
+        self.delay().await;
+        self.inner.version(key).await
+    }
+
+    async fn put_cas(&self, key: &str, expected: u64, bytes: &[u8]) -> anyhow::Result<Option<u64>> {
+        // Delay and fault happen on the request; the CAS itself stays atomic
+        // in the inner store (no await between check and write).
+        self.delay().await;
+        self.maybe_fail("put_cas", key)?;
+        self.inner.put_cas(key, expected, bytes).await
+    }
+
     async fn get_range(&self, key: &str, offset: u64, len: u64) -> anyhow::Result<Option<Vec<u8>>> {
         self.delay().await;
         self.inner.get_range(key, offset, len).await
