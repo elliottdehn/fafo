@@ -77,33 +77,72 @@ impl From<WireError> for ApiError {
     }
 }
 
-async fn call(node: &Node, base: &str, req: &Request) -> anyhow::Result<Response> {
-    let resp = node
-        .http
-        .post(format!("{base}/internal/rpc"))
-        .header(SECRET_HEADER, &node.secret)
-        .json(req)
-        .timeout(CALL_TIMEOUT)
-        .send()
-        .await?;
-    anyhow::ensure!(
-        resp.status().is_success(),
-        "rpc to {base} returned {}",
-        resp.status()
-    );
-    Ok(resp.json().await?)
+/// How a node reaches its peers. Production is HTTP; the simulator is an
+/// in-process routing table it can delay, drop, and partition — the seam
+/// that makes the whole cluster runnable under one deterministic thread.
+#[async_trait::async_trait]
+pub trait Transport: Send + Sync {
+    /// POST {base}/internal/rpc (or its simulated analog).
+    async fn call(&self, base: &str, req: &Request) -> anyhow::Result<Response>;
+    /// GET {base}/healthz — the liveness probe lease claiming relies on.
+    /// Deliberately unauthenticated so a node with a rotated secret still
+    /// reads as alive.
+    async fn health(&self, base: &str) -> bool;
 }
 
-/// Liveness probe used by lease claiming. Deliberately unauthenticated
-/// (GET /healthz) so a node with a rotated secret still reads as alive.
+/// The production transport: HTTP, because Cloudflare Containers have no
+/// direct container-to-container TCP — traffic between instances must
+/// ride something the Worker can route.
+pub struct Http {
+    client: reqwest::Client,
+    secret: String,
+}
+
+impl Http {
+    pub fn new(secret: String) -> Self {
+        Self {
+            client: reqwest::Client::new(),
+            secret,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl Transport for Http {
+    async fn call(&self, base: &str, req: &Request) -> anyhow::Result<Response> {
+        let resp = self
+            .client
+            .post(format!("{base}/internal/rpc"))
+            .header(SECRET_HEADER, &self.secret)
+            .json(req)
+            .timeout(CALL_TIMEOUT)
+            .send()
+            .await?;
+        anyhow::ensure!(
+            resp.status().is_success(),
+            "rpc to {base} returned {}",
+            resp.status()
+        );
+        Ok(resp.json().await?)
+    }
+
+    async fn health(&self, base: &str) -> bool {
+        self.client
+            .get(format!("{base}/healthz"))
+            .timeout(HEALTH_TIMEOUT)
+            .send()
+            .await
+            .map(|r| r.status().is_success())
+            .unwrap_or(false)
+    }
+}
+
+async fn call(node: &Node, base: &str, req: &Request) -> anyhow::Result<Response> {
+    node.transport.call(base, req).await
+}
+
 pub async fn health(node: &Node, base: &str) -> bool {
-    node.http
-        .get(format!("{base}/healthz"))
-        .timeout(HEALTH_TIMEOUT)
-        .send()
-        .await
-        .map(|r| r.status().is_success())
-        .unwrap_or(false)
+    node.transport.health(base).await
 }
 
 pub async fn forward_txn(
@@ -223,21 +262,14 @@ mod tests {
     #[tokio::test]
     async fn wire_failures_and_mismatches_become_clean_errors() {
         let dir = tempfile::tempdir().unwrap();
+        let store: std::sync::Arc<dyn crate::store::BlobStore> = std::sync::Arc::new(
+            crate::store::FsBlobStore::new(dir.path().join("blobs")).unwrap(),
+        );
         let node = crate::cluster::start(crate::cluster::NodeConfig {
-            store: std::sync::Arc::new(
-                crate::store::FsBlobStore::new(dir.path().join("blobs")).unwrap(),
-            ),
-            live_dir: dir.path().join("live"),
             logical: 4,
-            claim: crate::cluster::ClaimSpec::All,
-            bind: "127.0.0.1:0".into(),
-            advertise: None,
-            hysteresis: 200,
             secret: "s".into(),
-            api_token: None,
-            max_unshipped: crate::cluster::DEFAULT_MAX_UNSHIPPED,
-            limits: crate::limits::Limits::detect(),
             fence_ttl: Duration::from_secs(60),
+            ..crate::cluster::NodeConfig::new(store, dir.path().join("live"))
         })
         .await
         .unwrap();
@@ -250,6 +282,7 @@ mod tests {
             settled: false,
             home: 0,
             visit: None,
+            generation: 1,
         };
 
         // HTTP-level failure: the status is in the error, per call site.

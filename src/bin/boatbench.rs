@@ -5,7 +5,7 @@
 //!   cargo run --release --bin boatbench
 //!   TXNS=5000 CONC=100 OBJECTS=4 cargo run --release --bin boatbench
 
-use fafo::cluster::{self, ClaimSpec, Node, NodeConfig, Op};
+use fafo::cluster::{self, Node, NodeConfig, Op};
 use fafo::store::{BlobStore, FsBlobStore};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -50,18 +50,9 @@ async fn boot(root: &std::path::Path, blobs: &str, tag: &str) -> Node {
         Arc::new(SlowStore(fs, lat))
     };
     cluster::start(NodeConfig {
-        store,
-        live_dir: root.join(format!("live-{tag}")),
         logical: 8,
-        claim: ClaimSpec::All,
-        bind: "127.0.0.1:0".into(),
-        advertise: None,
-        hysteresis: 200,
         secret: "bench".into(),
-        api_token: None,
-        max_unshipped: cluster::DEFAULT_MAX_UNSHIPPED,
-        limits: fafo::limits::Limits::detect(),
-        fence_ttl: std::time::Duration::from_secs(10),
+        ..NodeConfig::new(store, root.join(format!("live-{tag}")))
     })
     .await
     .unwrap()

@@ -15,7 +15,7 @@
 //! then asks the heaviest worker to shed idle live objects, which turn into
 //! cache and become deletable.
 
-use std::collections::HashMap;
+use crate::Map;
 use std::path::PathBuf;
 
 #[derive(Clone, Copy, Debug)]
@@ -101,7 +101,7 @@ pub struct DiskLedger {
     budget: u64,
     used: u64,
     seq: u64,
-    files: HashMap<PathBuf, Entry>,
+    files: Map<PathBuf, Entry>,
 }
 
 /// What enforcement decided; the caller (who can reach worker channels)
@@ -118,7 +118,7 @@ impl DiskLedger {
             budget,
             used: 0,
             seq: 0,
-            files: HashMap::new(),
+            files: Map::default(),
         }
     }
 
@@ -189,7 +189,7 @@ impl DiskLedger {
             }
         }
         let shed_from_worker = if self.used > self.budget {
-            let mut live_by_worker: HashMap<usize, u64> = HashMap::new();
+            let mut live_by_worker: Map<usize, u64> = Map::default();
             for e in self.files.values() {
                 if e.state == FileState::Live {
                     *live_by_worker.entry(e.worker).or_default() += e.bytes;

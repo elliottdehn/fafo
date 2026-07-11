@@ -147,6 +147,60 @@ impl BlobStore for FsBlobStore {
     }
 }
 
+/// In-memory blob store: the simulator's durable truth, and a handy test
+/// double. Every operation is atomic under one lock — the same per-key
+/// atomicity a real object store gives — and the BTreeMap keeps listings
+/// sorted and iteration deterministic.
+#[derive(Default)]
+pub struct MemBlobStore {
+    blobs: std::sync::Mutex<std::collections::BTreeMap<String, Vec<u8>>>,
+}
+
+#[async_trait]
+impl BlobStore for MemBlobStore {
+    async fn get(&self, key: &str) -> anyhow::Result<Option<Vec<u8>>> {
+        Ok(self.blobs.lock().unwrap().get(key).cloned())
+    }
+
+    async fn put(&self, key: &str, bytes: &[u8]) -> anyhow::Result<()> {
+        self.blobs.lock().unwrap().insert(key.to_string(), bytes.to_vec());
+        Ok(())
+    }
+
+    async fn delete(&self, key: &str) -> anyhow::Result<()> {
+        self.blobs.lock().unwrap().remove(key);
+        Ok(())
+    }
+
+    async fn list(&self, prefix: &str) -> anyhow::Result<Vec<String>> {
+        Ok(self
+            .blobs
+            .lock()
+            .unwrap()
+            .range(prefix.to_string()..)
+            .take_while(|(k, _)| k.starts_with(prefix))
+            .map(|(k, _)| k.clone())
+            .collect())
+    }
+
+    async fn create(&self, key: &str, bytes: &[u8]) -> anyhow::Result<bool> {
+        let mut blobs = self.blobs.lock().unwrap();
+        if blobs.contains_key(key) {
+            return Ok(false);
+        }
+        blobs.insert(key.to_string(), bytes.to_vec());
+        Ok(true)
+    }
+
+    async fn get_range(&self, key: &str, offset: u64, len: u64) -> anyhow::Result<Option<Vec<u8>>> {
+        Ok(self.blobs.lock().unwrap().get(key).map(|bytes| {
+            let start = (offset as usize).min(bytes.len());
+            let end = ((offset + len) as usize).min(bytes.len());
+            bytes[start..end].to_vec()
+        }))
+    }
+}
+
 fn walk(dir: &Path, root: &Path, out: &mut Vec<String>) -> anyhow::Result<()> {
     let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,

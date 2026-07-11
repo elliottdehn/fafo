@@ -49,18 +49,10 @@ fn insert_op(object: &str) -> Op {
 async fn boot(root: &std::path::Path, logical: usize, hyst: u64, tag: &str) -> Node {
     let store: Arc<dyn BlobStore> = Arc::new(FsBlobStore::new(root.join("blobs")).unwrap());
     cluster::start(cluster::NodeConfig {
-        store,
-        live_dir: root.join(format!("live-{tag}")),
         logical,
-        claim: cluster::ClaimSpec::All,
-        bind: "127.0.0.1:0".into(),
-        advertise: None,
         hysteresis: hyst,
         secret: "anneal".into(),
-        api_token: None,
-        max_unshipped: cluster::DEFAULT_MAX_UNSHIPPED,
-        limits: fafo::limits::Limits::detect(),
-        fence_ttl: std::time::Duration::from_secs(10),
+        ..cluster::NodeConfig::new(store, root.join(format!("live-{tag}")))
     })
     .await
     .unwrap()

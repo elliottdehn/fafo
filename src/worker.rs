@@ -28,6 +28,7 @@
 //! so memory never outruns the blob store.
 
 use crate::api::ApiError;
+use crate::{Map, Set};
 use crate::cluster::{
     Node, Op, OpResult, TakeError, TransferMeta, TxnResponse, VisitInfo, checkpoint_key,
 };
@@ -37,7 +38,7 @@ use crate::object::{LiveObject, evict, fetch_image, materialize, object_key, pur
 use crate::store::BlobStore;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -118,6 +119,11 @@ pub enum WorkerMsg {
     },
     Stats {
         resp: oneshot::Sender<(u64, usize, usize)>,
+    },
+    /// Debug: a one-line-per-fact snapshot of queues, parked txns, and
+    /// boat state. The simulator prints these in deadlock reports.
+    Dump {
+        resp: oneshot::Sender<String>,
     },
 }
 
@@ -202,16 +208,20 @@ struct Worker {
     /// Objects explicitly owned (checkpointed). Hash-default objects are
     /// owned implicitly via routing and only enter this set if they ever
     /// migrate away and come back.
-    owned: HashSet<String>,
-    objects: HashMap<String, LiveObject>,
-    meta: HashMap<String, Meta>,
-    queues: HashMap<String, VecDeque<Entry>>,
-    parked: HashMap<u64, Parked>,
+    owned: Map<String, u64>,
+    /// Objects we released whose new owner may not have checkpointed yet:
+    /// object -> destination. Mirrored durably in our checkpoint so the
+    /// transfer gap is never invisible.
+    transit: Map<String, (usize, u64)>,
+    objects: Map<String, LiveObject>,
+    meta: Map<String, Meta>,
+    queues: Map<String, VecDeque<Entry>>,
+    parked: Map<u64, Parked>,
     next_txn: u64,
     txns_executed: u64,
     /// Boat state: objects with locally-committed, not-yet-shipped writes,
     /// with the size recorded when they first became dirty.
-    dirty: HashMap<String, u64>,
+    dirty: Map<String, u64>,
     /// Approximate bytes of unshipped state; the backpressure watermark.
     /// Below max_unshipped nothing changes; above it, optimistic txns are
     /// quietly demoted to boat-riders, which paces producers to ship speed.
@@ -223,13 +233,13 @@ struct Worker {
     pending_txns: Vec<AppliedTxn>,
     /// Page-hash manifests for large objects (delta shipping). Built on
     /// activation or first large ship; dropped on evict.
-    manifests: HashMap<String, Manifest>,
+    manifests: Map<String, Manifest>,
     /// Objects in the currently shipping boat (at most one boat in flight;
     /// the next launches the moment it lands, if anything is dirty).
-    inflight: Option<HashSet<String>>,
+    inflight: Option<Set<String>>,
     /// Parked long-polls per object, re-checked after every write txn
     /// (durable ones at boat launch, riding the waiter list to landing).
-    polls: HashMap<String, Vec<PendingPoll>>,
+    polls: Map<String, Vec<PendingPoll>>,
     /// Set while draining for shutdown; answered when the last boat lands.
     closing: Option<oneshot::Sender<()>>,
     done: bool,
@@ -238,38 +248,44 @@ struct Worker {
 pub fn spawn(node: Node, id: usize, live_dir: PathBuf) -> anyhow::Result<mpsc::UnboundedSender<WorkerMsg>> {
     std::fs::create_dir_all(&live_dir)?;
     let (tx, mut rx) = mpsc::unbounded_channel();
-    // Seed the explicit-owned set from routing exceptions loaded at boot.
-    let owned: HashSet<String> = {
-        let routing = node.routing.read().unwrap();
-        routing
-            .exceptions
-            .iter()
-            .filter(|&(_, w)| *w == id)
-            .map(|(o, _)| o.clone())
-            .collect()
-    };
+    let tracker = node.clone();
+    // Seed explicit ownership (with handoff generations) from the boot
+    // reconciliation of durable checkpoints — the dual-claim winners.
+    let owned = node
+        .boot_owned
+        .lock()
+        .unwrap()
+        .remove(&id)
+        .unwrap_or_default();
+    let transit = node
+        .boot_transit
+        .lock()
+        .unwrap()
+        .remove(&id)
+        .unwrap_or_default();
     let mut worker = Worker {
         node,
         id,
         live_dir,
         self_tx: tx.clone(),
         owned,
-        objects: HashMap::new(),
-        meta: HashMap::new(),
-        queues: HashMap::new(),
-        parked: HashMap::new(),
+        transit,
+        objects: Map::default(),
+        meta: Map::default(),
+        queues: Map::default(),
+        parked: Map::default(),
         next_txn: 0,
         txns_executed: 0,
-        dirty: HashMap::new(),
+        dirty: Map::default(),
         dirty_bytes: 0,
         pending_txns: Vec::new(),
-        manifests: HashMap::new(),
+        manifests: Map::default(),
         inflight: None,
-        polls: HashMap::new(),
+        polls: Map::default(),
         closing: None,
         done: false,
     };
-    tokio::spawn(async move {
+    tracker.spawn_tracked(async move {
         while let Some(msg) = rx.recv().await {
             worker.handle(msg).await;
             if worker.done {
@@ -325,13 +341,94 @@ impl Worker {
                 taker,
                 resp,
             } => {
-                if !self.owns(&object) {
-                    let hint = {
-                        let routing = self.node.routing.read().unwrap();
-                        Some(routing.owner_of(&object)).filter(|w| *w != self.id)
+                // Grants must rest on the durable ownership ledger, not
+                // the routing hint map: a stale hint pointing at this
+                // worker once let it grant a FORGED DEED to an object it
+                // had renounced long ago, forking the object's history
+                // (the remove-side checkpoint no-ops when the object was
+                // never in `owned`). Hash-default homes may adopt objects
+                // no checkpoint claims — that's the documented orphan
+                // fallback, which also heals stale-hint cycles.
+                if !self.owned.contains_key(&object) {
+                    use crate::cluster::Claim;
+                    // If one of OUR txns has a take in flight for this
+                    // object, the deed may be en route to us right now.
+                    // Adopting via the durable Transit marker would spend
+                    // the same renunciation twice — two admits, and the
+                    // second one resurrects ownership after we've granted
+                    // it onward: a fork (seed 1). Bounce; the taker
+                    // retries once the deed lands.
+                    if self.parked.values().any(|p| {
+                        p.taking && p.participants.get(p.acquired).map(String::as_str) == Some(object.as_str())
+                    }) {
+                        let _ = resp.send(Err(TakeError::Failed(
+                            "handoff to this worker in flight; retry".into(),
+                        )));
+                        return;
+                    }
+                    let is_home = crate::cluster::default_worker(
+                        &object,
+                        self.node.routing.read().unwrap().logical,
+                    ) == self.id;
+                    let claim =
+                        crate::cluster::durable_claim(self.node.store.as_ref(), &object).await;
+                    let adopt_gen = match claim {
+                        // Ours by checkpoint (e.g. rebuilt after a boot
+                        // where the hint map lost the trail): reclaim at
+                        // the generation of record.
+                        Claim::Owned(w, g) if w == self.id => Some(g),
+                        // A handoff addressed to US whose grant reply
+                        // died in flight: complete it at its generation.
+                        Claim::Transit(w, g) if w == self.id => Some(g),
+                        // Genuinely unclaimed: the hash-default home is
+                        // the documented fallback owner, entering the
+                        // generation ladder at 1.
+                        Claim::Unclaimed if is_home => Some(1),
+                        _ => None,
                     };
-                    let _ = resp.send(Err(TakeError::NotMine { hint }));
-                    return;
+                    let adopted = match adopt_gen {
+                        Some(generation) => {
+                            let ok = self
+                                .admit(
+                                    &object,
+                                    TransferMeta {
+                                        settled: false,
+                                        home: self.id,
+                                        visit: None,
+                                        generation,
+                                    },
+                                    false,
+                                )
+                                .await;
+                            // Formalizing implicit hash-home ownership (or
+                            // reclaiming our own recorded claim) is not an
+                            // arrival: the object has been here all along.
+                            // Resetting tenure here made every first grant
+                            // read as "unsettled" and killed hysteresis
+                            // returns cluster-wide.
+                            if ok && !matches!(claim, Claim::Transit(_, _)) {
+                                if let Some(m) = self.meta.get_mut(&object) {
+                                    m.arrived_at = 0;
+                                }
+                            }
+                            ok
+                            // fall through if true: durably ours, serve it
+                        }
+                        None => false,
+                    };
+                    if !adopted {
+                        let hint = match claim {
+                            Claim::Owned(w, _) | Claim::Transit(w, _) if w != usize::MAX => {
+                                Some(w)
+                            }
+                            _ => {
+                                let routing = self.node.routing.read().unwrap();
+                                Some(routing.owner_of(&object)).filter(|w| *w != self.id)
+                            }
+                        };
+                        let _ = resp.send(Err(TakeError::NotMine { hint }));
+                        return;
+                    }
                 }
                 let queue = self.queues.entry(object.clone()).or_default();
                 queue.push_back(Entry::Take { taker, resp });
@@ -341,7 +438,18 @@ impl Worker {
                 }
             }
             WorkerMsg::Adopt { object, meta } => {
-                self.admit(&object, meta, false).await;
+                // Adopts arrive late and duplicated: the renunciation that
+                // produced this one may ALSO have been consumed by the
+                // take-handler's Transit(me) healing while this message
+                // was in flight — after which we may have granted the
+                // object onward. The generation gate inside admit refuses
+                // any deed not strictly newer than what we already know,
+                // so a late duplicate can never resurrect ownership.
+                if !self.admit(&object, meta, false).await
+                    && std::env::var_os("FAFO_DST_LOG").is_some()
+                {
+                    eprintln!("w{}: dropped stale adopt of {object}", self.id);
+                }
                 // A parked txn may have a take in flight for this object;
                 // its retry loop will resolve back to us and short-circuit.
             }
@@ -398,6 +506,35 @@ impl Worker {
                 self.maybe_launch();
                 self.maybe_finish_closing();
             }
+            WorkerMsg::Dump { resp } => {
+                let mut out = String::new();
+                for (object, queue) in &self.queues {
+                    let entries: Vec<String> = queue
+                        .iter()
+                        .map(|e| match e {
+                            Entry::Txn(t) => format!("txn{t}"),
+                            Entry::Take { taker, .. } => format!("take->w{taker}"),
+                        })
+                        .collect();
+                    out.push_str(&format!("  w{} queue {object}: {entries:?}\n", self.id));
+                }
+                for (txn, p) in &self.parked {
+                    out.push_str(&format!(
+                        "  w{} txn{txn}: participants={:?} acquired={} taking={} activating={}\n",
+                        self.id, p.participants, p.acquired, p.taking, p.activating
+                    ));
+                }
+                if !self.dirty.is_empty() || self.inflight.is_some() {
+                    out.push_str(&format!(
+                        "  w{} dirty={:?} inflight={:?} pending={}\n",
+                        self.id,
+                        self.dirty.keys().collect::<Vec<_>>(),
+                        self.inflight,
+                        self.pending_txns.len()
+                    ));
+                }
+                let _ = resp.send(out);
+            }
             WorkerMsg::Stats { resp } => {
                 let parked_polls = self.polls.values().map(Vec::len).sum();
                 let _ = resp.send((self.txns_executed, self.owned.len(), parked_polls));
@@ -428,7 +565,21 @@ impl Worker {
     /// against its manifest — snapshots for small objects and for
     /// compaction (long chains or big diffs), deltas otherwise.
     fn maybe_launch(&mut self) {
+        crate::fafo_assert!(
+            self.dirty_bytes == self.dirty.values().sum::<u64>(),
+            "w{} dirty_bytes {} != sum of dirty {}",
+            self.id,
+            self.dirty_bytes,
+            self.dirty.values().sum::<u64>()
+        );
         if self.inflight.is_some() || self.pending_txns.is_empty() {
+            crate::fafo_assert!(
+                self.inflight.is_some() || self.dirty.is_empty(),
+                "w{}: dirty objects {:?} with no pending txns and no boat — \
+                 they would never ship",
+                self.id,
+                self.dirty.keys().collect::<Vec<_>>()
+            );
             return;
         }
         // Cut the boat along txn-connected components: a txn's participants
@@ -437,11 +588,11 @@ impl Worker {
         // hits the byte cap — bounding one shipment's RAM to the budget.
         let pending = std::mem::take(&mut self.pending_txns);
         let mut selected: Vec<usize> = Vec::new(); // txn indices for this boat
-        let mut boat_objects: HashSet<String> = HashSet::new();
+        let mut boat_objects: Set<String> = Set::default();
         let mut boat_bytes = 0u64;
         let mut leftover: Vec<usize> = Vec::new();
         for component in txn_components(&pending) {
-            let comp_objects: HashSet<&String> = component
+            let comp_objects: Set<&String> = component
                 .iter()
                 .flat_map(|&i| &pending[i].participants)
                 .collect();
@@ -483,6 +634,16 @@ impl Worker {
         let mut items = Vec::with_capacity(objects.len());
         let mut snap_err = false;
         for id in &objects {
+            // The fork tripwire: a boat may only ship what this worker
+            // durably owns. Two workers shipping one object independently
+            // is the fork the conservation oracle catches downstream —
+            // this catches it at the source, with the object named.
+            crate::fafo_assert!(
+                self.owns(id),
+                "w{} shipping {id} it does not own (routing says w{})",
+                self.id,
+                self.node.routing.read().unwrap().owner_of(id)
+            );
             let live_path = &self.objects.get(id).expect("dirty object is live").live_path;
             let Ok(bytes) = std::fs::read(live_path) else {
                 snap_err = true;
@@ -518,7 +679,7 @@ impl Worker {
             waiters.extend(self.take_fired_polls(id, true));
         }
         self.inflight = Some(objects.into_iter().collect());
-        tokio::spawn(ship_task(
+        self.node.spawn_tracked(ship_task(
             self.node.clone(),
             self.self_tx.clone(),
             items,
@@ -610,30 +771,14 @@ impl Worker {
             // object to the last durable state. Optimistic acks inside the
             // boat are lost — that is the documented optimistic contract.
             eprintln!(
-                "w{}: ship failed; reverting {} objects to last durable state",
-                self.id,
-                objects.len()
+                "w{}: ship failed; reverting to last durable: {objects:?}",
+                self.id
             );
-            for id in &objects {
-                // Parked polls judged optimistic state that just
-                // un-happened; fail them loudly so clients re-poll against
-                // one consistent history.
-                self.fail_polls(id, "state reverted; re-poll");
-                purge(&mut self.objects, id);
-                self.meta.remove(id);
-                self.manifests.remove(id);
-                if let Some(bytes) = self.dirty.remove(id) {
-                    self.dirty_bytes = self.dirty_bytes.saturating_sub(bytes);
-                }
-                self.node
-                    .disk
-                    .lock()
-                    .unwrap()
-                    .remove(&self.live_dir.join(format!("{id}.db")));
-            }
-            // Their unshipped txns died with the boat: these applied AFTER
-            // the doomed boat launched, so their waiters never rode it.
-            self.drop_pending_touching(&objects);
+            // Everything the boat carried reverts, plus the closure of
+            // pending txns that landed on top of it since launch. Parked
+            // polls judged state that just un-happened; they fail loudly
+            // inside so clients re-poll against one consistent history.
+            self.revert_closure(&objects);
         }
         // Freshly shipped objects just became sheddable; give the disk
         // ledger a chance to reclaim if it's over budget.
@@ -652,12 +797,28 @@ impl Worker {
         self.pump(ready).await;
     }
 
-    /// Objects just reverted to durable state: pending txns touching them
-    /// describe writes that no longer exist locally. Drop the entries and
-    /// tell their waiters plainly rather than letting the reply slot die
-    /// silently (or worse, letting a later boat snapshot a purged object).
-    fn drop_pending_touching(&mut self, reverted: &[String]) {
-        let reverted: HashSet<&String> = reverted.iter().collect();
+    /// Revert objects to durable state — and take the whole blast radius
+    /// with them. A pending txn touching a reverted object is dead, so its
+    /// OTHER participants must revert too (their live state contains half
+    /// of the dead txn), which can kill more pending txns, and so on: the
+    /// transitive txn-connected closure. Anything less leaves two wrecks
+    /// the simulator found in one dump: an object torn mid-transaction,
+    /// and an object dirty forever with no pending txn to ever sail it.
+    fn revert_closure(&mut self, seed: &[String]) {
+        let mut reverted: Set<String> = seed.iter().cloned().collect();
+        loop {
+            let mut grew = false;
+            for t in &self.pending_txns {
+                if t.participants.iter().any(|p| reverted.contains(p)) {
+                    for p in &t.participants {
+                        grew |= reverted.insert(p.clone());
+                    }
+                }
+            }
+            if !grew {
+                break;
+            }
+        }
         self.pending_txns.retain_mut(|t| {
             if t.participants.iter().any(|p| reverted.contains(p)) {
                 if let Some((resp, _)) = t.waiter.take() {
@@ -668,6 +829,20 @@ impl Worker {
                 true
             }
         });
+        for id in &reverted {
+            self.fail_polls(id, "state reverted; re-poll");
+            purge(&mut self.objects, id);
+            self.meta.remove(id);
+            self.manifests.remove(id);
+            if let Some(bytes) = self.dirty.remove(id) {
+                self.dirty_bytes = self.dirty_bytes.saturating_sub(bytes);
+            }
+            self.node
+                .disk
+                .lock()
+                .unwrap()
+                .remove(&self.live_dir.join(format!("{id}.db")));
+        }
     }
 
     /// Drive txns forward until everything is parked or done.
@@ -694,8 +869,20 @@ impl Worker {
                 return true;
             }
             let object = p.participants[p.acquired].clone();
-            let is_owner =
-                self.node.routing.read().unwrap().owner_of(&object) == self.id;
+            let is_owner = {
+                let mut routing = self.node.routing.write().unwrap();
+                match routing.exceptions.get(&object) {
+                    // Our own map says we own it, but the durable ledger
+                    // says we never admitted it: a stale hint about
+                    // ourselves. Serving it would be the forged deed;
+                    // chasing it would AlreadyLocal-loop. Drop the lie.
+                    Some(&w) if w == self.id && !self.owned.contains_key(&object) => {
+                        routing.exceptions.remove(&object);
+                        routing.owner_of(&object) == self.id
+                    }
+                    _ => routing.owner_of(&object) == self.id,
+                }
+            };
             let p = self.parked.get_mut(&txn).unwrap();
             if is_owner {
                 let queue = self.queues.entry(object.clone()).or_default();
@@ -713,14 +900,49 @@ impl Worker {
                         let node = self.node.clone();
                         let reply = self.self_tx.clone();
                         let live_path = self.live_dir.join(format!("{object}.db"));
-                        tokio::spawn(async move {
+                        // An implicit (hash-default) activation must check
+                        // the durable ledger: the object may live at a
+                        // checkpointed owner elsewhere, and serving our
+                        // stale blob copy would fork it.
+                        let verify_claim = !self.owned.contains_key(&object);
+                        let me = self.id;
+                        self.node.spawn_tracked(async move {
                             // Each in-flight fetch holds a full image in
                             // RAM; the permit caps how many at once.
                             let _permit =
                                 node.activation_permits.clone().acquire_owned().await;
-                            let result = fetch_image(&node.store, &object, &live_path)
-                                .await
-                                .map_err(|e| e.to_string());
+                            let result = async {
+                                if verify_claim {
+                                    use crate::cluster::Claim;
+                                    match crate::cluster::durable_claim(
+                                        node.store.as_ref(),
+                                        &object,
+                                    )
+                                    .await
+                                    {
+                                        Claim::Owned(w, _) | Claim::Transit(w, _) if w != me => {
+                                            // Heal routing from the durable
+                                            // truth and bounce; the retry
+                                            // routes right.
+                                            if w != usize::MAX {
+                                                node.routing
+                                                    .write()
+                                                    .unwrap()
+                                                    .exceptions
+                                                    .insert(object.clone(), w);
+                                            }
+                                            anyhow::bail!(
+                                                "object is durably claimed by w{w}; rerouted"
+                                            );
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                                recover_records_touching(node.store.as_ref(), &object).await?;
+                                fetch_image(&node.store, &object, &live_path).await
+                            }
+                            .await
+                            .map_err(|e| e.to_string());
                             let _ = reply.send(WorkerMsg::Activated {
                                 txn,
                                 object,
@@ -737,7 +959,7 @@ impl Worker {
                 p.taking = true;
                 p.crossed = true;
                 self.node.stats.takes.fetch_add(1, Ordering::Relaxed);
-                tokio::spawn(take_task(
+                self.node.spawn_tracked(take_task(
                     self.node.clone(),
                     self.self_tx.clone(),
                     self.id,
@@ -791,12 +1013,35 @@ impl Worker {
         p.taking = false;
         match result {
             TakenResult::Got(meta) => {
-                self.admit(&object, meta, from != self.id).await;
-                // The txn now holds the fresh object's queue head outright;
-                // advance() will activate it (from commuter cache if this
-                // object has lived here before).
-                self.queues
-                    .insert(object, VecDeque::from([Entry::Txn(txn)]));
+                // A deed can arrive stale: between the granter cutting it
+                // and this message being processed, we may have adopted
+                // the object through ANOTHER path (the Take handler's
+                // Transit(me) healing reads the same renunciation the
+                // granter is answering) and even granted it onward. The
+                // generation gate arbitrates: a deed not strictly newer
+                // than what we know is refused — one renunciation is
+                // never spent twice (seed 1's torn transfers).
+                if self.owned.contains_key(&object) {
+                    // Healed through another path at this same generation:
+                    // the deed is a harmless duplicate; the object is ours.
+                } else if !self.admit(&object, meta, from != self.id).await {
+                    let ready = self
+                        .fail_txn(
+                            txn,
+                            format!("deed for {object} superseded by a later grant; retry"),
+                        )
+                        .await;
+                    self.pump(ready).await;
+                    return;
+                }
+                // The txn holds the fresh object's queue head outright —
+                // but only when no queue exists. Clobbering a live queue
+                // here would drop parked txns and takes on the floor;
+                // advance() enqueues into an existing one correctly.
+                if !self.queues.contains_key(&object) {
+                    self.queues
+                        .insert(object, VecDeque::from([Entry::Txn(txn)]));
+                }
                 self.pump(vec![txn]).await;
             }
             TakenResult::AlreadyLocal => self.pump(vec![txn]).await,
@@ -808,8 +1053,28 @@ impl Worker {
     }
 
     /// Apply hysteresis policy to a newly received object and record
-    /// ownership (routing + checkpoint).
-    async fn admit(&mut self, object: &str, tm: TransferMeta, _remote: bool) {
+    /// ownership (routing + checkpoint). Returns false — refusing the
+    /// deed — when its generation is not newer than everything this
+    /// worker already knows about the object: a late duplicate (the same
+    /// renunciation arriving twice through different channels) or a deed
+    /// superseded by our own later grant. One renunciation, one spend.
+    async fn admit(&mut self, object: &str, tm: TransferMeta, _remote: bool) -> bool {
+        let known = self
+            .owned
+            .get(object)
+            .copied()
+            .max(self.transit.get(object).map(|&(_, g)| g));
+        if let Some(cur) = known
+            && tm.generation <= cur
+        {
+            if std::env::var_os("FAFO_DST_LOG").is_some() {
+                eprintln!(
+                    "w{}: refusing stale deed for {object} (gen {} <= known {cur})",
+                    self.id, tm.generation
+                );
+            }
+            return false;
+        }
         let now = self.now();
         let mut meta = Meta {
             arrived_at: now,
@@ -839,8 +1104,15 @@ impl Worker {
         } else {
             meta.visit = tm.visit; // returning home: keep the visit history
         }
+        if std::env::var_os("FAFO_DST_LOG").is_some() {
+            eprintln!(
+                "admit {object} at w{} settled={} return_to={:?}",
+                self.id, tm.settled, meta.return_to
+            );
+        }
         self.meta.insert(object.to_string(), meta);
-        self.owned.insert(object.to_string());
+        self.owned.insert(object.to_string(), tm.generation);
+        self.transit.remove(object);
         {
             let mut routing = self.node.routing.write().unwrap();
             if crate::cluster::default_worker(object, routing.logical) == self.id {
@@ -849,7 +1121,20 @@ impl Worker {
                 routing.exceptions.insert(object.to_string(), self.id);
             }
         }
-        self.checkpoint().await;
+        // The add-side checkpoint is best-effort: the durable truth that
+        // makes us owner is already written (the giver's transit marker at
+        // this generation for handoffs, the hash-home rule for adoptions),
+        // and only we can satisfy it — no dual claim can arise while ours
+        // is missing. Retrying forever here wedged the whole worker behind
+        // a store outage (found as a hung take during a fault window); a
+        // later checkpoint carries the owned map regardless.
+        if let Err(e) = self.checkpoint().await {
+            eprintln!(
+                "w{}: add-side checkpoint for {object} failed ({e}); the transit/home rule covers us until the next checkpoint",
+                self.id
+            );
+        }
+        true
     }
 
     /// Re-check this object's parked polls (one durability class per pass).
@@ -948,32 +1233,142 @@ impl Worker {
 
     /// Grant the take at the head of this queue: quiesce, transfer, and
     /// bounce everyone left behind (they must re-resolve to the new owner).
+    /// A transfer that cannot durably renounce is refused: the takers get
+    /// a retryable failure and the object stays exactly where it is.
     async fn grant_front(&mut self, object: &str) -> Vec<u64> {
         let mut queue = self.queues.remove(object).unwrap_or_default();
         let Some(Entry::Take { taker, resp }) = queue.pop_front() else {
             unreachable!("grant_front called on non-take head");
         };
-        let tm = self.release(object, Some(taker)).await;
-        let _ = resp.send(Ok(tm));
-
-        let mut ready = Vec::new();
-        for entry in queue {
-            match entry {
-                // Parked txns whose frontier was this object: re-drive; they
-                // will discover the new owner and issue a take.
-                Entry::Txn(t) => ready.push(t),
-                Entry::Take { resp, .. } => {
-                    let _ = resp.send(Err(TakeError::NotMine { hint: Some(taker) }));
+        match self.release(object, Some(taker)).await {
+            Ok(tm) => {
+                if std::env::var_os("FAFO_DST_LOG").is_some() {
+                    eprintln!("grant {object}: w{} -> w{taker}", self.id);
                 }
+                if let Err(lost) = resp.send(Ok(tm)) {
+                    // The taker died between asking and receiving: the
+                    // deed would fall into the sea. Reclaim immediately —
+                    // the transit marker (and this) keep the object from
+                    // ever being durably nobody's.
+                    eprintln!(
+                        "w{}: grant of {object} to w{taker} undeliverable; reclaiming",
+                        self.id
+                    );
+                    let mut meta = match lost {
+                        Ok(tm) => tm,
+                        Err(_) => unreachable!("we sent Ok"),
+                    };
+                    // The dead oneshot proves the deed was never delivered
+                    // (its receiver dropped before reading), so reclaiming
+                    // cannot race a consumer. Reclaim = a fresh handoff to
+                    // ourselves: the next generation.
+                    meta.generation += 1;
+                    let _ = self.admit(object, meta, false).await;
+                    // We own it again: bounce waiting takes (they retry),
+                    // keep waiting txns runnable right here.
+                    let mut ready = Vec::new();
+                    let mut keep = VecDeque::new();
+                    for entry in queue {
+                        match entry {
+                            Entry::Txn(t) => {
+                                if keep.is_empty() {
+                                    ready.push(t);
+                                }
+                                keep.push_back(Entry::Txn(t));
+                            }
+                            Entry::Take { resp, .. } => {
+                                let _ = resp.send(Err(TakeError::Failed(
+                                    "grant interrupted; retry".into(),
+                                )));
+                            }
+                        }
+                    }
+                    if !keep.is_empty() {
+                        self.queues.insert(object.to_string(), keep);
+                    }
+                    return ready;
+                }
+                let mut ready = Vec::new();
+                for entry in queue {
+                    match entry {
+                        // Parked txns whose frontier was this object:
+                        // re-drive; they will discover the new owner and
+                        // issue a take.
+                        Entry::Txn(t) => ready.push(t),
+                        Entry::Take { resp, .. } => {
+                            let _ = resp.send(Err(TakeError::NotMine { hint: Some(taker) }));
+                        }
+                    }
+                }
+                ready
+            }
+            Err(e) => {
+                let _ = resp.send(Err(TakeError::Failed(format!("transfer aborted: {e}"))));
+                // The store is refusing checkpoints; every queued take
+                // would fail the same way right now. Bounce them and let
+                // the survivors (txns) run here — we still own the object.
+                let mut ready = Vec::new();
+                let mut keep = VecDeque::new();
+                for entry in queue {
+                    match entry {
+                        Entry::Txn(t) => {
+                            if keep.is_empty() {
+                                ready.push(t);
+                            }
+                            keep.push_back(Entry::Txn(t));
+                        }
+                        Entry::Take { resp, .. } => {
+                            let _ = resp.send(Err(TakeError::Failed(
+                                "transfer aborted: checkpoint unavailable".into(),
+                            )));
+                        }
+                    }
+                }
+                if !keep.is_empty() {
+                    self.queues.insert(object.to_string(), keep);
+                }
+                ready
             }
         }
-        ready
     }
 
-    /// Drop local state and durably stop claiming this object. Remove side
-    /// writes its checkpoint BEFORE the receiver adds, so no object is ever
-    /// durably claimed twice.
-    async fn release(&mut self, object: &str, new_owner: Option<usize>) -> TransferMeta {
+    /// Drop local state and durably stop claiming this object. The remove
+    /// side writes its checkpoint BEFORE anything else happens — and the
+    /// transfer ABORTS if that write fails. Granting ownership you cannot
+    /// durably renounce leaves the object claimed by two checkpoints; the
+    /// simulator watched a restart resurrect the stale claim and fork the
+    /// object under two live writers (seed 5, torn transfer).
+    async fn release(&mut self, object: &str, new_owner: Option<usize>) -> anyhow::Result<TransferMeta> {
+        // Mint the next handoff generation: strictly above anything we
+        // ever held or granted for this object (implicit hash-default
+        // ownership is generation 0, so its first release mints 1).
+        let held = self.owned.remove(object);
+        let generation = held
+            .max(self.transit.get(object).map(|&(_, g)| g))
+            .unwrap_or(0)
+            + 1;
+        let dest = new_owner.unwrap_or(self.id);
+        let prior_transit = self.transit.insert(object.to_string(), (dest, generation));
+        if let Err(e) = self.checkpoint().await {
+            // Renounce failed: still ours, restore exactly what was.
+            match held {
+                Some(g) => {
+                    self.owned.insert(object.to_string(), g);
+                }
+                None => {
+                    self.owned.remove(object);
+                }
+            }
+            match prior_transit {
+                Some(t) => {
+                    self.transit.insert(object.to_string(), t);
+                }
+                None => {
+                    self.transit.remove(object);
+                }
+            }
+            anyhow::bail!("remove-side checkpoint failed: {e}");
+        }
         // Re-checks come from the worker that applies writes, and that is
         // about to be someone else: parked polls can't follow. Re-polling
         // is already the client's loop, so this is just an error.
@@ -987,7 +1382,6 @@ impl Worker {
             .unwrap()
             .set_cache(self.live_dir.join(format!("{object}.db")), self.id);
         let m = self.meta.remove(object);
-        self.owned.remove(object);
         let now = self.now();
         let tm = match m {
             Some(m) => TransferMeta {
@@ -996,11 +1390,13 @@ impl Worker {
                         && now.saturating_sub(m.arrived_at) >= self.node.hysteresis),
                 home: m.return_to.unwrap_or(self.id),
                 visit: m.visit,
+                generation,
             },
             None => TransferMeta {
                 settled: self.node.hysteresis > 0,
                 home: self.id,
                 visit: None,
+                generation,
             },
         };
         if let Some(new_owner) = new_owner {
@@ -1011,19 +1407,21 @@ impl Worker {
                 routing.exceptions.insert(object.to_string(), new_owner);
             }
         }
-        self.checkpoint().await;
-        tm
+        if std::env::var_os("FAFO_DST_LOG").is_some() {
+            eprintln!("release {object}: w{} -> {new_owner:?}", self.id);
+        }
+        Ok(tm)
     }
 
     // &mut self: a shared borrow held across the await would demand
     // Worker: Sync, which Connection forbids.
-    async fn checkpoint(&mut self) {
-        let mut owned: Vec<&String> = self.owned.iter().collect();
-        owned.sort();
-        let bytes = serde_json::to_vec(&json!({ "owned": owned })).expect("checkpoint serializes");
-        if let Err(e) = self.node.store.put(&checkpoint_key(self.id), &bytes).await {
-            eprintln!("w{}: checkpoint failed: {e}", self.id);
-        }
+    async fn checkpoint(&mut self) -> anyhow::Result<()> {
+        let cp = crate::cluster::Checkpoint {
+            owned: self.owned.clone(),
+            transit: self.transit.clone(),
+        };
+        let bytes = serde_json::to_vec(&cp).expect("checkpoint serializes");
+        self.node.store.put(&checkpoint_key(self.id), &bytes).await
     }
 
     async fn fail_txn(&mut self, txn: u64, msg: String) -> Vec<u64> {
@@ -1051,6 +1449,16 @@ impl Worker {
 
     async fn run_and_complete(&mut self, txn: u64) -> Vec<u64> {
         let p = self.parked.remove(&txn).expect("parked txn exists");
+        // Admission invariant: a txn only runs holding the head of every
+        // participant's queue. If this fails, ordered locking is broken
+        // and deadlock-freedom with it.
+        crate::fafo_assert!(
+            p.acquired == p.participants.len(),
+            "w{} ran txn{txn} with {}/{} participants acquired",
+            self.id,
+            p.acquired,
+            p.participants.len()
+        );
         if p.crossed {
             self.node
                 .stats
@@ -1203,14 +1611,17 @@ impl Worker {
         if home == self.id || !self.owns(object) {
             return;
         }
+        let Ok(mut tm) = self.release(object, Some(home)).await else {
+            return; // can't renounce durably: stay put, retry next idle
+        };
         self.node.stats.returns.fetch_add(1, Ordering::Relaxed);
-        let mut tm = self.release(object, Some(home)).await;
         tm.settled = false; // it's going home, not visiting
         tm.home = home;
         let node = self.node.clone();
+        let giver = self.id;
         let object = object.to_string();
-        tokio::spawn(async move {
-            send_adopt(&node, home, object, tm).await;
+        self.node.spawn_tracked(async move {
+            send_adopt(&node, giver, home, object, tm).await;
         });
     }
 
@@ -1231,10 +1642,22 @@ impl Worker {
         read_only: bool,
         cap: Option<&Arc<grants::Capability>>,
     ) -> Result<(Vec<OpResult>, Vec<String>), ApiError> {
-        // Participants are guaranteed live: advance() activates cold
-        // objects (off-loop) before a txn is allowed to run.
+        // advance() activated every participant before this txn was
+        // allowed to run — but a boat can SINK between acquisition and
+        // execution, and the revert purges its objects out from under us.
+        // Catch it here and fail retryably; indexing a purged participant
+        // would kill the whole worker (the simulator caught exactly that,
+        // seed 1, storage-fault window).
+        if let Some(missing) = participants
+            .iter()
+            .find(|id| !self.objects.contains_key(id.as_str()))
+        {
+            return Err(ApiError::internal(format!(
+                "participant {missing} reverted before execution; retry"
+            )));
+        }
         fn conn_of<'a>(
-            objects: &'a HashMap<String, LiveObject>,
+            objects: &'a Map<String, LiveObject>,
             id: &str,
         ) -> &'a rusqlite::Connection {
             &objects.get(id).expect("participant activated").conn
@@ -1276,7 +1699,7 @@ impl Worker {
                 ));
             }
         }
-        let clear_authorizers = |objects: &HashMap<String, LiveObject>| {
+        let clear_authorizers = |objects: &Map<String, LiveObject>| {
             if cap.is_some() {
                 for id in participants {
                     conn_of(objects, id).authorizer(
@@ -1333,21 +1756,8 @@ impl Worker {
             // Participants before it already committed and cannot be
             // uncommitted: erase the txn atomically by reverting them to
             // durable state. Their unshipped writes revert too — the
-            // sunk-boat contract, applied locally.
-            for id in &participants[..failed_at] {
-                self.fail_polls(id, "state reverted; re-poll");
-                purge(&mut self.objects, id);
-                self.manifests.remove(id);
-                if let Some(bytes) = self.dirty.remove(id) {
-                    self.dirty_bytes = self.dirty_bytes.saturating_sub(bytes);
-                }
-                self.node
-                    .disk
-                    .lock()
-                    .unwrap()
-                    .remove(&self.live_dir.join(format!("{id}.db")));
-            }
-            self.drop_pending_touching(&participants[..failed_at]);
+            // sunk-boat contract, applied locally — closure included.
+            self.revert_closure(&participants[..failed_at]);
             return Err(ApiError::internal(format!("local commit failed: {e}")));
         }
 
@@ -1437,7 +1847,7 @@ fn txn_components(pending: &[AppliedTxn]) -> Vec<Vec<usize>> {
         parent[i]
     }
     let mut parent: Vec<usize> = (0..pending.len()).collect();
-    let mut first_txn_with: HashMap<&str, usize> = HashMap::new();
+    let mut first_txn_with: Map<&str, usize> = Map::default();
     for (i, txn) in pending.iter().enumerate() {
         for object in &txn.participants {
             match first_txn_with.get(object.as_str()) {
@@ -1452,7 +1862,7 @@ fn txn_components(pending: &[AppliedTxn]) -> Vec<Vec<usize>> {
         }
     }
     let mut components: Vec<Vec<usize>> = Vec::new();
-    let mut slot_of_root: HashMap<usize, usize> = HashMap::new();
+    let mut slot_of_root: Map<usize, usize> = Map::default();
     for i in 0..pending.len() {
         let root = find(&mut parent, i);
         let slot = *slot_of_root.entry(root).or_insert_with(|| {
@@ -1511,7 +1921,13 @@ async fn ship_task(
     items: Vec<ShipItem>,
     waiters: Vec<(oneshot::Sender<Result<TxnResponse, ApiError>>, TxnResponse)>,
 ) {
-    let staging_id = uuid::Uuid::new_v4().to_string();
+    // Node tag + sequence: unique across the cluster, deterministic under
+    // the simulator (a uuid here was the last randomness in the hot path).
+    let staging_id = format!(
+        "{}-{}",
+        node.tag.get().map(String::as_str).unwrap_or("boot"),
+        node.ship_seq.fetch_add(1, Ordering::Relaxed)
+    );
     let objects: Vec<String> = items.iter().map(|i| i.object.clone()).collect();
     let payload_bytes: u64 = items.iter().map(|i| i.bytes().len() as u64).sum();
     let mut err: Option<String> = None;
@@ -1543,7 +1959,7 @@ async fn ship_task(
     // 3. the fenced flag, set by any failed verification.
     if err.is_none() {
         let deadline = *node.earliest_write.lock().unwrap();
-        let wait = deadline.saturating_duration_since(std::time::Instant::now());
+        let wait = deadline.saturating_duration_since(tokio::time::Instant::now());
         if !wait.is_zero() {
             tokio::time::sleep(wait).await;
         }
@@ -1608,9 +2024,20 @@ async fn ship_task(
                         (delta::delta_key(&item.object, *counter), bytes)
                     }
                 };
+                if std::env::var_os("FAFO_DST_LOG").is_some() {
+                    eprintln!(
+                        "ship {} {} @{}",
+                        staging_id,
+                        key,
+                        delta::change_counter(item.bytes())
+                    );
+                }
                 if node.store.put(&key, bytes).await.is_err() {
                     unpromoted.push(item.object.clone());
                 }
+            }
+            if !unpromoted.is_empty() && std::env::var_os("FAFO_DST_LOG").is_some() {
+                eprintln!("boat {staging_id} committed but unpromoted: {unpromoted:?}");
             }
             if unpromoted.is_empty() {
                 if !inline {
@@ -1674,8 +2101,55 @@ async fn take_task(
     object: String,
 ) {
     let mut last_err = String::from("no attempts");
+    // A NotMine hint names the next door to knock on — NOT the truth.
+    // It steers this chase privately; it must never be written into the
+    // routing map. (A stale hint written there once let a giver conclude
+    // "already local" mid-adopt and resurrect ownership it had just
+    // released: two live writers, one object, forked history. Simulator,
+    // seed 3.) Only real handshakes — grant, adopt, release — move routing.
+    let mut chase: Option<usize> = None;
     for attempt in 0..TAKE_RETRIES {
-        let owner = node.routing.read().unwrap().owner_of(&object);
+        let owner = match chase.take() {
+            // A peer claims WE own it. Believing it blindly once spun an
+            // AlreadyLocal/chase livelock — but discarding it blindly
+            // strands objects when it's TRUE: a fault-skipped boot read
+            // leaves a worker amnesiac about its own durable claims, and
+            // the hint is the only correction that will ever arrive
+            // (seed 34: every routing map pointed at the hash home, whose
+            // ledger check answered "w0 owns it" to w0, forever). Ask the
+            // ledger; if it confirms us, heal our own memory and run.
+            Some(h) if h == my_worker => {
+                use crate::cluster::Claim;
+                match crate::cluster::durable_claim(node.store.as_ref(), &object).await {
+                    Claim::Owned(w, g) | Claim::Transit(w, g)
+                        if w == my_worker && w != usize::MAX =>
+                    {
+                        // Ordered channel: the Adopt lands before Taken,
+                        // so the txn re-drives against restored ownership.
+                        let _ = reply.send(WorkerMsg::Adopt {
+                            object: object.clone(),
+                            meta: TransferMeta {
+                                settled: false,
+                                home: my_worker,
+                                visit: None,
+                                generation: g,
+                            },
+                        });
+                        let _ = reply.send(WorkerMsg::Taken {
+                            txn,
+                            object,
+                            from: my_worker,
+                            result: TakenResult::AlreadyLocal,
+                        });
+                        return;
+                    }
+                    Claim::Owned(w, _) | Claim::Transit(w, _) if w != usize::MAX => w,
+                    _ => node.routing.read().unwrap().owner_of(&object),
+                }
+            }
+            Some(h) => h,
+            None => node.routing.read().unwrap().owner_of(&object),
+        };
         if owner == my_worker {
             let _ = reply.send(WorkerMsg::Taken {
                 txn,
@@ -1684,6 +2158,9 @@ async fn take_task(
                 result: TakenResult::AlreadyLocal,
             });
             return;
+        }
+        if std::env::var_os("FAFO_DST_LOG").is_some() {
+            eprintln!("take {object} txn{txn} by w{my_worker} attempt {attempt} -> w{owner}");
         }
         let outcome = {
             let local_tx = crate::cluster::local_sender(&node, owner);
@@ -1722,6 +2199,16 @@ async fn take_task(
                 }
             }
         };
+        if std::env::var_os("FAFO_DST_LOG").is_some() {
+            eprintln!(
+                "take {object} txn{txn} attempt {attempt} outcome: {}",
+                match &outcome {
+                    Ok(Ok(_)) => "got".to_string(),
+                    Ok(Err(e)) => format!("{e:?}"),
+                    Err(e) => format!("err {e}"),
+                }
+            );
+        }
         match outcome {
             Ok(Ok(meta)) => {
                 let _ = reply.send(WorkerMsg::Taken {
@@ -1733,13 +2220,7 @@ async fn take_task(
                 return;
             }
             Ok(Err(TakeError::NotMine { hint })) => {
-                if let Some(h) = hint {
-                    node.routing
-                        .write()
-                        .unwrap()
-                        .exceptions
-                        .insert(object.clone(), h);
-                }
+                chase = hint;
                 last_err = format!("owner moved (hint {hint:?})");
             }
             Ok(Err(TakeError::Failed(e))) => last_err = e,
@@ -1755,19 +2236,32 @@ async fn take_task(
     });
 }
 
-async fn send_adopt(node: &Node, home: usize, object: String, meta: TransferMeta) {
+async fn send_adopt(node: &Node, giver: usize, home: usize, object: String, meta: TransferMeta) {
     let local_tx = crate::cluster::local_sender(node, home);
     if let Some(tx) = local_tx {
         let _ = tx.send(WorkerMsg::Adopt { object, meta });
         return;
     }
     let addr = node.routing.read().unwrap().addr_of_worker(home);
-    if let Some(addr) = addr
-        && let Err(e) = crate::rpc::adopt(node, &addr, home, object.clone(), meta).await
-    {
-        // Failed return: the object is orphaned (no checkpoint claims it)
-        // and falls back to its hash-default worker. Data is safe.
-        eprintln!("return of {object} to w{home} failed: {e}");
+    let failure = match addr {
+        Some(addr) => crate::rpc::adopt(node, &addr, home, object.clone(), meta.clone())
+            .await
+            .err()
+            .map(|e| e.to_string()),
+        None => Some(format!("no address for worker {home}")),
+    };
+    if let Some(e) = failure {
+        // The return died in flight — but "failed" here can mean "the ACK
+        // was lost": the home may have adopted. Blindly reclaiming at the
+        // giver would put two live writers on one object (the fork the
+        // conservation oracle catches downstream), so we do NOT reclaim.
+        // The object rests in transit: the durable marker names the home,
+        // and the next access heals it there (take-handler / activation
+        // adoption at Transit(home)). Liveness resumes with the next
+        // touch; correctness never left.
+        eprintln!("return of {object} to w{home} failed ({e}); healing deferred to next access");
+        let _ = giver;
+        let _ = meta;
     }
 }
 
@@ -1823,13 +2317,69 @@ async fn promote_staged(store: &dyn BlobStore, staged_key: &str, bytes: &[u8]) -
             .filter(|b| b.len() == 4)
             .map(|b| u32::from_be_bytes([b[0], b[1], b[2], b[3]]));
         if current.is_some_and(|c| c >= delta::change_counter(bytes)) {
+            if std::env::var_os("FAFO_DST_LOG").is_some() {
+                eprintln!("promote skip {object}: current {current:?} >= staged {}", delta::change_counter(bytes));
+            }
             return Ok(());
+        }
+        if std::env::var_os("FAFO_DST_LOG").is_some() {
+            eprintln!("promote {object}: current {current:?} -> staged {}", delta::change_counter(bytes));
         }
         store.put(&object_key(object), bytes).await?;
     } else if let Some((object, counter)) = name.rsplit_once(".delta.") {
         store
             .put(&format!("objects/{object}.d.{counter}"), bytes)
             .await?;
+    }
+    Ok(())
+}
+
+/// Roll one committed record forward: promote its payload (staged blobs
+/// or inline), then delete it. Idempotent and counter-monotone, so
+/// concurrent rollers-forward are harmless.
+async fn roll_forward(store: &dyn BlobStore, key: &str, record: &TxnRecord) -> anyhow::Result<()> {
+    if record.inline.is_empty() {
+        for staged in store.list(&format!("staging/{}/", record.txn_id)).await? {
+            if let Some(blob) = store.get(&staged).await? {
+                promote_staged(store, &staged, &blob).await?;
+            }
+            store.delete(&staged).await?;
+        }
+    } else {
+        // Inline boat: the payload lives in the record itself.
+        for (name, hexed) in &record.inline {
+            if let Some(blob) = hex_decode(hexed) {
+                promote_staged(store, name, &blob).await?;
+            }
+        }
+    }
+    store.delete(key).await?;
+    Ok(())
+}
+
+/// Activation-time recovery: before an object is activated ANYWHERE, any
+/// committed-but-unpromoted record touching it must be rolled forward —
+/// the whole record, its other participants included (atomicity).
+///
+/// Without this, a taker can activate state OLDER than a durable commit
+/// (the crashed owner's record landed but its promotion didn't), fork the
+/// object's history, and when the crashed node finally restarts, its boot
+/// recovery replays the stale record and resurrects half a transaction.
+/// The simulator caught it as conservation breaking by exactly one unit.
+/// The txns/ prefix is empty in steady state, so this is one cheap LIST
+/// per cold activation.
+pub async fn recover_records_touching(store: &dyn BlobStore, object: &str) -> anyhow::Result<()> {
+    for key in store.list("txns/").await? {
+        let Some(bytes) = store.get(&key).await? else {
+            continue;
+        };
+        let Ok(record) = serde_json::from_slice::<TxnRecord>(&bytes) else {
+            continue;
+        };
+        if record.objects.iter().any(|o| o == object) {
+            roll_forward(store, &key, &record).await?;
+            println!("activation of {object} rolled forward txn {}", record.txn_id);
+        }
     }
     Ok(())
 }
@@ -1847,22 +2397,7 @@ pub async fn recover(store: &dyn BlobStore) -> anyhow::Result<()> {
             store.delete(&key).await?;
             continue;
         };
-        if record.inline.is_empty() {
-            for staged in store.list(&format!("staging/{}/", record.txn_id)).await? {
-                if let Some(blob) = store.get(&staged).await? {
-                    promote_staged(store, &staged, &blob).await?;
-                }
-                store.delete(&staged).await?;
-            }
-        } else {
-            // Inline boat: the payload lives in the record itself.
-            for (name, hexed) in &record.inline {
-                if let Some(blob) = hex_decode(hexed) {
-                    promote_staged(store, name, &blob).await?;
-                }
-            }
-        }
-        store.delete(&key).await?;
+        roll_forward(store, &key, &record).await?;
         println!("recovered committed txn {}", record.txn_id);
     }
     for key in store.list("staging/").await? {

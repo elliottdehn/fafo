@@ -20,11 +20,11 @@
 //! process could commit within it. Documented in the README.
 
 use crate::api::ApiError;
+use crate::Map;
 use crate::store::BlobStore;
 use crate::worker::{self, WorkerMsg};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -69,6 +69,11 @@ pub struct TransferMeta {
     /// already on a trip, else the giver.
     pub home: usize,
     pub visit: Option<VisitInfo>,
+    /// Handoff generation this deed was cut at: strictly greater than any
+    /// generation the giver ever held or granted for this object. A deed
+    /// at gen <= what a worker already knows is stale and must be refused.
+    #[serde(default)]
+    pub generation: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -121,10 +126,10 @@ pub struct Routing {
     pub logical: usize,
     /// Lease blocks over the worker space (see ClusterMeta::blocks).
     pub blocks: usize,
-    pub exceptions: HashMap<String, usize>,
+    pub exceptions: Map<String, usize>,
     /// Lease block -> base URL of the node holding it. Block-keyed so the
     /// map stays O(blocks) however large the logical worker space is.
-    pub addrs: HashMap<usize, String>,
+    pub addrs: Map<usize, String>,
 }
 
 impl Routing {
@@ -162,12 +167,16 @@ impl Routing {
 /// owning instance, deleting the inter-instance hairpin for any object
 /// still at its hash-default home.
 pub fn default_worker(object: &str, logical: usize) -> usize {
+    (fnv1a(object.as_bytes()) % logical as u64) as usize
+}
+
+pub fn fnv1a(bytes: &[u8]) -> u64 {
     let mut h: u64 = 0xcbf29ce484222325;
-    for b in object.as_bytes() {
+    for b in bytes {
         h ^= *b as u64;
         h = h.wrapping_mul(0x100000001b3);
     }
-    (h % logical as u64) as usize
+    h
 }
 
 // --------------------------------------------------------------------- node
@@ -229,6 +238,49 @@ pub struct NodeConfig {
     /// commits before the new holder's first read. Closes the split-brain
     /// window under bounded-clock-rate assumptions.
     pub fence_ttl: std::time::Duration,
+    /// How this node reaches peers. None = HTTP (production). The
+    /// simulator injects an in-process transport it can delay, drop, and
+    /// partition.
+    pub transport: Option<Arc<dyn crate::rpc::Transport>>,
+    /// Serve the public HTTP API. The simulator turns this off: no
+    /// sockets means no OS nondeterminism.
+    pub serve_http: bool,
+    /// What losing a lease means. True (production): process::exit —
+    /// fail-stop is the correct response to a superseded epoch. False
+    /// (simulation): crash only this node, the sim must keep running.
+    pub exit_on_fence: bool,
+    /// Check the wall clock (in addition to the monotonic one) at the
+    /// fencing recency gate. True in production — it catches system
+    /// suspends the monotonic clock sleeps through. False under the
+    /// simulator, where tokio's paused clock is the only real one and a
+    /// CPU-contended host would otherwise fence healthy virtual nodes
+    /// (found as a once-per-sweep heisen-failure: wall time outran
+    /// FENCE_TTL while virtual time was fine).
+    pub wall_fence: bool,
+}
+
+impl NodeConfig {
+    /// Production-shaped defaults; override what the situation needs.
+    pub fn new(store: Arc<dyn BlobStore>, live_dir: impl Into<PathBuf>) -> Self {
+        Self {
+            store,
+            live_dir: live_dir.into(),
+            logical: 4096,
+            claim: ClaimSpec::All,
+            bind: "127.0.0.1:0".into(),
+            advertise: None,
+            hysteresis: 200,
+            secret: "dev-secret".into(),
+            api_token: None,
+            max_unshipped: DEFAULT_MAX_UNSHIPPED,
+            limits: crate::limits::Limits::detect(),
+            fence_ttl: std::time::Duration::from_secs(10),
+            transport: None,
+            serve_http: true,
+            exit_on_fence: true,
+            wall_fence: true,
+        }
+    }
 }
 
 pub const DEFAULT_MAX_UNSHIPPED: u64 = 256 * 1024 * 1024;
@@ -240,7 +292,7 @@ pub struct NodeInner {
     /// virtual: owning a block claims its whole worker range, but a task
     /// only exists once a worker is first touched (Orleans-style), so a
     /// million logical workers cost nothing until used.
-    pub local: RwLock<HashMap<usize, mpsc::UnboundedSender<WorkerMsg>>>,
+    pub local: RwLock<Map<usize, mpsc::UnboundedSender<WorkerMsg>>>,
     /// Where spawned workers keep live files (needed for lazy spawning).
     pub live_dir: PathBuf,
     /// Logical clock for tenure/visit windows (per-node; hints only).
@@ -254,12 +306,28 @@ pub struct NodeInner {
     pub limits: crate::limits::Limits,
     /// Node-wide local-file accounting; enforces the disk budget.
     pub disk: Mutex<crate::limits::DiskLedger>,
+    /// Per-worker transit maps loaded from checkpoints at boot, so a
+    /// rebooted giver still remembers which handoffs were in flight.
+    pub boot_transit: Mutex<Map<usize, Map<String, (usize, u64)>>>,
+    /// Per-worker owned sets (with generations) reconciled at boot; each
+    /// worker task consumes its slice when it spawns.
+    pub boot_owned: Mutex<Map<usize, Map<String, u64>>>,
     /// Caps concurrent cold-object fetches (each holds an image in RAM).
     pub activation_permits: Arc<tokio::sync::Semaphore>,
-    pub http: reqwest::Client,
+    /// How this node reaches peers (HTTP in production, in-process under
+    /// the simulator).
+    pub transport: Arc<dyn crate::rpc::Transport>,
+    /// Short name derived from the advertise address plus this boot's
+    /// lease epoch; prefixes staging ids so they are unique across the
+    /// cluster AND across restarts (a restarted node reusing ids let one
+    /// generation's commit records clobber another's — simulator, seed 3),
+    /// while staying deterministic under simulation (uuids were not).
+    pub tag: std::sync::OnceLock<String>,
+    /// Staging-id sequence for boats.
+    pub ship_seq: AtomicU64,
     pub stats: Stats,
     /// Epochs of block leases this node holds; watched by the lease guard.
-    pub epochs: RwLock<HashMap<usize, u64>>,
+    pub epochs: RwLock<Map<usize, u64>>,
     /// Set by the lease guard just before fail-stop; checked at the commit
     /// point as a last line of defense.
     pub fenced: AtomicBool,
@@ -268,11 +336,18 @@ pub struct NodeInner {
     /// monotonic clock catches process pauses (it keeps ticking while we
     /// don't); the wall clock catches system suspend (where monotonic
     /// may sleep too). Stale on EITHER axis forces re-verification.
-    pub verified: Mutex<(std::time::Instant, std::time::SystemTime)>,
+    /// (tokio Instants, so the simulator's virtual clock governs them.)
+    pub verified: Mutex<(tokio::time::Instant, std::time::SystemTime)>,
     /// No commit may pass before this instant: set to claim time + TTL when
     /// taking over a non-tombstoned lease, giving a paused predecessor's
     /// recency gate time to expire first.
-    pub earliest_write: Mutex<std::time::Instant>,
+    pub earliest_write: Mutex<tokio::time::Instant>,
+    /// Fail-stop policy: exit the process (production) or crash just this
+    /// node (simulation).
+    exit_on_fence: bool,
+    wall_fence: bool,
+    /// Every task this node spawned: HTTP server, lease guard, workers,
+    /// boats, takes. crash() aborts them all — kill -9 with a scalpel.
     tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
 }
 
@@ -324,9 +399,78 @@ pub fn block_range(block: usize, logical: usize, blocks: usize) -> (usize, usize
     (start, end)
 }
 
-#[derive(Serialize, Deserialize)]
-struct Checkpoint {
-    owned: Vec<String>,
+#[derive(Serialize, Deserialize, Default)]
+#[serde(from = "CheckpointWire")]
+pub(crate) struct Checkpoint {
+    /// object -> the handoff generation at which this worker admitted it.
+    /// Generations strictly increase with every release of an object, so
+    /// "highest gen wins" arbitrates every stale-claim question — dual
+    /// claims at boot, late adopts, twice-spent deeds — with an integer
+    /// compare instead of heuristics. (The simulator burned down every
+    /// cheaper scheme: unversioned claims left cycles of stale transit
+    /// markers that a chain-follower resolved arbitrarily — and wrongly.)
+    pub(crate) owned: Map<String, u64>,
+    /// Objects this worker released whose new owner may not have durably
+    /// claimed them yet: object -> (destination, generation). This is what
+    /// makes the transfer gap VISIBLE — without it, an object mid-handoff
+    /// looks durably unclaimed and the hash-default fallback would
+    /// manufacture a second owner.
+    #[serde(default, skip_serializing_if = "Map::is_empty")]
+    pub(crate) transit: Map<String, (usize, u64)>,
+}
+
+/// Wire-compat shim: checkpoints written before handoff generations stored
+/// `owned` as a bare array and `transit` as object -> worker. Silently
+/// ignoring them on upgrade would be amnesia — the exact failure mode the
+/// simulator punished — so legacy entries deserialize at generation 1
+/// (any post-upgrade handoff outbids them).
+#[derive(Deserialize)]
+struct CheckpointWire {
+    #[serde(default)]
+    owned: OwnedWire,
+    #[serde(default)]
+    transit: TransitWire,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum OwnedWire {
+    Gens(Map<String, u64>),
+    Legacy(Vec<String>),
+}
+
+impl Default for OwnedWire {
+    fn default() -> Self {
+        OwnedWire::Gens(Map::default())
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum TransitWire {
+    Gens(Map<String, (usize, u64)>),
+    Legacy(Map<String, usize>),
+}
+
+impl Default for TransitWire {
+    fn default() -> Self {
+        TransitWire::Gens(Map::default())
+    }
+}
+
+impl From<CheckpointWire> for Checkpoint {
+    fn from(w: CheckpointWire) -> Self {
+        Checkpoint {
+            owned: match w.owned {
+                OwnedWire::Gens(m) => m,
+                OwnedWire::Legacy(v) => v.into_iter().map(|o| (o, 1)).collect(),
+            },
+            transit: match w.transit {
+                TransitWire::Gens(m) => m,
+                TransitWire::Legacy(m) => m.into_iter().map(|(o, w)| (o, (w, 1))).collect(),
+            },
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -398,9 +542,9 @@ async fn lease_from_keys(
 async fn load_leases(
     store: &dyn BlobStore,
     blocks: usize,
-) -> anyhow::Result<HashMap<usize, LeaseState>> {
+) -> anyhow::Result<Map<usize, LeaseState>> {
     let keys = store.list("_lease/").await?;
-    let mut by_block: HashMap<usize, Vec<String>> = HashMap::new();
+    let mut by_block: Map<usize, Vec<String>> = Map::default();
     for key in keys {
         if let Some(b) = key
             .strip_prefix("_lease/b")
@@ -411,7 +555,7 @@ async fn load_leases(
             by_block.entry(b).or_default().push(key);
         }
     }
-    let mut out = HashMap::new();
+    let mut out = Map::default();
     for (block, keys) in by_block {
         if let Some(state) = lease_from_keys(store, block, &keys).await? {
             out.insert(block, state);
@@ -450,7 +594,10 @@ pub async fn start(cfg: NodeConfig) -> anyhow::Result<Node> {
     // claimed by two checkpoints (crash between transfer writes) goes to the
     // lower worker id — arbitrary but deterministic, and safe because the
     // data lives in the blob store either way.
-    let mut exceptions: HashMap<String, usize> = HashMap::new();
+    let mut exceptions: Map<String, usize> = Map::default();
+    let mut boot_transit: Map<usize, Map<String, (usize, u64)>> = Map::default();
+    let mut boot_owned: Map<usize, Map<String, u64>> = Map::default();
+    let mut claim_gens: Map<String, (usize, u64)> = Map::default();
     for key in cfg.store.list("_worker/").await? {
         let Some(w) = key
             .strip_prefix("_worker/")
@@ -465,34 +612,64 @@ pub async fn start(cfg: NodeConfig) -> anyhow::Result<Node> {
         let Ok(cp) = serde_json::from_slice::<Checkpoint>(&bytes) else {
             continue;
         };
-        for object in cp.owned {
-            if default_worker(&object, logical) == w {
-                continue;
-            }
-            match exceptions.get(&object) {
-                Some(&prev) if prev <= w => {
-                    println!("boot: {object} dual-claimed by w{prev} and w{w}; keeping w{prev}");
+        if !cp.transit.is_empty() {
+            boot_transit.insert(w, cp.transit.clone());
+        }
+        for (object, generation) in cp.owned {
+            match claim_gens.get(&object) {
+                Some(&(prev_w, prev_g)) => {
+                    // Dual claim: the higher generation is the later
+                    // handoff, i.e. the real owner. (Ties can't happen —
+                    // one release, one generation — but break them
+                    // deterministically anyway.)
+                    let keep = if generation > prev_g || (generation == prev_g && w < prev_w) {
+                        claim_gens.insert(object.clone(), (w, generation));
+                        w
+                    } else {
+                        prev_w
+                    };
+                    println!(
+                        "boot: {object} dual-claimed by w{prev_w}@g{prev_g} and w{w}@g{generation}; keeping w{keep}"
+                    );
                 }
-                _ => {
-                    exceptions.insert(object, w);
+                None => {
+                    claim_gens.insert(object.clone(), (w, generation));
                 }
             }
         }
     }
+    for (object, (w, generation)) in &claim_gens {
+        boot_owned
+            .entry(*w)
+            .or_default()
+            .insert(object.clone(), *generation);
+        if default_worker(object, logical) != *w {
+            exceptions.insert(object.clone(), *w);
+        }
+    }
 
-    let listener = tokio::net::TcpListener::bind(&cfg.bind).await?;
-    let advertise = cfg
-        .advertise
-        .clone()
-        .unwrap_or_else(|| format!("http://{}", listener.local_addr().unwrap()));
+    // No HTTP means no sockets at all (the simulator's world); it also
+    // means the advertise address must be given, since there is no bound
+    // port to derive one from.
+    let listener = if cfg.serve_http {
+        Some(tokio::net::TcpListener::bind(&cfg.bind).await?)
+    } else {
+        None
+    };
+    let advertise = match (cfg.advertise.clone(), &listener) {
+        (Some(a), _) => a,
+        (None, Some(l)) => format!("http://{}", l.local_addr()?),
+        (None, None) => anyhow::bail!("advertise is required when not serving HTTP"),
+    };
 
     // Current block-lease holders (one list; so we can route to peers).
     let leases = load_leases(cfg.store.as_ref(), blocks).await?;
-    let addrs: HashMap<usize, String> = leases
+    let addrs: Map<usize, String> = leases
         .iter()
         .map(|(b, lease)| (*b, lease.addr.clone()))
         .collect();
 
+    let secret = cfg.secret;
     let node: Node = Arc::new(NodeInner {
         store: cfg.store.clone(),
         routing: RwLock::new(Routing {
@@ -501,33 +678,44 @@ pub async fn start(cfg: NodeConfig) -> anyhow::Result<Node> {
             exceptions,
             addrs,
         }),
-        local: RwLock::new(HashMap::new()),
+        local: RwLock::new(Map::default()),
         live_dir: cfg.live_dir.clone(),
         clock: AtomicU64::new(0),
         hysteresis: cfg.hysteresis,
         advertise: advertise.clone(),
-        secret: cfg.secret,
+        secret: secret.clone(),
         api_token: cfg.api_token,
         max_unshipped: cfg.max_unshipped,
         limits: cfg.limits,
         disk: Mutex::new(crate::limits::DiskLedger::new(cfg.limits.disk_budget)),
+        boot_transit: Mutex::new(boot_transit),
+        boot_owned: Mutex::new(boot_owned),
         activation_permits: Arc::new(tokio::sync::Semaphore::new(cfg.limits.activation_permits)),
-        http: reqwest::Client::new(),
+        transport: match cfg.transport {
+            Some(t) => t,
+            None => Arc::new(crate::rpc::Http::new(secret.clone())),
+        },
+        tag: std::sync::OnceLock::new(),
+        ship_seq: AtomicU64::new(0),
         stats: Stats::default(),
-        epochs: RwLock::new(HashMap::new()),
+        epochs: RwLock::new(Map::default()),
         fenced: AtomicBool::new(false),
         fence_ttl: cfg.fence_ttl,
-        verified: Mutex::new((std::time::Instant::now(), std::time::SystemTime::now())),
-        earliest_write: Mutex::new(std::time::Instant::now()),
+        verified: Mutex::new((tokio::time::Instant::now(), std::time::SystemTime::now())),
+        earliest_write: Mutex::new(tokio::time::Instant::now()),
+        exit_on_fence: cfg.exit_on_fence,
+        wall_fence: cfg.wall_fence,
         tasks: Mutex::new(Vec::new()),
     });
 
     // The HTTP server must be up before claiming: peers health-check us,
     // and a claimed-but-unreachable node reads as dead.
-    let app = crate::api::router(node.clone());
-    node.tasks.lock().unwrap().push(tokio::spawn(async move {
-        let _ = axum::serve(listener, app).await;
-    }));
+    if let Some(listener) = listener {
+        let app = crate::api::router(node.clone());
+        node.spawn_tracked(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+    }
 
     // Claiming operates on BLOCKS: O(≤256) blob ops however big W is.
     let candidate_blocks: Vec<usize> = match &cfg.claim {
@@ -558,7 +746,7 @@ pub async fn start(cfg: NodeConfig) -> anyhow::Result<Node> {
     };
 
     // Health-check each foreign holder once, not once per block.
-    let mut addr_alive: HashMap<String, bool> = HashMap::new();
+    let mut addr_alive: Map<String, bool> = Map::default();
     let mut claimed = 0usize;
     for b in candidate_blocks {
         if claimed >= quota_blocks {
@@ -591,7 +779,7 @@ pub async fn start(cfg: NodeConfig) -> anyhow::Result<Node> {
                 // strictly before we read or write anything.
                 if !lease.released {
                     let mut ew = node.earliest_write.lock().unwrap();
-                    *ew = (*ew).max(std::time::Instant::now() + cfg.fence_ttl);
+                    *ew = (*ew).max(tokio::time::Instant::now() + cfg.fence_ttl);
                 }
                 lease.epoch + 1
             }
@@ -618,8 +806,16 @@ pub async fn start(cfg: NodeConfig) -> anyhow::Result<Node> {
         claimed += 1;
     }
 
+    // Name this boot: address hash + the highest epoch we just claimed.
+    // Epochs only go up, so two boots of one node can never share a tag.
+    let boot_epoch = node.epochs.read().unwrap().values().max().copied().unwrap_or(0);
+    let _ = node.tag.set(format!(
+        "{:08x}e{boot_epoch}",
+        fnv1a(advertise.as_bytes()) as u32
+    ));
+
     // Claiming just created/verified our leases: stamp it.
-    *node.verified.lock().unwrap() = (std::time::Instant::now(), std::time::SystemTime::now());
+    *node.verified.lock().unwrap() = (tokio::time::Instant::now(), std::time::SystemTime::now());
 
     // Lease guard: fail-stop if any of our epochs gets superseded. Losing a
     // lease means another node is now the writer for that worker; continuing
@@ -627,12 +823,12 @@ pub async fn start(cfg: NodeConfig) -> anyhow::Result<Node> {
     // (fail-stop) response, not a recoverable error. Each clean sweep also
     // refreshes the recency stamps the commit gate checks.
     let guard_node = node.clone();
-    node.tasks.lock().unwrap().push(tokio::spawn(async move {
+    node.spawn_tracked(async move {
         loop {
             tokio::time::sleep(LEASE_GUARD_INTERVAL).await;
             verify_leases(&guard_node).await;
         }
-    }));
+    });
 
     println!(
         "node {} claimed worker ranges {:?} of {} logical workers ({} blocks)",
@@ -660,7 +856,7 @@ pub async fn verify_leases(node: &Node) -> bool {
     let Ok(keys) = node.store.list("_lease/").await else {
         return true; // transient store error: keep the old stamp, retry later
     };
-    let mut max_epoch: HashMap<usize, u64> = HashMap::new();
+    let mut max_epoch: Map<usize, u64> = Map::default();
     for key in &keys {
         // _lease/b<block>/e<epoch>.json (tombstones end .released)
         let Some(rest) = key.strip_prefix("_lease/b") else {
@@ -691,7 +887,7 @@ pub async fn verify_leases(node: &Node) -> bool {
             return false;
         }
     }
-    *node.verified.lock().unwrap() = (std::time::Instant::now(), std::time::SystemTime::now());
+    *node.verified.lock().unwrap() = (tokio::time::Instant::now(), std::time::SystemTime::now());
     true
 }
 
@@ -702,6 +898,9 @@ pub fn lease_stale(node: &Node) -> bool {
     if mono.elapsed() > node.fence_ttl {
         return true;
     }
+    if !node.wall_fence {
+        return false;
+    }
     std::time::SystemTime::now()
         .duration_since(wall)
         .map(|d| d > node.fence_ttl)
@@ -711,10 +910,15 @@ pub fn lease_stale(node: &Node) -> bool {
 fn fail_stop(node: &Node, msg: &str) {
     node.fenced.store(true, Ordering::SeqCst);
     eprintln!("FENCED: {msg}; fail-stopping");
-    // Under test, exiting would take the whole test runner with us; the
-    // fenced flag (which the commit gate honors) stands in for death.
-    #[cfg(not(test))]
-    std::process::exit(1);
+    if node.exit_on_fence {
+        // Under test, exiting would take the whole test runner with us;
+        // the fenced flag (which the commit gate honors) stands in.
+        #[cfg(not(test))]
+        std::process::exit(1);
+    } else {
+        // Simulation: this node dies, the world keeps turning.
+        node.crash();
+    }
 }
 
 /// Get (or lazily spawn) the local worker task for a logical worker this
@@ -742,6 +946,31 @@ pub fn local_sender(node: &Node, worker: usize) -> Option<mpsc::UnboundedSender<
 }
 
 impl NodeInner {
+    /// Spawn a task that dies with this node. Everything a node starts —
+    /// server, guard, workers, boats, takes — goes through here so that
+    /// crash() can take it all down the way the kernel would.
+    pub fn spawn_tracked<F>(&self, fut: F)
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let mut tasks = self.tasks.lock().unwrap();
+        tasks.retain(|t| !t.is_finished()); // don't hoard the dead
+        tasks.push(tokio::spawn(fut));
+    }
+
+    /// kill -9: abort every task without flushing, tombstoning, or saying
+    /// goodbye. Unshipped optimistic writes die (their contract), leases
+    /// stay un-tombstoned (successors must health-check and wait out the
+    /// fence TTL), and armed wills go down with the ship — exactly the
+    /// behavior the simulator exists to interrogate.
+    pub fn crash(&self) {
+        self.fenced.store(true, Ordering::SeqCst);
+        for task in self.tasks.lock().unwrap().drain(..) {
+            task.abort();
+        }
+        self.local.write().unwrap().clear();
+    }
+
     /// Enforce the disk budget: the ledger deletes LRU cache files itself;
     /// if live files alone still bust the budget, the heaviest worker gets
     /// a Shed request (deactivate idle clean objects -> cache -> deletable).
@@ -822,6 +1051,24 @@ impl NodeInner {
             let _ = self.store.create(&tombstone_key(w, epoch), b"released").await;
         }
         self.epochs.write().unwrap().clear();
+    }
+
+    /// Deadlock forensics: every live worker's queues and parked txns.
+    pub async fn debug_dump(&self) -> String {
+        let senders: Vec<(usize, mpsc::UnboundedSender<WorkerMsg>)> = {
+            let local = self.local.read().unwrap();
+            local.iter().map(|(w, tx)| (*w, tx.clone())).collect()
+        };
+        let mut out = format!("node {}:\n", self.advertise);
+        for (_w, tx) in senders {
+            let (rtx, rrx) = oneshot::channel();
+            if tx.send(WorkerMsg::Dump { resp: rtx }).is_ok()
+                && let Ok(dump) = rrx.await
+            {
+                out.push_str(&dump);
+            }
+        }
+        out
     }
 
     pub async fn stats(&self) -> StatsSnapshot {
@@ -942,19 +1189,7 @@ pub async fn submit_routed(
     // Plurality owner wins; ties break toward the less-loaded worker
     // (pressure), then lowest id (determinism). Two-object cross txns are
     // always 1-1 ties, so the load tie-break is the main balancing force.
-    let target = {
-        let routing = node.routing.read().unwrap();
-        let mut votes: HashMap<usize, usize> = HashMap::new();
-        for id in &ids {
-            *votes.entry(routing.owner_of(id)).or_default() += 1;
-        }
-        votes
-            .into_iter()
-            .min_by_key(|&(w, count)| (std::cmp::Reverse(count), routing.exception_load(w), w))
-            .map(|(w, _)| w)
-            .unwrap()
-    };
-
+    let target = plurality_target(node, &ids);
     let local_tx = local_sender(node, target);
     if let Some(tx) = local_tx {
         let (rtx, rrx) = oneshot::channel();
@@ -1009,6 +1244,64 @@ pub async fn submit_routed(
             other => other,
         }
     }
+}
+
+fn plurality_target(node: &Node, ids: &[String]) -> usize {
+    let routing = node.routing.read().unwrap();
+    let mut votes: Map<usize, usize> = Map::default();
+    for id in ids {
+        *votes.entry(routing.owner_of(id)).or_default() += 1;
+    }
+    votes
+        .into_iter()
+        .min_by_key(|&(w, count)| (std::cmp::Reverse(count), routing.exception_load(w), w))
+        .map(|(w, _)| w)
+        .expect("validated txns have participants")
+}
+
+/// A transaction that arrived over the RPC never forwards again: one hop,
+/// then THIS node coordinates. Any worker can (takes pull the remote
+/// participants in, healing routing hints as they chase). Re-forwarding
+/// looked harmless but is a live loop: two nodes with mutually stale
+/// exception hints bounce the txn forever, each hop nesting inside the
+/// last — the simulator caught it on its very first seed.
+pub async fn submit_received(
+    node: &Node,
+    cap: Option<Arc<crate::grants::Capability>>,
+    ids: Vec<String>,
+    ops: Vec<Op>,
+    read_only: bool,
+    optimistic: bool,
+) -> Result<TxnResponse, ApiError> {
+    let preferred = plurality_target(node, &ids);
+    let tx = local_sender(node, preferred).or_else(|| {
+        // The plurality owner isn't ours (the sender's hint was stale):
+        // coordinate at our lowest claimed worker, deterministically.
+        let block = node.epochs.read().unwrap().keys().min().copied()?;
+        let (start, _) = {
+            let routing = node.routing.read().unwrap();
+            block_range(block, routing.logical, routing.blocks)
+        };
+        local_sender(node, start)
+    });
+    let Some(tx) = tx else {
+        return Err(ApiError::internal(
+            "no local worker to coordinate a received transaction",
+        ));
+    };
+    let (rtx, rrx) = oneshot::channel();
+    tx.send(WorkerMsg::Submit {
+        participants: ids,
+        ops,
+        read_only,
+        poll: None,
+        cap,
+        optimistic,
+        resp: rtx,
+    })
+    .map_err(|_| ApiError::internal("worker is gone"))?;
+    rrx.await
+        .map_err(|_| ApiError::internal("transaction dropped"))?
 }
 
 /// Long-poll a read-only query on one object: the reply arrives when the
@@ -1080,6 +1373,66 @@ pub fn cancel_poll(node: &Node, object: &str, conn: u64, frame: u64) {
     }
 }
 
+/// The durable truth about who claims an object, from the checkpoint set.
+/// Placement hints can go stale (transfers whose parties died mid-
+/// handshake leave cycles of lies); the checkpoints cannot — every
+/// transfer renounces durably (with a transit marker) before granting.
+/// Rare-path only: one LIST plus one GET per checkpointed worker.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Claim {
+    /// A worker's checkpoint lists it as owned (worker, generation).
+    Owned(usize, u64),
+    /// Mid-handoff: the giver's transit marker names the destination
+    /// (destination, generation).
+    Transit(usize, u64),
+    /// No durable claim anywhere: the hash-default home may adopt.
+    Unclaimed,
+}
+
+pub async fn durable_claim(store: &dyn BlobStore, object: &str) -> Claim {
+    let Ok(keys) = store.list("_worker/").await else {
+        // Can't read the truth: claim nothing, adopt nothing.
+        return Claim::Transit(usize::MAX, u64::MAX);
+    };
+    // Highest generation wins; at equal generation an admitted claim
+    // (owned) supersedes the giver's marker for the same handoff. Stale
+    // markers from earlier hops lose on generation alone — no chain
+    // walking, no cycles, no heuristics.
+    let mut best: Option<Claim> = None;
+    let rank = |c: &Claim| match *c {
+        Claim::Owned(_, g) => (g, 1u8),
+        Claim::Transit(_, g) => (g, 0u8),
+        Claim::Unclaimed => (0, 0),
+    };
+    for key in keys {
+        let Some(w) = key
+            .strip_prefix("_worker/")
+            .and_then(|k| k.strip_suffix(".json"))
+            .and_then(|k| k.parse::<usize>().ok())
+        else {
+            continue;
+        };
+        let Ok(Some(bytes)) = store.get(&key).await else {
+            continue;
+        };
+        let Ok(cp) = serde_json::from_slice::<Checkpoint>(&bytes) else {
+            continue;
+        };
+        let mut consider = |c: Claim| {
+            if best.as_ref().is_none_or(|b| rank(&c) > rank(b)) {
+                best = Some(c);
+            }
+        };
+        if let Some(&g) = cp.owned.get(object) {
+            consider(Claim::Owned(w, g));
+        }
+        if let Some(&(to, g)) = cp.transit.get(object) {
+            consider(Claim::Transit(to, g));
+        }
+    }
+    best.unwrap_or(Claim::Unclaimed)
+}
+
 /// Convenience for tests: find an id that hash-defaults to a given worker.
 pub fn id_on_worker(worker: usize, logical: usize, tag: &str) -> String {
     (0..)
@@ -1102,18 +1455,12 @@ mod tests {
     ) -> Node {
         let store: Arc<dyn BlobStore> = Arc::new(FsBlobStore::new(root.join("blobs")).unwrap());
         start(NodeConfig {
-            store,
-            live_dir: root.join(format!("live-{tag}")),
             logical,
             claim,
-            bind: "127.0.0.1:0".into(),
-            advertise: None,
             hysteresis,
             secret: "test-secret".into(),
-            api_token: None,
-            max_unshipped: DEFAULT_MAX_UNSHIPPED,
-            limits: crate::limits::Limits::detect(),
             fence_ttl: std::time::Duration::from_secs(60),
+            ..NodeConfig::new(store, root.join(format!("live-{tag}")))
         })
         .await
         .unwrap()
@@ -1246,8 +1593,8 @@ mod tests {
         let mut routing = Routing {
             logical: 4,
             blocks: 4,
-            exceptions: HashMap::new(),
-            addrs: HashMap::new(),
+            exceptions: Map::default(),
+            addrs: Map::default(),
         };
         assert!(!routing.crowded(0), "an empty cluster is never crowded");
         // 8 exceptions over 4 workers: fair share 2, cap max(2*8/4, 4) = 4.
@@ -1562,7 +1909,7 @@ mod tests {
     }
 
     /// Counts full GETs per key, to prove the commuter cache skips them.
-    struct CountingStore(FsBlobStore, std::sync::Mutex<HashMap<String, u32>>);
+    struct CountingStore(FsBlobStore, std::sync::Mutex<Map<String, u32>>);
 
     #[async_trait::async_trait]
     impl BlobStore for CountingStore {
@@ -1592,22 +1939,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let counting = Arc::new(CountingStore(
             FsBlobStore::new(dir.path().join("blobs")).unwrap(),
-            std::sync::Mutex::new(HashMap::new()),
+            std::sync::Mutex::new(Map::default()),
         ));
         let store: Arc<dyn BlobStore> = counting.clone();
         let node = start(NodeConfig {
-            store,
-            live_dir: dir.path().join("live"),
             logical: 4,
             claim: ClaimSpec::All,
-            bind: "127.0.0.1:0".into(),
-            advertise: None,
-            hysteresis: 3, // low tenure bar so the cross-txn displaces + returns
+            hysteresis: 3, // low tenure bar so the cross-txn displaces + returns,
             secret: "test".into(),
-            api_token: None,
-            max_unshipped: DEFAULT_MAX_UNSHIPPED,
-            limits: crate::limits::Limits::detect(),
             fence_ttl: std::time::Duration::from_secs(60),
+            ..NodeConfig::new(store, dir.path().join("live"))
         })
         .await
         .unwrap();
@@ -1696,18 +2037,12 @@ mod tests {
         let mut limits = crate::limits::Limits::derive(4 << 30, 8 << 30);
         limits.max_boat_bytes = 1; // every component alone busts the cap
         let node = start(NodeConfig {
-            store,
-            live_dir: dir.path().join("live"),
             logical: 4,
             claim: ClaimSpec::All,
-            bind: "127.0.0.1:0".into(),
-            advertise: None,
-            hysteresis: 200,
             secret: "test".into(),
-            api_token: None,
-            max_unshipped: DEFAULT_MAX_UNSHIPPED,
             limits,
             fence_ttl: std::time::Duration::from_secs(60),
+            ..NodeConfig::new(store, dir.path().join("live"))
         })
         .await
         .unwrap();
@@ -1773,18 +2108,12 @@ mod tests {
         let mut limits = crate::limits::Limits::derive(4 << 30, 8 << 30);
         limits.disk_budget = 40 * 1024; // ~2 small SQLite files
         let node = start(NodeConfig {
-            store,
-            live_dir: dir.path().join("live"),
             logical: 4,
             claim: ClaimSpec::All,
-            bind: "127.0.0.1:0".into(),
-            advertise: None,
-            hysteresis: 200,
             secret: "test".into(),
-            api_token: None,
-            max_unshipped: DEFAULT_MAX_UNSHIPPED,
             limits,
             fence_ttl: std::time::Duration::from_secs(60),
+            ..NodeConfig::new(store, dir.path().join("live"))
         })
         .await
         .unwrap();
@@ -1890,18 +2219,10 @@ mod tests {
     ) -> Node {
         let store: Arc<dyn BlobStore> = Arc::new(FsBlobStore::new(root.join("blobs")).unwrap());
         start(NodeConfig {
-            store,
-            live_dir: root.join(format!("live-{tag}")),
             logical: 4,
-            claim: ClaimSpec::All,
-            bind: "127.0.0.1:0".into(),
-            advertise: None,
-            hysteresis: 200,
             secret: "test".into(),
-            api_token: None,
-            max_unshipped: DEFAULT_MAX_UNSHIPPED,
-            limits: crate::limits::Limits::detect(),
             fence_ttl,
+            ..NodeConfig::new(store, root.join(format!("live-{tag}")))
         })
         .await
         .unwrap()
@@ -2110,18 +2431,11 @@ mod tests {
                 let store: Arc<dyn BlobStore> =
                     Arc::new(FsBlobStore::new(root.join("blobs")).unwrap());
                 start(NodeConfig {
-                    store,
-                    live_dir: root.join(format!("live-{tag}")),
                     logical: 4,
                     claim: ClaimSpec::Workers(claim),
-                    bind: "127.0.0.1:0".into(),
-                    advertise: None,
-                    hysteresis: 200,
                     secret: "test-secret".into(),
-                    api_token: None,
-                    max_unshipped: DEFAULT_MAX_UNSHIPPED,
-                    limits: crate::limits::Limits::detect(),
                     fence_ttl: std::time::Duration::from_millis(300),
+                    ..NodeConfig::new(store, root.join(format!("live-{tag}")))
                 })
                 .await
                 .unwrap()
@@ -2179,18 +2493,39 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn boot_keeps_the_lower_worker_on_dual_claimed_objects() {
+    async fn boot_resolves_dual_claims_by_generation() {
         let dir = tempfile::tempdir().unwrap();
         let store = FsBlobStore::new(dir.path().join("blobs")).unwrap();
-        // A crash between the two transfer writes can leave an object in
-        // two checkpoints. Boot must pick one deterministically.
+        // A crash mid-handoff can leave an object in two checkpoints. The
+        // higher handoff generation is the later transfer — the real owner.
         let obj = id_on_worker(0, 4, "dual");
-        store.put("_worker/2.json", format!(r#"{{"owned":["{obj}"]}}"#).as_bytes()).await.unwrap();
-        store.put("_worker/1.json", format!(r#"{{"owned":["{obj}"]}}"#).as_bytes()).await.unwrap();
-        store.put("_worker/3.json", b"not even json").await.unwrap(); // ignored
+        store
+            .put("_worker/2.json", format!(r#"{{"owned":{{"{obj}":7}}}}"#).as_bytes())
+            .await
+            .unwrap();
+        store
+            .put("_worker/1.json", format!(r#"{{"owned":{{"{obj}":3}}}}"#).as_bytes())
+            .await
+            .unwrap();
+        // Legacy pre-generation checkpoint (bare array = generation 1):
+        // still readable — silently dropping it would be induced amnesia.
+        let legacy = id_on_worker(0, 4, "legacy");
+        store
+            .put("_worker/3.json", format!(r#"{{"owned":["{legacy}"]}}"#).as_bytes())
+            .await
+            .unwrap();
         store.put("_worker/stray-file", b"{}").await.unwrap(); // not a worker: ignored
         let node = boot(dir.path(), 4, ClaimSpec::All, "a").await;
-        assert_eq!(node.routing.read().unwrap().owner_of(&obj), 1, "lower id wins");
+        assert_eq!(
+            node.routing.read().unwrap().owner_of(&obj),
+            2,
+            "higher generation wins the dual claim"
+        );
+        assert_eq!(
+            node.routing.read().unwrap().owner_of(&legacy),
+            3,
+            "legacy checkpoints still claim their objects"
+        );
         node.shutdown().await;
     }
 
@@ -2329,34 +2664,22 @@ mod tests {
             std::time::Duration::from_millis(300),
         ));
         let node_a = start(NodeConfig {
-            store: store.clone(),
-            live_dir: dir.path().join("live-a"),
             logical: 4,
             claim: ClaimSpec::Workers(vec![0, 1]),
-            bind: "127.0.0.1:0".into(),
-            advertise: None,
             hysteresis: 3,
             secret: "test".into(),
-            api_token: None,
-            max_unshipped: DEFAULT_MAX_UNSHIPPED,
-            limits: crate::limits::Limits::detect(),
             fence_ttl: std::time::Duration::from_secs(60),
+            ..NodeConfig::new(store.clone(), dir.path().join("live-a"))
         })
         .await
         .unwrap();
         let node_b = start(NodeConfig {
-            store,
-            live_dir: dir.path().join("live-b"),
             logical: 4,
             claim: ClaimSpec::Workers(vec![2, 3]),
-            bind: "127.0.0.1:0".into(),
-            advertise: None,
             hysteresis: 3,
             secret: "test".into(),
-            api_token: None,
-            max_unshipped: DEFAULT_MAX_UNSHIPPED,
-            limits: crate::limits::Limits::detect(),
             fence_ttl: std::time::Duration::from_secs(60),
+            ..NodeConfig::new(store, dir.path().join("live-b"))
         })
         .await
         .unwrap();
@@ -2542,18 +2865,12 @@ mod tests {
         let mut limits = crate::limits::Limits::derive(4 << 30, 8 << 30);
         limits.max_boat_bytes = 1; // every component alone busts the cap
         let node = start(NodeConfig {
-            store,
-            live_dir: dir.path().join("live"),
             logical: 4,
             claim: ClaimSpec::All,
-            bind: "127.0.0.1:0".into(),
-            advertise: None,
-            hysteresis: 200,
             secret: "test".into(),
-            api_token: None,
-            max_unshipped: DEFAULT_MAX_UNSHIPPED,
             limits,
             fence_ttl: std::time::Duration::from_secs(60),
+            ..NodeConfig::new(store, dir.path().join("live"))
         })
         .await
         .unwrap();
@@ -2674,14 +2991,19 @@ mod tests {
         // from shedding (their live file is ahead of the blob store).
         local_sender(&node, 1).unwrap().send(WorkerMsg::Shed).unwrap();
 
-        // A take granted while the store is down still transfers (the
-        // checkpoint write fails and is logged; placement is a hint).
+        // A take during the outage is REFUSED: ownership you cannot
+        // durably renounce must not move (granting anyway once forked an
+        // object under two live writers). The object stays here, usable.
         let (ttx, trx) = oneshot::channel();
         local_sender(&node, 1)
             .unwrap()
             .send(WorkerMsg::Take { object: bystander.clone(), taker: 2, resp: ttx })
             .unwrap();
-        trx.await.unwrap().unwrap();
+        let refused = trx.await.unwrap();
+        assert!(
+            matches!(refused, Err(TakeError::Failed(_)) | Err(TakeError::NotMine { .. })),
+            "transfer must abort when the renounce can't be made durable: {refused:?}"
+        );
         publish(&node, &chan, "doomed", true).await;
         // A pessimistic follower applies onto state that is about to
         // un-happen; it must hear "reverted", not hang on a dead reply slot.
@@ -3109,18 +3431,10 @@ mod tests {
         logical: usize,
     ) -> Node {
         start(NodeConfig {
-            store,
-            live_dir: root.join("live"),
             logical,
-            claim: ClaimSpec::All,
-            bind: "127.0.0.1:0".into(),
-            advertise: None,
-            hysteresis: 200,
             secret: "test".into(),
-            api_token: None,
-            max_unshipped: DEFAULT_MAX_UNSHIPPED,
-            limits: crate::limits::Limits::detect(),
             fence_ttl: std::time::Duration::from_secs(60),
+            ..NodeConfig::new(store, root.join("live"))
         })
         .await
         .unwrap()

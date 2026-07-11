@@ -7,9 +7,9 @@
 //! everything runs serially — that is the single-writer guarantee, no locks
 //! required.
 
+use crate::Map;
 use crate::store::BlobStore;
 use rusqlite::Connection;
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -58,12 +58,19 @@ pub async fn fetch_image(
     };
 
     let cached = std::fs::read(live_path).ok().filter(|b| b.len() >= 100);
+    let cache_counter = cached.as_deref().map(crate::delta::change_counter);
     let mut image = match cached {
         // Cache at or past the base: the delta chain bridges the gap and
         // the base download is skipped entirely.
         Some(cache) if crate::delta::change_counter(&cache) >= base_counter => cache,
         _ => store.get(&object_key(id)).await?.unwrap_or_default(),
     };
+    if std::env::var_os("FAFO_DST_LOG").is_some() {
+        eprintln!(
+            "activate {id}: base@{base_counter} cache@{cache_counter:?} using@{}",
+            crate::delta::change_counter(&image)
+        );
+    }
 
     let have = crate::delta::change_counter(&image);
     let mut chain_total = 0u32;
@@ -93,7 +100,7 @@ pub async fn fetch_image(
 /// Make a fetched image live: write the working copy and open the
 /// connection. Synchronous and cheap — safe inside the worker loop.
 pub fn materialize(
-    objects: &mut HashMap<String, LiveObject>,
+    objects: &mut Map<String, LiveObject>,
     id: &str,
     live_dir: &Path,
     image: &[u8],
@@ -122,14 +129,14 @@ pub fn materialize(
 /// Drop the live connection but KEEP the file as a commuter cache. Only
 /// valid when the file matches durably shipped state — i.e. after a flush,
 /// which every ownership transfer is gated on.
-pub fn evict(objects: &mut HashMap<String, LiveObject>, id: &str) {
+pub fn evict(objects: &mut Map<String, LiveObject>, id: &str) {
     objects.remove(id);
 }
 
 /// Drop the live connection AND the file. For poisoned state: failed ships,
 /// failed local commits — anything where the file may exceed what the blob
 /// store confirmed.
-pub fn purge(objects: &mut HashMap<String, LiveObject>, id: &str) {
+pub fn purge(objects: &mut Map<String, LiveObject>, id: &str) {
     if let Some(LiveObject { conn, live_path }) = objects.remove(id) {
         drop(conn); // close before unlinking
         let _ = std::fs::remove_file(live_path);
@@ -352,7 +359,7 @@ mod tests {
     #[tokio::test]
     async fn materialize_evict_purge_lifecycle() {
         let dir = tempfile::tempdir().unwrap();
-        let mut objects = HashMap::new();
+        let mut objects = Map::default();
 
         // Fresh object: an empty image opens as an empty database.
         materialize(&mut objects, "x", dir.path(), &[]).unwrap();

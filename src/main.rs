@@ -59,8 +59,6 @@ async fn main() -> anyhow::Result<()> {
     );
 
     let node = cluster::start(NodeConfig {
-        store: blob_store_from_env(&data_dir)?,
-        live_dir: format!("{data_dir}/live/p{port}").into(),
         logical,
         claim: ClaimSpec::parse(&env_or("CLAIM", "all"), logical),
         bind: format!("{host}:{port}"),
@@ -74,6 +72,10 @@ async fn main() -> anyhow::Result<()> {
         },
         limits,
         fence_ttl: std::time::Duration::from_millis(env_or("FENCE_TTL_MS", "10000").parse()?),
+        ..NodeConfig::new(
+            blob_store_from_env(&data_dir)?,
+            format!("{data_dir}/live/p{port}"),
+        )
     })
     .await?;
 

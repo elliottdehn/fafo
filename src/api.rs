@@ -24,7 +24,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use std::collections::HashMap;
+use crate::Map;
 use std::sync::{Arc, Mutex};
 
 #[derive(Debug)]
@@ -256,6 +256,64 @@ fn next_conn_id() -> u64 {
     NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
+/// One client connection's protocol state, independent of any socket:
+/// the WebSocket pump drives it in production; the simulator opens them
+/// directly against a node. The split matters because the teardown
+/// promises (run the will, sweep parked polls) live in close() — and a
+/// Session that is DROPPED without close() behaves exactly like a
+/// connection whose server died mid-promise.
+pub struct Session {
+    node: Node,
+    auth: Auth,
+    conn: u64,
+    /// frame id -> object, for polls parked right now on this connection.
+    /// Cancel frames look up here; close() cancels the rest so a dead
+    /// client's polls don't linger until the object's next write.
+    outstanding: Mutex<Map<u64, String>>,
+    will: Mutex<Option<ArmedWill>>,
+}
+
+impl Session {
+    pub fn open(node: Node, auth: Auth) -> Self {
+        Self {
+            node,
+            auth,
+            conn: next_conn_id(),
+            outstanding: Default::default(),
+            will: Default::default(),
+        }
+    }
+
+    /// Handle one frame of the wire protocol; the reply (if any) is the
+    /// JSON to send back. Frames may run concurrently (pipelining).
+    pub async fn frame(&self, text: &str) -> Option<String> {
+        handle_ws_frame(
+            &self.node,
+            &self.auth,
+            self.conn,
+            &self.outstanding,
+            &self.will,
+            text,
+        )
+        .await
+    }
+
+    /// The connection is dead: execute the will first (an ordinary
+    /// transaction — it may well wake polls parked by the living), then
+    /// sweep our own parked polls.
+    pub async fn close(&self) {
+        let armed = self.will.lock().unwrap().take(); // guard drops before the await
+        if let Some(w) = armed
+            && let Err(e) = submit_as(&self.node, w.cap, w.objects, w.ops, false, w.optimistic).await
+        {
+            eprintln!("conn {}: last-will transaction failed: {}", self.conn, e.message);
+        }
+        for (frame, object) in self.outstanding.lock().unwrap().drain() {
+            cancel_poll(&self.node, &object, self.conn, frame);
+        }
+    }
+}
+
 async fn ws_conn(node: Node, socket: axum::extract::ws::WebSocket, auth: Auth) {
     use axum::extract::ws::Message;
     use futures::{SinkExt, StreamExt};
@@ -270,13 +328,7 @@ async fn ws_conn(node: Node, socket: axum::extract::ws::WebSocket, auth: Auth) {
             }
         }
     });
-    let conn = next_conn_id();
-    // frame id -> object, for polls parked right now on this connection.
-    // Cancel frames look up here; socket teardown cancels the rest so a
-    // dead client's polls don't linger until the object's next write.
-    let outstanding: Arc<Mutex<HashMap<u64, String>>> =
-        Default::default();
-    let will: Arc<Mutex<Option<ArmedWill>>> = Default::default();
+    let session = Arc::new(Session::open(node, auth));
     while let Some(Ok(msg)) = stream.next().await {
         let Message::Text(text) = msg else {
             if matches!(msg, Message::Close(_)) {
@@ -284,30 +336,15 @@ async fn ws_conn(node: Node, socket: axum::extract::ws::WebSocket, auth: Auth) {
             }
             continue;
         };
-        let node = node.clone();
+        let session = session.clone();
         let tx = tx.clone();
-        let outstanding = outstanding.clone();
-        let will = will.clone();
-        let auth = auth.clone();
         tokio::spawn(async move {
-            if let Some(reply) =
-                handle_ws_frame(&node, &auth, conn, &outstanding, &will, text.as_str()).await
-            {
+            if let Some(reply) = session.frame(text.as_str()).await {
                 let _ = tx.send(reply);
             }
         });
     }
-    // The socket is dead: execute the will first (an ordinary transaction —
-    // it may well wake polls parked by the living), then sweep our own.
-    let armed = will.lock().unwrap().take(); // guard drops before the await
-    if let Some(w) = armed
-        && let Err(e) = submit_as(&node, w.cap, w.objects, w.ops, false, w.optimistic).await
-    {
-        eprintln!("conn {conn}: last-will transaction failed: {}", e.message);
-    }
-    for (frame, object) in outstanding.lock().unwrap().drain() {
-        cancel_poll(&node, &object, conn, frame);
-    }
+    session.close().await;
     drop(tx);
     let _ = writer.await;
 }
@@ -316,7 +353,7 @@ async fn handle_ws_frame(
     node: &Node,
     auth: &Auth,
     conn: u64,
-    outstanding: &Mutex<HashMap<u64, String>>,
+    outstanding: &Mutex<Map<u64, String>>,
     will: &Mutex<Option<ArmedWill>>,
     text: &str,
 ) -> Option<String> {
@@ -482,10 +519,16 @@ async fn rpc_handler(
             message: "bad cluster secret".into(),
         });
     }
+    Ok(Json(handle_rpc(&node, req).await))
+}
+
+/// Dispatch one inter-node request. Reached through HTTP in production;
+/// the simulator's transport calls it directly.
+pub async fn handle_rpc(node: &Node, req: crate::rpc::Request) -> crate::rpc::Response {
     use crate::rpc::{Request as Rpc, Response as RpcResp};
     use crate::worker::WorkerMsg;
     use tokio::sync::oneshot;
-    let resp = match req {
+    match req {
         Rpc::Txn {
             objects,
             ops,
@@ -493,8 +536,8 @@ async fn rpc_handler(
             optimistic,
             cap,
         } => RpcResp::Txn(
-            crate::cluster::submit_routed(
-                &node,
+            crate::cluster::submit_received(
+                node,
                 cap.map(Arc::new),
                 objects,
                 ops,
@@ -509,7 +552,7 @@ async fn rpc_handler(
             object,
             taker,
         } => {
-            let tx = crate::cluster::local_sender(&node, worker);
+            let tx = crate::cluster::local_sender(node, worker);
             match tx {
                 Some(tx) => {
                     let (rtx, rrx) = oneshot::channel();
@@ -535,14 +578,13 @@ async fn rpc_handler(
             object,
             meta,
         } => {
-            let tx = crate::cluster::local_sender(&node, worker);
+            let tx = crate::cluster::local_sender(node, worker);
             match tx {
                 Some(tx) if tx.send(WorkerMsg::Adopt { object, meta }).is_ok() => RpcResp::Ok,
                 _ => RpcResp::Err("worker is gone".into()),
             }
         }
-    };
-    Ok(Json(resp))
+    }
 }
 
 #[derive(Deserialize)]
@@ -747,7 +789,7 @@ async fn list_objects(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cluster::{ClaimSpec, DEFAULT_MAX_UNSHIPPED, NodeConfig, start};
+    use crate::cluster::{ClaimSpec, NodeConfig, start};
     use crate::grants::{Capability, Grant};
     use crate::store::{BlobStore, FsBlobStore};
     use reqwest::Method;
@@ -758,18 +800,12 @@ mod tests {
         let store: Arc<dyn BlobStore> =
             Arc::new(FsBlobStore::new(dir.path().join("blobs")).unwrap());
         let node = start(NodeConfig {
-            store,
-            live_dir: dir.path().join("live"),
             logical: 4,
             claim: ClaimSpec::All,
-            bind: "127.0.0.1:0".into(),
-            advertise: None,
-            hysteresis: 200,
             secret: "cluster-secret".into(),
             api_token: api_token.map(str::to_string),
-            max_unshipped: DEFAULT_MAX_UNSHIPPED,
-            limits: crate::limits::Limits::detect(),
             fence_ttl: std::time::Duration::from_secs(60),
+            ..NodeConfig::new(store, dir.path().join("live"))
         })
         .await
         .unwrap();
@@ -1028,7 +1064,7 @@ mod tests {
     async fn frame(
         node: &Node,
         auth: &Auth,
-        outstanding: &Mutex<HashMap<u64, String>>,
+        outstanding: &Mutex<Map<u64, String>>,
         will: &Mutex<Option<ArmedWill>>,
         text: &str,
     ) -> Option<Value> {
@@ -1037,8 +1073,8 @@ mod tests {
             .map(|s| serde_json::from_str(&s).unwrap())
     }
 
-    fn fresh_conn_state() -> (Mutex<HashMap<u64, String>>, Mutex<Option<ArmedWill>>) {
-        (Mutex::new(HashMap::new()), Mutex::new(None))
+    fn fresh_conn_state() -> (Mutex<Map<u64, String>>, Mutex<Option<ArmedWill>>) {
+        (Mutex::new(Map::default()), Mutex::new(None))
     }
 
     #[tokio::test]
