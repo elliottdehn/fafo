@@ -581,6 +581,25 @@ impl Worker {
             self.dirty_bytes,
             self.dirty.values().sum::<u64>()
         );
+        // A worker must never ship an object it no longer owns. Under
+        // churn (a stale hysteresis return or a live-node takeover can
+        // reassign an object while we still hold unshipped writes for it),
+        // ownership moves out from under dirty state; shipping it would
+        // fork the object's history. Revert the orphaned writes' whole
+        // txn-connected closure instead — the new owner holds the durable
+        // truth, and our unshipped writes are optimistic (lost, per the
+        // documented contract) or pessimistic-but-not-yet-acked (waiters
+        // failed retryably). This is the safe handling the ship-time fork
+        // tripwire used to only assert against.
+        let orphaned: Vec<String> = self
+            .dirty
+            .keys()
+            .filter(|id| !self.owns(id))
+            .cloned()
+            .collect();
+        if !orphaned.is_empty() {
+            self.revert_closure(&orphaned);
+        }
         if self.inflight.is_some() || self.pending_txns.is_empty() {
             crate::fafo_assert!(
                 self.inflight.is_some() || self.dirty.is_empty(),
