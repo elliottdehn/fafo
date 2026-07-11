@@ -22,6 +22,7 @@
 //!   3. stage snapshots at            staging/<txn>/<id>.db
 //!   4. put the commit record at      txns/<txn>.json          <- COMMIT POINT
 //!   5. promote snapshots to          objects/<id>.db, clean up
+//!
 //! Crash after 4 → rolled forward by `recover` at boot. Before 4 → staging
 //! garbage, swept at boot. Failure after local commit → evict participants
 //! so memory never outruns the blob store.
@@ -98,6 +99,10 @@ pub enum WorkerMsg {
     ShipDone {
         objects: Vec<String>,
         ok: bool,
+        /// Committed (the record landed) but the final object/delta put
+        /// failed: the blob store is behind acked local state. The worker
+        /// self-heals by re-shipping these from the live file.
+        unpromoted: Vec<String>,
     },
     /// Internal: a spawned activation fetch finished. Blob I/O for cold
     /// objects happens off-loop so one cold tenant can't stall the others.
@@ -348,11 +353,10 @@ impl Worker {
                     if self.unshipped(&id) || self.queues.contains_key(&id) {
                         continue;
                     }
-                    if let Some(obj) = self.objects.remove(&id) {
-                        let path = obj.live_path.clone();
-                        drop(obj);
+                    if let Some(LiveObject { conn, live_path }) = self.objects.remove(&id) {
+                        drop(conn); // close before the ledger may unlink it
                         self.manifests.remove(&id);
-                        self.node.disk.lock().unwrap().set_cache(path, self.id);
+                        self.node.disk.lock().unwrap().set_cache(live_path, self.id);
                         shed_any = true;
                     }
                 }
@@ -366,7 +370,11 @@ impl Worker {
                 from,
                 result,
             } => self.on_taken(txn, object, from, result).await,
-            WorkerMsg::ShipDone { objects, ok } => self.on_ship_done(objects, ok).await,
+            WorkerMsg::ShipDone {
+                objects,
+                ok,
+                unpromoted,
+            } => self.on_ship_done(objects, ok, unpromoted).await,
             WorkerMsg::Activated {
                 txn,
                 object,
@@ -589,10 +597,37 @@ impl Worker {
         ));
     }
 
-    async fn on_ship_done(&mut self, objects: Vec<String>, ok: bool) {
+    async fn on_ship_done(&mut self, objects: Vec<String>, ok: bool, unpromoted: Vec<String>) {
         self.inflight = None;
         if ok {
             self.node.stats.ships.fetch_add(1, Ordering::Relaxed);
+            // Promotion failures leave the blob store behind acked local
+            // state even though the commit record landed (recovery would
+            // roll it forward at next boot — but a live take would activate
+            // the stale base NOW). Self-heal: drop the manifest so the next
+            // ship is a full snapshot baseline (a lost delta leaves a gap
+            // no later delta bridges), and re-dirty the object so a repair
+            // boat launches immediately. Dirty also means unshipped, which
+            // keeps takes and returns waiting meanwhile.
+            if !unpromoted.is_empty() {
+                for id in &unpromoted {
+                    self.manifests.remove(id);
+                    if !self.dirty.contains_key(id) {
+                        let bytes = self
+                            .objects
+                            .get(id)
+                            .and_then(|o| std::fs::metadata(&o.live_path).ok())
+                            .map(|m| m.len())
+                            .unwrap_or(0);
+                        self.dirty.insert(id.clone(), bytes);
+                        self.dirty_bytes += bytes;
+                    }
+                }
+                self.pending_txns.push(AppliedTxn {
+                    participants: unpromoted,
+                    waiter: None,
+                });
+            }
             // Durable polls registered mid-flight missed this boat's launch
             // check. If the object is clean right now, live state IS the
             // just-landed durable state — judge them against it.
@@ -630,11 +665,20 @@ impl Worker {
                     .remove(&self.live_dir.join(format!("{id}.db")));
             }
             // Their unshipped txns died with the boat: drop pending entries
-            // touching reverted objects (their waiters were already failed
-            // by ship_task if pessimistic; optimistic acks are the contract).
+            // touching reverted objects. These applied AFTER the doomed
+            // boat launched, so their waiters never rode it — fail them
+            // explicitly rather than dropping the reply slot silently.
             let reverted: HashSet<&String> = objects.iter().collect();
-            self.pending_txns
-                .retain(|t| !t.participants.iter().any(|p| reverted.contains(p)));
+            self.pending_txns.retain_mut(|t| {
+                if t.participants.iter().any(|p| reverted.contains(p)) {
+                    if let Some((resp, _)) = t.waiter.take() {
+                        let _ = resp.send(Err(ApiError::internal("state reverted; retry")));
+                    }
+                    false
+                } else {
+                    true
+                }
+            });
         }
         // Freshly shipped objects just became sheddable; give the disk
         // ledger a chance to reclaim if it's over budget.
@@ -1052,7 +1096,7 @@ impl Worker {
 
         // Apply locally; durability is the boat's job.
         match self
-            .apply(&p.participants, &p.ops, p.read_only, p.cap.as_deref())
+            .apply(&p.participants, &p.ops, p.read_only, p.cap.as_ref())
             .await
         {
             Err(e) => {
@@ -1212,7 +1256,7 @@ impl Worker {
         participants: &[String],
         ops: &[Op],
         read_only: bool,
-        cap: Option<&grants::Capability>,
+        cap: Option<&std::sync::Arc<grants::Capability>>,
     ) -> Result<(Vec<OpResult>, Vec<String>), ApiError> {
         // Participants are guaranteed live: advance() activates cold
         // objects (off-loop) before a txn is allowed to run.
@@ -1253,7 +1297,7 @@ impl Worker {
         if let Some(cap) = cap {
             for id in participants {
                 let object = id.clone();
-                let cap = std::sync::Arc::new(cap.clone());
+                let cap = cap.clone();
                 conn_of(&self.objects, id).authorizer(Some(
                     move |ctx: rusqlite::hooks::AuthContext<'_>| cap_gate(&cap, &object, &ctx),
                 ));
@@ -1531,7 +1575,7 @@ async fn ship_task(
                 let _ = resp.send(Ok(response));
             }
 
-            let mut promoted = true;
+            let mut unpromoted: Vec<String> = Vec::new();
             for item in &items {
                 let (key, bytes) = match &item.payload {
                     ShipPayload::Snapshot { bytes, .. } => (object_key(&item.object), bytes),
@@ -1540,10 +1584,10 @@ async fn ship_task(
                     }
                 };
                 if node.store.put(&key, bytes).await.is_err() {
-                    promoted = false;
+                    unpromoted.push(item.object.clone());
                 }
             }
-            if promoted {
+            if unpromoted.is_empty() {
                 if !inline {
                     for item in &items {
                         let _ = node.store.delete(&item.staging_key(&staging_id)).await;
@@ -1572,7 +1616,11 @@ async fn ship_task(
                     }
                 }
             }
-            let _ = reply.send(WorkerMsg::ShipDone { objects, ok: true });
+            let _ = reply.send(WorkerMsg::ShipDone {
+                objects,
+                ok: true,
+                unpromoted,
+            });
         }
         Some(e) => {
             if !inline {
@@ -1583,7 +1631,11 @@ async fn ship_task(
             for (resp, _) in waiters {
                 let _ = resp.send(Err(ApiError::internal(format!("commit failed: {e}"))));
             }
-            let _ = reply.send(WorkerMsg::ShipDone { objects, ok: false });
+            let _ = reply.send(WorkerMsg::ShipDone {
+                objects,
+                ok: false,
+                unpromoted: Vec::new(),
+            });
         }
     }
 }
@@ -1717,7 +1769,7 @@ fn hex_encode(bytes: &[u8]) -> String {
 }
 
 fn hex_decode(s: &str) -> Option<Vec<u8>> {
-    if s.len() % 2 != 0 {
+    if !s.len().is_multiple_of(2) {
         return None;
     }
     (0..s.len())
@@ -1736,6 +1788,18 @@ fn txn_key(staging_id: &str) -> String {
 async fn promote_staged(store: &dyn BlobStore, staged_key: &str, bytes: &[u8]) -> anyhow::Result<()> {
     let name = staged_key.rsplit('/').next().unwrap_or_default();
     if let Some(object) = name.strip_suffix(".snap") {
+        // Monotone in the change counter: a stale record (its promotion
+        // failed once, then a later boat shipped newer state) must not roll
+        // the base backwards. Stale deltas need no guard — activation
+        // already ignores counters at or below the base.
+        let current = store
+            .get_range(&object_key(object), delta::HEADER_CHANGE_COUNTER as u64, 4)
+            .await?
+            .filter(|b| b.len() == 4)
+            .map(|b| u32::from_be_bytes([b[0], b[1], b[2], b[3]]));
+        if current.is_some_and(|c| c >= delta::change_counter(bytes)) {
+            return Ok(());
+        }
         store.put(&object_key(object), bytes).await?;
     } else if let Some((object, counter)) = name.rsplit_once(".delta.") {
         store
@@ -1916,5 +1980,43 @@ mod tests {
         assert!(store.get("staging/t1/alice.snap").await.unwrap().is_none());
         assert!(store.get("staging/t2/bob.snap").await.unwrap().is_none());
         assert!(store.get("objects/bob.db").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn recovery_never_rolls_a_base_backwards() {
+        let dir = tempfile::tempdir().unwrap();
+        let store: Arc<dyn BlobStore> =
+            Arc::new(FsBlobStore::new(dir.path().join("blobs")).unwrap());
+        let snap = |counter: u32| {
+            let mut f = vec![0u8; 4096];
+            f[delta::HEADER_CHANGE_COUNTER..delta::HEADER_CHANGE_COUNTER + 4]
+                .copy_from_slice(&counter.to_be_bytes());
+            f
+        };
+        // The live base is at counter 9; a stale record — from a boat whose
+        // promotion failed and was later superseded by a repair boat —
+        // still stages counter 3.
+        store.put("objects/erin.db", &snap(9)).await.unwrap();
+        store.put("staging/t9/erin.snap", &snap(3)).await.unwrap();
+        let record = serde_json::to_vec(&TxnRecord {
+            txn_id: "t9".into(),
+            objects: vec!["erin".into()],
+            inline: vec![],
+        })
+        .unwrap();
+        store.put("txns/t9.json", &record).await.unwrap();
+
+        recover(store.as_ref()).await.unwrap();
+
+        let base = store.get("objects/erin.db").await.unwrap().unwrap();
+        assert_eq!(
+            delta::change_counter(&base),
+            9,
+            "a stale staged snapshot must not clobber a newer base"
+        );
+        assert!(
+            store.get("txns/t9.json").await.unwrap().is_none(),
+            "the stale record still gets cleaned up"
+        );
     }
 }

@@ -156,7 +156,7 @@ mod tests {
         let got = verify("s", &token).unwrap();
         assert!(allows(&got, "user-77-inbox", "write"));
         assert!(allows(&got, "user-77-", "write"));
-        assert!(!allows(&got, "user-770-inbox", "write") || true, "prefix is literal");
+        assert!(!allows(&got, "user-770-inbox", "write"), "prefix is literal");
         assert!(!allows(&got, "user-78-inbox", "write"));
     }
 

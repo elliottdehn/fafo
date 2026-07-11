@@ -79,7 +79,11 @@ pub async fn fetch_image(
             continue; // already reflected in the cached image
         }
         let Some(bytes) = store.get(&key).await? else {
-            continue;
+            // Listed but gone: a compaction GC'd it under us mid-fetch.
+            // Applying the rest over the gap would silently build a stale
+            // image; fail the activation instead — a retry re-reads the
+            // fresh base and succeeds.
+            anyhow::bail!("delta {key} vanished mid-activation (compaction race); retry");
         };
         crate::delta::apply(&mut image, &crate::delta::decode(&bytes)?);
     }
@@ -123,9 +127,8 @@ pub fn evict(objects: &mut HashMap<String, LiveObject>, id: &str) {
 /// failed local commits — anything where the file may exceed what the blob
 /// store confirmed.
 pub fn purge(objects: &mut HashMap<String, LiveObject>, id: &str) {
-    if let Some(obj) = objects.remove(id) {
-        let path = obj.live_path.clone();
-        drop(obj);
-        let _ = std::fs::remove_file(path);
+    if let Some(LiveObject { conn, live_path }) = objects.remove(id) {
+        drop(conn); // close before unlinking
+        let _ = std::fs::remove_file(live_path);
     }
 }

@@ -118,12 +118,14 @@ impl R2BlobStore {
     {
         let mut last = anyhow::anyhow!("no attempts");
         for attempt in 0..RETRIES {
+            if attempt > 0 {
+                tokio::time::sleep(Duration::from_millis(100 * attempt as u64)).await;
+            }
             match op().await {
                 Ok(Some(v)) => return Ok(v),
                 Ok(None) => last = anyhow::anyhow!("transient (5xx)"),
                 Err(e) => last = e,
             }
-            tokio::time::sleep(Duration::from_millis(100 * (attempt as u64 + 1))).await;
         }
         Err(last)
     }

@@ -132,8 +132,9 @@ pub fn router(node: Node) -> Router {
         // The database-connection experience: one WebSocket, many
         // transactions as frames. After the upgrade, frames bypass the
         // per-request platform machinery entirely — this is the low-latency
-        // production path. Auth via ?token= (browsers can't set headers on
-        // WS), checked in the handler.
+        // production path. Auth via Authorization: Bearer or the
+        // fafo-token.<TOKEN> subprotocol (never the URL), checked in the
+        // handler.
         .route("/ws", get(ws_handler))
         .with_state(node)
 }

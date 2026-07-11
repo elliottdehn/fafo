@@ -645,22 +645,41 @@ pub async fn verify_leases(node: &Node) -> bool {
         let e = node.epochs.read().unwrap();
         e.iter().map(|(b, e)| (*b, *e)).collect()
     };
-    // ONE list covers every block (16 sequential lists here was both the
-    // guard's R2 bill and multi-second latency outliers at the commit gate).
-    let blocks = node.routing.read().unwrap().blocks;
-    let Ok(leases) = load_leases(node.store.as_ref(), blocks).await else {
+    // ONE list covers every block (per-block lists — and later per-block
+    // GETs — were both the guard's R2 bill and multi-second latency
+    // outliers at the commit gate). Epochs are parsed straight from the
+    // key names: a lease key only exists with its content fully written
+    // (create-if-absent), so no blob reads are needed to compare.
+    let Ok(keys) = node.store.list("_lease/").await else {
         return true; // transient store error: keep the old stamp, retry later
     };
+    let mut max_epoch: HashMap<usize, u64> = HashMap::new();
+    for key in &keys {
+        // _lease/b<block>/e<epoch>.json (tombstones end .released)
+        let Some(rest) = key.strip_prefix("_lease/b") else {
+            continue;
+        };
+        let Some((block, entry)) = rest.split_once('/') else {
+            continue;
+        };
+        let (Ok(block), Some(epoch)) = (
+            block.parse::<usize>(),
+            entry
+                .strip_prefix('e')
+                .and_then(|e| e.strip_suffix(".json"))
+                .and_then(|e| e.parse::<u64>().ok()),
+        ) else {
+            continue;
+        };
+        let best = max_epoch.entry(block).or_insert(epoch);
+        *best = (*best).max(epoch);
+    }
     for (b, mine) in epochs {
-        if let Some(lease) = leases.get(&b)
-            && lease.epoch > mine
-        {
+        let latest = max_epoch.get(&b).copied().unwrap_or(0);
+        if latest > mine {
             fail_stop(
                 node,
-                &format!(
-                    "lease for block {b} superseded (epoch {} > {mine})",
-                    lease.epoch
-                ),
+                &format!("lease for block {b} superseded (epoch {latest} > {mine})"),
             );
             return false;
         }
@@ -2435,6 +2454,72 @@ mod tests {
         async fn get_range(&self, key: &str, o: u64, l: u64) -> anyhow::Result<Option<Vec<u8>>> {
             self.0.get_range(key, o, l).await
         }
+    }
+
+    /// Fails puts to final object keys only (objects/*), leaving staging
+    /// and commit records alone: the boat commits but promotion fails.
+    struct StubbornStore(FsBlobStore, std::sync::atomic::AtomicBool);
+
+    #[async_trait::async_trait]
+    impl BlobStore for StubbornStore {
+        async fn get(&self, key: &str) -> anyhow::Result<Option<Vec<u8>>> {
+            self.0.get(key).await
+        }
+        async fn put(&self, key: &str, bytes: &[u8]) -> anyhow::Result<()> {
+            if self.1.load(Ordering::Relaxed) && key.starts_with("objects/") {
+                anyhow::bail!("injected promotion failure");
+            }
+            self.0.put(key, bytes).await
+        }
+        async fn delete(&self, key: &str) -> anyhow::Result<()> {
+            self.0.delete(key).await
+        }
+        async fn list(&self, prefix: &str) -> anyhow::Result<Vec<String>> {
+            self.0.list(prefix).await
+        }
+        async fn create(&self, key: &str, bytes: &[u8]) -> anyhow::Result<bool> {
+            self.0.create(key, bytes).await
+        }
+        async fn get_range(&self, key: &str, o: u64, l: u64) -> anyhow::Result<Option<Vec<u8>>> {
+            self.0.get_range(key, o, l).await
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_promotion_self_heals_on_the_next_boat() {
+        let dir = tempfile::tempdir().unwrap();
+        let stubborn = Arc::new(StubbornStore(
+            FsBlobStore::new(dir.path().join("blobs")).unwrap(),
+            std::sync::atomic::AtomicBool::new(false),
+        ));
+        let store: Arc<dyn BlobStore> = stubborn.clone();
+        let node = boot_with_store(dir.path(), store, 4).await;
+        let chan = id_on_worker(1, 4, "chan");
+        make_channel(&node, &chan).await;
+        let base_key = crate::object::object_key(&chan);
+        let counter = |bytes: Option<Vec<u8>>| {
+            bytes.as_deref().map(crate::delta::change_counter).unwrap_or(0)
+        };
+        let before = counter(stubborn.0.get(&base_key).await.unwrap());
+
+        // The commit record lands (the write acks) but promotion fails:
+        // the blob store is now behind acked local state.
+        stubborn.1.store(true, Ordering::Relaxed);
+        publish(&node, &chan, "stuck", false).await;
+
+        // Heal the store: the worker must re-ship current state on its
+        // own — no reboot, no further writes from clients.
+        stubborn.1.store(false, Ordering::Relaxed);
+        let mut healed = false;
+        for _ in 0..250 {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            if counter(stubborn.0.get(&base_key).await.unwrap()) > before {
+                healed = true;
+                break;
+            }
+        }
+        assert!(healed, "base snapshot must catch up after a failed promotion");
+        node.shutdown().await;
     }
 
     #[tokio::test]
