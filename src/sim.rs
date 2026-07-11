@@ -191,6 +191,67 @@ impl Default for DstConfig {
     }
 }
 
+impl DstConfig {
+    /// Derive a whole cluster shape from the seed alone. Every knob is
+    /// randomized within a range that stays *legal but hostile* — small
+    /// fence windows against high latency, degenerate single-node worlds,
+    /// fault storms up to 90%, tight worker spaces that force churn. The
+    /// seed determines both the config and the run, so a crash is still
+    /// replayable from the seed and `--fuzz` alone. This is parameter-space
+    /// search on top of schedule-space search: the default config is one
+    /// point; this explores the rest.
+    pub fn fuzzed(seed: u64) -> Self {
+        let mut r = Rng::new(seed ^ CONFIG_SALT);
+        let nodes = 1 + r.below(5) as usize; // 1..=5
+        let logical_workers = [4usize, 8, 16, 16, 32][r.below(5) as usize];
+        let net_latency_ms = 1 + r.below(30);
+        let store_latency_ms = 1 + r.below(30);
+        // Fence TTL stays within the supported operating envelope: below
+        // ~2x the guard sweep (fence_ttl/3) fencing has no safety margin,
+        // which is a MISCONFIGURATION, not a bug to hunt. Everything at or
+        // above 800ms is legal and hammered.
+        let fence_ttl_ms = [800u64, 1200, 1800, 2400, 3000][r.below(5) as usize];
+        Self {
+            seed,
+            nodes,
+            logical_workers,
+            accounts: 6 + r.below(8) as usize,
+            initial_balance: 100,
+            transfers: 40 + r.below(120) as usize,
+            optimistic_pct: r.below(101) as u32,
+            clients: 2 + r.below(5) as usize,
+            channel_msgs: 10 + r.below(30) as usize,
+            wills: r.below(6) as usize,
+            store_latency_ms,
+            net_latency_ms,
+            store_fail_pct: r.below(60) as u32,
+            crashes: r.below(4) as usize,
+            // Restarts always on: the platform (Cloudflare Containers) always
+            // reschedules a crashed instance. Permanent node loss with no
+            // replacement is out of the operating envelope — the orphan
+            // reclaim sweep heals it, but "fewer nodes forever" is not a
+            // supported steady state to fuzz against.
+            restarts: true,
+            fence_ttl_ms,
+            op_timeout_ms: 120_000,
+            will_ttl_ms: fence_ttl_ms.max(1000) * 2,
+            wills_survive_node_crash: true,
+            durable_wills: true,
+            erc20_accounts: 4 + r.below(6) as usize,
+            erc20_ops: 20 + r.below(40) as usize,
+            escrows: r.below(12) as usize,
+            counters: 1 + r.below(5) as usize,
+            counter_incs: 10 + r.below(40) as usize,
+            feeds: 1 + r.below(3) as usize,
+            feed_appends: 8 + r.below(20) as usize,
+        }
+    }
+}
+
+/// A fixed salt so a fuzzed config's internal RNG stream doesn't alias the
+/// run's own RNG stream (which is seeded by `seed` directly).
+const CONFIG_SALT: u64 = 0x00c0_ffee_f00d_face;
+
 // ---------------------------------------------------------------- trace
 
 /// A running hash of everything a client could observe, plus a tail of

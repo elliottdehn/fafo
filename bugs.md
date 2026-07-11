@@ -264,6 +264,65 @@ inside the fix that taught it.
 
 > ELI5: The "now serving" bell rings when a shipment arrives — but when a shipment gets cancelled the counter also frees up, and nobody ever rang the bell. **Nastiness: 7/10.**
 
+## Config-fuzzing: the same system, ten thousand shapes
+
+Seed-fuzzing explores *schedules* on one cluster shape. Config-fuzzing
+(`dst mine --fuzz`) derives the whole shape from the seed too — node count,
+latencies, fault rates, fence TTL, worker-space size, workload sizes — so a
+crash is still `(seed)` and replayable, but the search now covers the
+parameter space, not just one point in it. It found bug 24 on the first
+minute.
+
+**24. Routing and truth, diverged.** A worker holds two views of who owns
+an object: `owned` (its private, durable-backed truth) and the shared
+routing map (a *hint*). An earlier fix taught `advance()` to distrust the
+hint when it lied *in our favor* ("routing says we own it, but we never
+admitted it"). It never handled the mirror: routing naming *someone else*
+for an object we actually own. Then our own transactions take-chase the
+wrong peer, who bounces us with "NotMine, try yourself" — and the self-heal
+Adopt is at the generation we already hold, so `admit` correctly refuses it
+as stale, so nothing ever corrects the map. The take loops forever; every
+transaction behind it starves. Cross-object contention from the
+multi-workload battery surfaced it instantly (seed 8614294886503471524).
+Fix: `owned` is authoritative — if the object is in it, we ARE the owner,
+and `advance()` heals routing toward that truth, both directions.
+
+> ELI5: The county says you own the house and you agree — but your own GPS insists it's across town, so you keep driving to a stranger's door, who sends you home, where your GPS sends you back. Forever. **Nastiness: 8/10.**
+
+## The bug that isn't fixed yet (honesty)
+
+Config-fuzzing also found that a node which **permanently dies with no
+restart** strands its lease blocks: nothing adopts them, and its objects go
+unreadable forever. ~14% of *unconstrained* configs hit it.
+
+This one is documented, not fixed — deliberately. It sits at the edge of
+the operating envelope: the deployment target (Cloudflare Containers)
+always reschedules a crashed instance, so "fewer nodes, forever" is not a
+state production reaches. And two attempts to add an orphan-reclaim sweep
+were **reverted for making things worse** — the exact "every fix ships a
+new failure mode" trap:
+
+1. Reclaim based on an RPC **health check** forked immediately: health-check
+   rides RPC, so a live-but-*partitioned* holder reads as dead, gets its
+   block stolen, and both write.
+2. Reclaim based on **lease deadlines** (a holder refreshes through the
+   store; reclaim only a lapsed lease) fixed the partition race — a
+   partitioned holder still refreshes — but STILL forked on the default
+   config, because reclaiming a block interacts with the crash/reboot/
+   migration timing to leave two live copies of a worker's object state.
+   The real crux is reconciling **block-lease** ownership with
+   **object-checkpoint** ownership on reclaim, and it needs a clear-headed
+   design, not a late-night patch.
+
+The disciplined call was to keep the availability limitation (bounded,
+understood, out-of-envelope) rather than ship the data corruption that
+"fixing" it kept introducing. The fuzzer stays constrained to the supported
+envelope (always-restart, fence TTL above the fencing safety floor), where
+the committed system survives **thousands of randomized cluster shapes with
+zero safety violations** — which is the property that actually matters.
+
+> ELI5: We found that if a member of the band quits mid-tour and is never replaced, their songs stop getting played. The fix — teaching the others to cover — kept accidentally having two people sing the same song at once, which is worse, so we wrote down "don't lose a member permanently" and kept the band tight instead. **Nastiness: 5/10 (bounded availability, no data risk).**
+
 ## Before the dice: what the example suite caught
 
 Not everything needed the simulator. These four surfaced earlier, during

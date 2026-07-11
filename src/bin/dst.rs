@@ -26,13 +26,18 @@ fn main() {
     };
     let has = |name: &str| args.iter().any(|a| a == name);
 
-    let mut cfg: DstConfig = match flag("--config") {
-        Some(path) => serde_json::from_str(&std::fs::read_to_string(&path).expect("read config"))
+    let fuzz = has("--fuzz");
+    let mut cfg: DstConfig = match (flag("--config"), fuzz) {
+        (Some(path), _) => serde_json::from_str(&std::fs::read_to_string(&path).expect("read config"))
             .expect("parse config"),
-        None => DstConfig::default(),
+        // --fuzz derives the whole cluster shape from the seed; the concrete
+        // seed is filled in below (and per-seed in `mine`).
+        (None, true) => DstConfig::fuzzed(flag("--seed").as_deref().and_then(|s| s.parse().ok()).unwrap_or(1)),
+        (None, false) => DstConfig::default(),
     };
     if let Some(seed) = flag("--seed") {
-        cfg.seed = seed.parse().expect("--seed takes a u64");
+        let seed = seed.parse().expect("--seed takes a u64");
+        cfg = if fuzz { DstConfig::fuzzed(seed) } else { DstConfig { seed, ..cfg } };
     }
     if has("--wills-strict") {
         cfg.wills_survive_node_crash = true;
@@ -44,11 +49,19 @@ fn main() {
         cfg.wills_survive_node_crash = true;
     }
 
-    let extra = has("--no-durable-wills") || has("--wills-strict");
+    let extra_flags: Vec<String> = ["--wills-strict", "--no-durable-wills", "--fuzz"]
+        .iter()
+        .filter(|f| has(f))
+        .map(|f| f.to_string())
+        .collect();
+    if mode == "config" {
+        println!("{}", serde_json::to_string_pretty(&cfg).unwrap());
+        return;
+    }
     match mode {
         "run" => run_one(cfg),
         "check" => check(cfg),
-        "mine" => mine(cfg, &flag("--jobs"), &flag("--seconds"), extra),
+        "mine" => mine(cfg, &flag("--jobs"), &flag("--seconds"), &extra_flags, fuzz),
         _ => {
             eprintln!(
                 "usage: dst run|check|mine [--seed N] [--config f.json] \
@@ -99,7 +112,13 @@ fn check(cfg: DstConfig) {
     );
 }
 
-fn mine(cfg: DstConfig, jobs: &Option<String>, seconds: &Option<String>, wills_strict: bool) {
+fn mine(
+    cfg: DstConfig,
+    jobs: &Option<String>,
+    seconds: &Option<String>,
+    extra_flags: &[String],
+    fuzz: bool,
+) {
     let jobs: usize = jobs
         .as_deref()
         .map(|j| j.parse().expect("--jobs"))
@@ -110,24 +129,31 @@ fn mine(cfg: DstConfig, jobs: &Option<String>, seconds: &Option<String>, wills_s
     let exe = std::env::current_exe().expect("current_exe");
     std::fs::create_dir_all("crashes").expect("crashes dir");
 
-    // Persist the exact config next to the crash logs: a bounty claim is
-    // (config, seed), nothing else.
+    // In fixed-config mode a bounty claim is (config, seed): persist the
+    // config. In --fuzz mode the seed alone derives the config, so there is
+    // nothing to persist — the crash log carries the exact repro command.
     let config_path = "crashes/mine-config.json";
-    std::fs::write(config_path, serde_json::to_string_pretty(&cfg).unwrap()).unwrap();
+    if !fuzz {
+        std::fs::write(config_path, serde_json::to_string_pretty(&cfg).unwrap()).unwrap();
+    }
 
     let mut seeder = Rng::new(cfg.seed);
     let mut running: Vec<(u64, std::process::Child)> = Vec::new();
     let (mut launched, mut clean, mut bugs) = (0u64, 0u64, 0u64);
-    println!("mining with {jobs} jobs (config {config_path}); a crash is a bug, a bug is $100");
+    let mode_label = if fuzz { "config-fuzzing" } else { config_path };
+    println!("mining with {jobs} jobs ({mode_label}); a crash is a bug, a bug is $100");
 
     loop {
         let out_of_time = deadline.is_some_and(|d| std::time::Instant::now() > d);
         while running.len() < jobs && !out_of_time {
             let seed = seeder.next();
             let mut cmd = Command::new(&exe);
-            cmd.args(["run", "--seed", &seed.to_string(), "--config", config_path]);
-            if wills_strict {
-                cmd.arg("--wills-strict");
+            cmd.args(["run", "--seed", &seed.to_string()]);
+            if !fuzz {
+                cmd.args(["--config", config_path]);
+            }
+            for f in extra_flags {
+                cmd.arg(f);
             }
             let child = cmd
                 .stdout(std::process::Stdio::null())
@@ -151,7 +177,12 @@ fn mine(cfg: DstConfig, jobs: &Option<String>, seconds: &Option<String>, wills_s
                     let out = child.wait_with_output().expect("crash output");
                     let log = format!("crashes/seed-{seed}.log");
                     let mut f = std::fs::File::create(&log).expect("crash log");
-                    writeln!(f, "seed: {seed}\nconfig: {config_path}\nreproduce: dst run --seed {seed} --config {config_path}\n").unwrap();
+                    let repro = if fuzz {
+                        format!("dst run --seed {seed} --fuzz")
+                    } else {
+                        format!("dst run --seed {seed} --config {config_path}")
+                    };
+                    writeln!(f, "seed: {seed}\nreproduce: {repro}\n").unwrap();
                     f.write_all(&out.stderr).unwrap();
                     println!("BUG: seed {seed} crashed -> {log}");
                 }
