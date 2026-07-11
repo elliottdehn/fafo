@@ -249,6 +249,12 @@ pub struct NodeConfig {
     /// fail-stop is the correct response to a superseded epoch. False
     /// (simulation): crash only this node, the sim must keep running.
     pub exit_on_fence: bool,
+    /// This node's clock-rate multiplier: 1.0 = a true clock; 0.95 = runs
+    /// 5% slow. Production is always 1.0 — this exists so the simulator
+    /// can violate clock agreement and test the fencing model's stated
+    /// assumption (bounded clock RATE error). Every fencing time-read on
+    /// this node is scaled by it.
+    pub clock_rate: f64,
     /// Check the wall clock (in addition to the monotonic one) at the
     /// fencing recency gate. True in production — it catches system
     /// suspends the monotonic clock sleeps through. False under the
@@ -293,6 +299,7 @@ impl NodeConfig {
             serve_http: true,
             exit_on_fence: true,
             wall_fence: true,
+            clock_rate: 1.0,
             will_ttl: std::time::Duration::from_secs(30),
             durable_wills: true,
             clock_base: None,
@@ -358,11 +365,18 @@ pub struct NodeInner {
     /// don't); the wall clock catches system suspend (where monotonic
     /// may sleep too). Stale on EITHER axis forces re-verification.
     /// (tokio Instants, so the simulator's virtual clock governs them.)
-    pub verified: Mutex<(tokio::time::Instant, std::time::SystemTime)>,
+    /// The node's own clock: all fencing durations are measured through
+    /// it, so a rate-skewed node (simulation) mis-measures its own fence
+    /// windows exactly the way a machine with a bad oscillator would.
+    pub node_clock: NodeClock,
+    /// Node-time of the last successful lease verification, plus the wall
+    /// stamp for the suspend check.
+    pub verified: Mutex<(std::time::Duration, std::time::SystemTime)>,
     /// No commit may pass before this instant: set to claim time + TTL when
     /// taking over a non-tombstoned lease, giving a paused predecessor's
     /// recency gate time to expire first.
-    pub earliest_write: Mutex<tokio::time::Instant>,
+    /// Node-time before which this node must not write (takeover wait-out).
+    pub earliest_write: Mutex<std::time::Duration>,
     /// Fail-stop policy: exit the process (production) or crash just this
     /// node (simulation).
     exit_on_fence: bool,
@@ -516,6 +530,85 @@ impl From<CheckpointWire> for Checkpoint {
     }
 }
 
+/// A per-node monotonic clock with a rate multiplier. now() is the node's
+/// own opinion of how much time has passed since it booted; sleep_node()
+/// sleeps a NODE-duration by converting to real time. rate=1.0 in
+/// production; the simulator skews it to attack fencing.
+pub struct NodeClock {
+    birth: tokio::time::Instant,
+    rate: f64,
+    /// While Some(at), the clock is FROZEN at `at` real-since-birth: now()
+    /// stops advancing. Models a host suspend / VM pause / severe
+    /// deschedule — the node's own clock stalls even as real time passes.
+    /// On resume the frozen interval is added to `skipped`, so the clock
+    /// continues from where it stopped (a suspended process does not
+    /// "catch up"). Running: accumulated frozen time skipped so far.
+    pause: Mutex<ClockPause>,
+}
+
+enum ClockPause {
+    Running { skipped: std::time::Duration },
+    Frozen { at: std::time::Duration, skipped: std::time::Duration },
+}
+
+impl NodeClock {
+    pub fn new(rate: f64) -> Self {
+        Self {
+            birth: tokio::time::Instant::now(),
+            rate,
+            pause: Mutex::new(ClockPause::Running {
+                skipped: std::time::Duration::ZERO,
+            }),
+        }
+    }
+
+    /// Node-time elapsed since boot, through this node's rate and any
+    /// frozen (suspended) interval.
+    pub fn now(&self) -> std::time::Duration {
+        let raw = self.birth.elapsed();
+        let effective = match *self.pause.lock().unwrap() {
+            ClockPause::Running { skipped } => raw.saturating_sub(skipped),
+            // Frozen: time stops at the freeze point (minus prior skips).
+            ClockPause::Frozen { at, skipped } => at.saturating_sub(skipped),
+        };
+        effective.mul_f64(self.rate)
+    }
+
+    /// Suspend the clock: now() stops advancing until resume().
+    pub fn freeze(&self) {
+        let raw = self.birth.elapsed();
+        let mut g = self.pause.lock().unwrap();
+        if let ClockPause::Running { skipped } = *g {
+            *g = ClockPause::Frozen { at: raw, skipped };
+        }
+    }
+
+    /// Resume: fold the frozen real-interval into `skipped` so the clock
+    /// picks up exactly where it froze.
+    pub fn thaw(&self) {
+        let raw = self.birth.elapsed();
+        let mut g = self.pause.lock().unwrap();
+        if let ClockPause::Frozen { at, skipped } = *g {
+            *g = ClockPause::Running {
+                skipped: skipped + raw.saturating_sub(at),
+            };
+        }
+    }
+
+    /// Sleep for a duration measured in NODE time.
+    pub async fn sleep_node(&self, d: std::time::Duration) {
+        tokio::time::sleep(d.div_f64(self.rate)).await;
+    }
+}
+
+/// How much clock-rate disagreement fencing tolerates: a takeover waits
+/// fence_ttl * this before its first write, so an old holder whose clock
+/// runs slow (its gate lapses LATE in real time) is still fenced before
+/// the successor writes, as long as fast/slow rate ratio <= this. ±10%
+/// rate error (ratio 1.22) fits with margin; beyond it, forks — which the
+/// simulator's --clock-chaos mode demonstrates on purpose.
+pub const SKEW_TOLERANCE: f64 = 1.25;
+
 #[derive(Serialize, Deserialize)]
 struct Lease {
     addr: String,
@@ -533,7 +626,20 @@ fn tombstone_key(block: usize, epoch: u64) -> String {
     format!("_lease/b{block}/e{epoch}.released")
 }
 
-const LEASE_GUARD_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+/// The lease guard sweep period. It MUST stay below fence_ttl: a node whose
+/// lease was superseded (a peer took over while it was slow/partitioned)
+/// keeps writing until its guard notices, so the guard interval is the
+/// exposure window, and a takeover that waited out fence_ttl before writing
+/// must not write inside it. Deriving it as fence_ttl/3 makes fence_ttl >
+/// guard structural for any configured TTL — a fixed 5s guard against a
+/// 1s TTL leaves a 4s dual-write window (found by the DST's pause fault:
+/// isolate a live node, let a peer take its lease, watch it fork). Capped
+/// so a production 10s TTL still sweeps promptly; floored against busy-loop.
+fn guard_interval(fence_ttl: std::time::Duration) -> std::time::Duration {
+    (fence_ttl / 3)
+        .max(std::time::Duration::from_millis(50))
+        .min(std::time::Duration::from_secs(5))
+}
 
 struct LeaseState {
     epoch: u64,
@@ -744,8 +850,9 @@ pub async fn start(cfg: NodeConfig) -> anyhow::Result<Node> {
         epochs: RwLock::new(Map::default()),
         fenced: AtomicBool::new(false),
         fence_ttl: cfg.fence_ttl,
-        verified: Mutex::new((tokio::time::Instant::now(), std::time::SystemTime::now())),
-        earliest_write: Mutex::new(tokio::time::Instant::now()),
+        node_clock: NodeClock::new(cfg.clock_rate),
+        verified: Mutex::new((std::time::Duration::ZERO, std::time::SystemTime::now())),
+        earliest_write: Mutex::new(std::time::Duration::ZERO),
         exit_on_fence: cfg.exit_on_fence,
         wall_fence: cfg.wall_fence,
         will_ttl: cfg.will_ttl,
@@ -826,7 +933,7 @@ pub async fn start(cfg: NodeConfig) -> anyhow::Result<Node> {
                 // strictly before we read or write anything.
                 if !lease.released {
                     let mut ew = node.earliest_write.lock().unwrap();
-                    *ew = (*ew).max(tokio::time::Instant::now() + cfg.fence_ttl);
+                    *ew = (*ew).max(node.node_clock.now() + cfg.fence_ttl.mul_f64(SKEW_TOLERANCE));
                 }
                 lease.epoch + 1
             }
@@ -862,17 +969,18 @@ pub async fn start(cfg: NodeConfig) -> anyhow::Result<Node> {
     ));
 
     // Claiming just created/verified our leases: stamp it.
-    *node.verified.lock().unwrap() = (tokio::time::Instant::now(), std::time::SystemTime::now());
+    *node.verified.lock().unwrap() = (node.node_clock.now(), std::time::SystemTime::now());
 
     // Lease guard: fail-stop if any of our epochs gets superseded. Losing a
     // lease means another node is now the writer for that worker; continuing
     // would violate single-writer. Exiting the whole process is the correct
     // (fail-stop) response, not a recoverable error. Each clean sweep also
     // refreshes the recency stamps the commit gate checks.
+    let sweep = guard_interval(cfg.fence_ttl);
     let guard_node = node.clone();
     node.spawn_tracked(async move {
         loop {
-            tokio::time::sleep(LEASE_GUARD_INTERVAL).await;
+            tokio::time::sleep(sweep).await;
             verify_leases(&guard_node).await;
         }
     });
@@ -963,7 +1071,7 @@ pub async fn verify_leases(node: &Node) -> bool {
             return false;
         }
     }
-    *node.verified.lock().unwrap() = (tokio::time::Instant::now(), std::time::SystemTime::now());
+    *node.verified.lock().unwrap() = (node.node_clock.now(), std::time::SystemTime::now());
     true
 }
 
@@ -971,7 +1079,7 @@ pub async fn verify_leases(node: &Node) -> bool {
 /// clock: monotonic catches process pauses, wall catches system suspend.
 pub fn lease_stale(node: &Node) -> bool {
     let (mono, wall) = *node.verified.lock().unwrap();
-    if mono.elapsed() > node.fence_ttl {
+    if node.node_clock.now().saturating_sub(mono) > node.fence_ttl {
         return true;
     }
     if !node.wall_fence {

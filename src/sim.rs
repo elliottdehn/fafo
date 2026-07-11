@@ -140,6 +140,30 @@ pub struct DstConfig {
     pub counters: usize,
     #[serde(default = "d_counter_incs")]
     pub counter_incs: usize,
+    /// Per-node clock-rate skew, in percent around 1.0: each node boots
+    /// with a rate drawn from [1-skew, 1+skew]. The fencing model's stated
+    /// assumption is bounded RATE error; the supported envelope (±8%,
+    /// ratio ≤ 1.17) sits inside the engine's SKEW_TOLERANCE (1.25).
+    #[serde(default = "d_clock_skew_pct")]
+    pub clock_skew_pct: u32,
+    /// Pause faults per run: a live node is isolated (RPC-dead to peers,
+    /// still running) long enough for a peer to take over its lease, then
+    /// healed — the classic "zombie loses its lease and rejoins" adversary.
+    /// Correct fencing must keep the zombie from writing after takeover.
+    #[serde(default = "d_pause_faults")]
+    pub pause_faults: usize,
+    /// Chaos: pauses ALSO freeze the paused node's clock (host-suspend /
+    /// VM-pause), so on wake it believes ~no time passed. This can defeat
+    /// clock-based fencing (a documented limitation) — on by default only
+    /// under --clock-chaos.
+    #[serde(default)]
+    pub pause_freezes_clock: bool,
+    /// Chaos mode: rates in [0.6, 1.6] (ratio up to 2.67), deliberately
+    /// beyond SKEW_TOLERANCE. This is `--no-durable-wills` for clocks: the
+    /// run is EXPECTED to fork, proving the simulator can see clock-rate
+    /// violations at all. Never on by default.
+    #[serde(default)]
+    pub clock_chaos: bool,
     /// Watched feeds (`feed-{i}`), each consumed three ways at once:
     /// a cursor poll loop, a DURABLE cursor loop (its deliveries must
     /// survive any crash), and a change-detection (baseline-hash) watcher.
@@ -154,6 +178,8 @@ fn d_erc20_ops() -> usize { 40 }
 fn d_escrows() -> usize { 8 }
 fn d_counters() -> usize { 4 }
 fn d_counter_incs() -> usize { 30 }
+fn d_clock_skew_pct() -> u32 { 8 }
+fn d_pause_faults() -> usize { 1 }
 fn d_feeds() -> usize { 2 }
 fn d_feed_appends() -> usize { 15 }
 
@@ -187,6 +213,10 @@ impl Default for DstConfig {
             counter_incs: d_counter_incs(),
             feeds: d_feeds(),
             feed_appends: d_feed_appends(),
+            clock_skew_pct: d_clock_skew_pct(),
+            clock_chaos: false,
+            pause_faults: d_pause_faults(),
+            pause_freezes_clock: false,
         }
     }
 }
@@ -244,6 +274,15 @@ impl DstConfig {
             counter_incs: 10 + r.below(40) as usize,
             feeds: 1 + r.below(3) as usize,
             feed_appends: 8 + r.below(20) as usize,
+            clock_skew_pct: r.below(9) as u32, // 0..=8%: inside SKEW_TOLERANCE
+            clock_chaos: false,
+            // The pause adversary IS in the envelope: a live node loses its
+            // lease (partition + a peer's reboot-takeover) and rejoins.
+            // Fencing must keep its post-takeover writes out (commit-point
+            // verify) AND its refused writes must not survive in the
+            // commuter cache (fetch_image bounds the cache to durable).
+            pause_faults: r.below(3) as usize,
+            pause_freezes_clock: false,
         }
     }
 }
@@ -420,6 +459,20 @@ impl SimNet {
         self.blocked.lock().unwrap().clear();
     }
 
+    /// Cut one node off from every current peer (both directions): it can
+    /// still reach the store, but no RPC in or out. Peers health-check it
+    /// as dead; the node keeps running.
+    pub fn isolate(&self, addr: &str) {
+        let peers: Vec<String> = self.nodes.lock().unwrap().keys().cloned().collect();
+        let mut blocked = self.blocked.lock().unwrap();
+        for p in peers {
+            if p != addr {
+                blocked.insert((addr.to_string(), p.clone()));
+                blocked.insert((p, addr.to_string()));
+            }
+        }
+    }
+
     fn reachable(&self, from: &str, to: &str) -> Option<Node> {
         if self
             .blocked
@@ -586,12 +639,23 @@ impl World {
             g[i]
         };
         let addr = addr_of(i);
+        // Each boot draws this node's oscillator error. Chaos mode blows
+        // straight past the engine's tolerance — expected to fork.
+        let clock_rate = if self.cfg.clock_chaos {
+            0.6 + (below(&self.rng, 101) as f64) / 100.0 // 0.60..=1.60
+        } else if self.cfg.clock_skew_pct > 0 {
+            let span = self.cfg.clock_skew_pct.min(50) as f64 / 100.0;
+            1.0 - span + (below(&self.rng, 1001) as f64) / 1000.0 * 2.0 * span
+        } else {
+            1.0
+        };
         let node = cluster::start(NodeConfig {
             logical: self.cfg.logical_workers,
             claim,
             advertise: Some(addr.clone()),
             hysteresis: 8,
             secret: "dst".into(),
+            clock_rate,
             fence_ttl: Duration::from_millis(self.cfg.fence_ttl_ms),
             transport: Some(Arc::new(SimTransport {
                 net: self.net.clone(),
@@ -618,6 +682,58 @@ impl World {
         self.nodes.lock().unwrap()[i] = Some(node);
         self.trace.record(format!("boot n{i} g{generation}"));
         Ok(())
+    }
+
+    /// The pause adversary: isolate a live node (RPC-dead to peers, still
+    /// running and still reaching the store), force a peer to take over its
+    /// lease during the blackout, then heal. A correctly-fenced zombie must
+    /// NOT commit anything after the takeover — its guard sees the superseded
+    /// epoch and fail-stops, or its commit gate refuses. Optionally freezes
+    /// the zombie's clock too (suspend), which can defeat clock fencing.
+    async fn pause_fault(self: &Arc<Self>) {
+        let live = self.live_indices();
+        if live.len() < 2 {
+            return; // need a survivor to take over
+        }
+        let victim = live[below(&self.rng, live.len() as u64) as usize];
+        let taker = *live.iter().find(|&&i| i != victim).unwrap();
+        let Some(vnode) = self.node(victim) else { return };
+
+        self.net.isolate(&addr_of(victim));
+        if self.cfg.pause_freezes_clock {
+            vnode.node_clock.freeze();
+        }
+        self.trace.record(format!(
+            "pause n{victim} (freeze={})",
+            self.cfg.pause_freezes_clock
+        ));
+
+        // Force the takeover: bounce the taker so its boot-claim scans the
+        // blocks, finds the victim RPC-dead, waits out the fence TTL, and
+        // adopts them. (Reboot is how the safe system takes over at all.)
+        self.crash_node(taker);
+        sleep(Duration::from_millis(self.cfg.fence_ttl_ms * 3)).await;
+        // Reboot the taker with its NORMAL auto quota (a real node claims
+        // its share, never All): it adopts the isolated victim's blocks as
+        // dead-holder orphans up to quota.
+        let _ = self.boot_node(taker).await;
+        // Let the taker actually write to the reclaimed objects.
+        sleep(Duration::from_millis(self.cfg.fence_ttl_ms)).await;
+
+        // Zombie wakes. If fencing is wrong, its next writes fork.
+        if self.cfg.pause_freezes_clock {
+            vnode.node_clock.thaw();
+        }
+        self.net.heal();
+        self.trace.record(format!("resume n{victim}"));
+        // The healed victim sees its leases superseded and fail-stops
+        // (crashes internally). Model the platform rescheduling it: crash it
+        // in the world's books and reboot, so its orphaned blocks get
+        // reclaimed and objects there become reachable again.
+        sleep(Duration::from_millis(self.cfg.fence_ttl_ms)).await;
+        self.crash_node(victim);
+        sleep(Duration::from_millis(self.cfg.fence_ttl_ms * 2)).await;
+        let _ = self.boot_node(victim).await;
     }
 
     fn crash_node(&self, i: usize) {
@@ -1938,6 +2054,11 @@ pub async fn run(world: Arc<World>) -> RunReport {
                 let _ = world.boot_node(victim).await;
             }
         }
+    }
+    // The pause adversary: a live node loses its lease to a peer and
+    // rejoins. Fencing must keep the zombie's post-takeover writes out.
+    for _ in 0..world.cfg.pause_faults {
+        world.pause_fault().await;
     }
     for t in phase2 {
         t.await.expect("phase 2 workload");

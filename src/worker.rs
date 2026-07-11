@@ -2005,11 +2005,19 @@ async fn ship_task(
     // 3. the fenced flag, set by any failed verification.
     if err.is_none() {
         let deadline = *node.earliest_write.lock().unwrap();
-        let wait = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let wait = deadline.saturating_sub(node.node_clock.now());
         if !wait.is_zero() {
-            tokio::time::sleep(wait).await;
+            node.node_clock.sleep_node(wait).await;
         }
-        if crate::cluster::lease_stale(&node) && !crate::cluster::verify_leases(&node).await {
+        // Verify the lease at the commit point UNCONDITIONALLY. A node can
+        // be superseded while its recency stamp is still fresh — it keeps
+        // refreshing through the store even while RPC-partitioned, so the
+        // old `lease_stale &&` fast-path was unsound: a boat would write its
+        // commit record over a taker that had already claimed the block
+        // (found by the DST's pause + clock-skew faults — a live node loses
+        // a lease and its in-flight boat commits anyway). One `_lease/`
+        // list per boat is the price of storage-verified fencing.
+        if !crate::cluster::verify_leases(&node).await {
             err = Some("lease superseded; commit refused".into());
         }
     }

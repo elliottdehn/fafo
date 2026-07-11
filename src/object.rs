@@ -57,24 +57,48 @@ pub async fn fetch_image(
         return Ok((Vec::new(), 0)); // no base blob: fresh object
     };
 
+    // The durable delta chain, listed up front: it defines how far durable
+    // state actually reaches. The commuter cache is only trustworthy up to
+    // that point — a cache counter BEYOND every durable delta is an
+    // uncommitted local write (a boat the owner applied but that fencing
+    // then refused, so its commit record never landed). Trusting such a
+    // cache resurrects a fenced write and forks history (found by the DST
+    // pause fault: a live node loses its lease, its refused boat's write
+    // survives in the cache, a later activation replays it).
+    let delta_keys = store.list(&crate::delta::delta_prefix(id)).await?;
+    let mut max_durable = base_counter;
+    for key in &delta_keys {
+        if let Some(counter) = crate::delta::parse_delta_counter(key, id)
+            && counter > base_counter
+        {
+            max_durable = max_durable.max(counter);
+        }
+    }
+
     let cached = std::fs::read(live_path).ok().filter(|b| b.len() >= 100);
     let cache_counter = cached.as_deref().map(crate::delta::change_counter);
     let mut image = match cached {
-        // Cache at or past the base: the delta chain bridges the gap and
-        // the base download is skipped entirely.
-        Some(cache) if crate::delta::change_counter(&cache) >= base_counter => cache,
+        // Cache within [base, max_durable]: it is a valid checkpoint on the
+        // durable chain, so the base download is skipped. A cache BELOW the
+        // base (stale) or ABOVE max_durable (uncommitted, ahead of durable)
+        // is discarded — download the base and rebuild from durable deltas.
+        Some(cache)
+            if (base_counter..=max_durable).contains(&crate::delta::change_counter(&cache)) =>
+        {
+            cache
+        }
         _ => store.get(&object_key(id)).await?.unwrap_or_default(),
     };
     if std::env::var_os("FAFO_DST_LOG").is_some() {
         eprintln!(
-            "activate {id}: base@{base_counter} cache@{cache_counter:?} using@{}",
+            "activate {id}: base@{base_counter} cache@{cache_counter:?} max_durable@{max_durable} using@{}",
             crate::delta::change_counter(&image)
         );
     }
 
     let have = crate::delta::change_counter(&image);
     let mut chain_total = 0u32;
-    for key in store.list(&crate::delta::delta_prefix(id)).await? {
+    for key in delta_keys {
         let Some(counter) = crate::delta::parse_delta_counter(&key, id) else {
             continue;
         };
@@ -289,10 +313,21 @@ mod tests {
             )
             .await
             .unwrap();
+        // Cache AT the durable frontier (counter 6 = base 5 + delta 6):
+        // a valid checkpoint, served untouched with no base download, and
+        // the delta it already reflects (6 <= 6) isn't re-applied.
         let live = dir.path().join("t.db");
-        std::fs::write(&live, fake_db(7, 0xcc)).unwrap();
+        std::fs::write(&live, fake_db(6, 0xcc)).unwrap();
         let (image, _) = fetch_image(&store, "t", &live).await.unwrap();
-        assert_eq!(image, fake_db(7, 0xcc), "cached bytes served untouched");
+        assert_eq!(image, fake_db(6, 0xcc), "cached bytes served untouched");
+
+        // A cache AHEAD of durable (counter 7 > max durable 6) holds an
+        // uncommitted local write — a boat fencing refused, so no delta 7
+        // ever landed. Trusting it would resurrect the fenced write, so it
+        // is discarded and the base is downloaded (blocked here -> error).
+        std::fs::write(&live, fake_db(7, 0xcc)).unwrap();
+        let err = fetch_image(&store, "t", &live).await.unwrap_err();
+        assert!(err.to_string().contains("base download"), "cache ahead of durable forces a download");
 
         // A stale cache (counter behind the base) must NOT be trusted.
         std::fs::write(&live, fake_db(3, 0xdd)).unwrap();

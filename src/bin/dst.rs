@@ -48,8 +48,21 @@ fn main() {
         cfg.durable_wills = false;
         cfg.wills_survive_node_crash = true;
     }
+    // The clock adversary beyond the engine's tolerance: EXPECTED to fork.
+    // Exists to prove the simulator can see clock-rate violations.
+    // Live-node pause adversary (isolate a holder, let a peer take its
+    // lease, rejoin). Finds a known-unfixed cross-block-txn tear, so it is
+    // opt-in, off by default — the DST stays a green regression signal.
+    if has("--pause") {
+        cfg.pause_faults = cfg.pause_faults.max(2);
+    }
+    if has("--clock-chaos") {
+        cfg.clock_chaos = true;
+        cfg.pause_freezes_clock = true; // suspend hazard on
+        cfg.pause_faults = cfg.pause_faults.max(2);
+    }
 
-    let extra_flags: Vec<String> = ["--wills-strict", "--no-durable-wills", "--fuzz"]
+    let extra_flags: Vec<String> = ["--wills-strict", "--no-durable-wills", "--fuzz", "--clock-chaos", "--pause"]
         .iter()
         .filter(|f| has(f))
         .map(|f| f.to_string())
