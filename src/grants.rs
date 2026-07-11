@@ -181,6 +181,61 @@ mod tests {
     }
 
     #[test]
+    fn multiple_grants_union_and_star_matches_everything() {
+        let c = Capability {
+            grants: vec![
+                Grant {
+                    objects: "room-1".into(),
+                    verbs: vec!["read".into()],
+                },
+                Grant {
+                    objects: "log-*".into(),
+                    verbs: vec!["insert".into()],
+                },
+            ],
+            exp: far_future(),
+            sub: None,
+        };
+        assert!(allows(&c, "room-1", "read"));
+        assert!(allows(&c, "log-7", "insert"));
+        assert!(!allows(&c, "room-1", "insert"), "verbs don't leak across grants");
+        assert!(!allows(&c, "log-7", "read"));
+
+        // A bare "*" is the everything-glob — legal, but all on the minter.
+        let all = cap("*", &["read"], far_future());
+        assert!(allows(&all, "anything-at-all", "read"));
+    }
+
+    #[test]
+    fn stars_only_glob_at_the_end() {
+        // The docs promise prefix globs ONLY: a mid-pattern star is a
+        // literal character (and can never match a valid object id).
+        let c = cap("a*b", &["read"], far_future());
+        assert!(!allows(&c, "aXb", "read"));
+        assert!(!allows(&c, "ab", "read"));
+        assert!(allows(&c, "a*b", "read"), "matches itself, literally");
+    }
+
+    #[test]
+    fn poll_is_its_own_verb() {
+        let c = cap("chan", &["write", "read"], far_future());
+        assert!(!allows(&c, "chan", "poll"), "neither write nor read implies poll");
+        let p = cap("chan", &["poll"], far_future());
+        assert!(!allows(&p, "chan", "write"));
+    }
+
+    #[test]
+    fn verify_rejects_well_signed_garbage() {
+        // Odd-length hex in either half.
+        assert!(verify("s", "fafo1.abc.ab").is_none());
+        assert!(verify("s", "fafo1.ab.abc").is_none());
+        // A correctly signed payload that isn't a Capability at all.
+        let payload = b"not json";
+        let forged = format!("{PREFIX}{}.{}", hex(payload), hex(&sign("s", payload)));
+        assert!(verify("s", &forged).is_none());
+    }
+
+    #[test]
     fn tampering_expiry_and_wrong_secret_all_fail() {
         let c = cap("room-42", &["write"], far_future());
         let token = mint("secret", &c);

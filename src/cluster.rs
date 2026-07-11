@@ -308,13 +308,20 @@ fn default_blocks_legacy() -> usize {
     64 // pre-blocks clusters had per-worker leases with W=64
 }
 
-/// Workers [b*W/B, (b+1)*W/B) belong to block b.
+/// Which lease block covers a worker. This mapping names the lease keys in
+/// the blob store, so it is frozen — existing clusters depend on it.
 pub fn block_of(worker: usize, logical: usize, blocks: usize) -> usize {
     worker * blocks / logical
 }
 
+/// The worker range a block covers: exactly the workers block_of sends to
+/// it. The ceilings matter when blocks don't divide W evenly — plain floor
+/// division here would disagree with block_of at the seams (block_of(3906)
+/// is 0 for W=1M, B=256; a floored range would put 3906 in block 1).
 pub fn block_range(block: usize, logical: usize, blocks: usize) -> (usize, usize) {
-    (block * logical / blocks, (block + 1) * logical / blocks)
+    let start = (block * logical).div_ceil(blocks);
+    let end = ((block + 1) * logical).div_ceil(blocks);
+    (start, end)
 }
 
 #[derive(Serialize, Deserialize)]
@@ -885,7 +892,7 @@ pub async fn submit(
 /// and trigger cascades) must be covered by the token's verbs.
 pub async fn submit_as(
     node: &Node,
-    cap: Option<std::sync::Arc<crate::grants::Capability>>,
+    cap: Option<Arc<crate::grants::Capability>>,
     objects: Vec<String>,
     ops: Vec<Op>,
     read_only: bool,
@@ -926,7 +933,7 @@ pub fn validate_txn(objects: Vec<String>, ops: &[Op]) -> Result<Vec<String>, Api
 /// Routing half of submit, callable from the RPC handler (already validated).
 pub async fn submit_routed(
     node: &Node,
-    cap: Option<std::sync::Arc<crate::grants::Capability>>,
+    cap: Option<Arc<crate::grants::Capability>>,
     ids: Vec<String>,
     ops: Vec<Op>,
     read_only: bool,
@@ -1158,6 +1165,89 @@ mod tests {
         )
         .await
         .unwrap();
+    }
+
+    #[test]
+    fn blocks_tile_the_worker_space_exactly() {
+        // Every worker belongs to exactly one block, and that block's
+        // range contains it — even when blocks don't divide W evenly.
+        for (logical, blocks) in [(8, 4), (4096, 256), (1_000_000, 256), (100, 7), (256, 256)] {
+            let mut covered = 0;
+            for b in 0..blocks {
+                let (start, end) = block_range(b, logical, blocks);
+                assert!(start <= end);
+                covered += end - start;
+                for w in start..end {
+                    assert_eq!(block_of(w, logical, blocks), b, "W={logical} B={blocks} w={w}");
+                }
+            }
+            assert_eq!(covered, logical, "W={logical} B={blocks}: no gaps, no overlap");
+        }
+    }
+
+    #[test]
+    fn default_worker_is_frozen_fnv1a() {
+        // The Worker edge router reimplements this hash in TypeScript to
+        // route requests straight to the owning instance. These values
+        // changing means every deployed router is suddenly wrong.
+        assert_eq!(default_worker("alice", 4096), 2311);
+        assert_eq!(default_worker("bob", 4096), 2644);
+        assert_eq!(default_worker("alice", 1), 0);
+    }
+
+    #[test]
+    fn claim_specs_parse_the_documented_forms() {
+        assert!(matches!(ClaimSpec::parse("all", 8), ClaimSpec::All));
+        assert!(matches!(ClaimSpec::parse("auto:16", 8), ClaimSpec::Auto(16)));
+        assert!(matches!(ClaimSpec::parse("7", 8), ClaimSpec::Workers(w) if w == vec![7]));
+        assert!(
+            matches!(ClaimSpec::parse("2-5", 8), ClaimSpec::Workers(w) if w == vec![2, 3, 4, 5])
+        );
+        // Ranges clamp to the worker space; nonsense claims nothing.
+        assert!(
+            matches!(ClaimSpec::parse("6-99", 8), ClaimSpec::Workers(w) if w == vec![6, 7])
+        );
+        assert!(matches!(ClaimSpec::parse("5-2", 8), ClaimSpec::Workers(w) if w.is_empty()));
+        assert!(matches!(ClaimSpec::parse("junk", 8), ClaimSpec::Workers(w) if w.is_empty()));
+    }
+
+    #[test]
+    fn txn_validation_sorts_dedups_and_rejects() {
+        let op = |object: &str| Op {
+            object: object.into(),
+            sql: "SELECT 1".into(),
+            params: vec![],
+        };
+        let ids = validate_txn(
+            vec!["bob".into(), "alice".into(), "bob".into()],
+            &[op("alice"), op("bob")],
+        )
+        .unwrap();
+        assert_eq!(ids, vec!["alice", "bob"], "sorted and deduped");
+
+        assert!(validate_txn(vec![], &[]).is_err(), "no participants");
+        assert!(validate_txn(vec!["_meta".into()], &[]).is_err(), "reserved id");
+        let err = validate_txn(vec!["alice".into()], &[op("eve")]).unwrap_err();
+        assert!(err.message.contains("undeclared"), "op outside the declared set");
+    }
+
+    #[test]
+    fn pressure_caps_how_much_one_worker_may_hoard() {
+        let mut routing = Routing {
+            logical: 4,
+            blocks: 4,
+            exceptions: HashMap::new(),
+            addrs: HashMap::new(),
+        };
+        assert!(!routing.crowded(0), "an empty cluster is never crowded");
+        // 8 exceptions over 4 workers: fair share 2, cap max(2*8/4, 4) = 4.
+        for i in 0..8 {
+            routing.exceptions.insert(format!("obj{i}"), if i < 5 { 0 } else { 1 });
+        }
+        assert_eq!(routing.exception_load(0), 5);
+        assert!(routing.crowded(0), "5 of 8 on one worker is a mega-worker forming");
+        assert!(!routing.crowded(1));
+        assert_eq!(routing.owner_of("obj3"), 0, "exceptions override the hash");
     }
 
     #[tokio::test]
@@ -2715,8 +2805,8 @@ mod tests {
     // SQLite's authorizer at prepare time — CTEs and trigger cascades are
     // classified by the engine itself, not by keyword sniffing.
 
-    fn test_cap(objects: &str, verbs: &[&str]) -> std::sync::Arc<crate::grants::Capability> {
-        std::sync::Arc::new(crate::grants::Capability {
+    fn test_cap(objects: &str, verbs: &[&str]) -> Arc<crate::grants::Capability> {
+        Arc::new(crate::grants::Capability {
             grants: vec![crate::grants::Grant {
                 objects: objects.into(),
                 verbs: verbs.iter().map(|s| s.to_string()).collect(),
@@ -2728,7 +2818,7 @@ mod tests {
 
     async fn exec_as(
         node: &Node,
-        cap: std::sync::Arc<crate::grants::Capability>,
+        cap: Arc<crate::grants::Capability>,
         object: &str,
         sql: &str,
     ) -> Result<TxnResponse, ApiError> {
@@ -2889,7 +2979,7 @@ mod tests {
 
         // update on the account, insert on the channel: the outbox shape,
         // with each object's connection gated by its own verbs.
-        let cap = std::sync::Arc::new(crate::grants::Capability {
+        let cap = Arc::new(crate::grants::Capability {
             grants: vec![
                 crate::grants::Grant {
                     objects: acct.clone(),

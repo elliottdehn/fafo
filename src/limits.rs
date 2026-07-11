@@ -248,6 +248,65 @@ mod tests {
     }
 
     #[test]
+    fn ledger_accounting_tracks_growth_shrink_and_removal() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("a.db");
+        std::fs::write(&p, vec![0u8; 100]).unwrap();
+        let mut ledger = DiskLedger::new(10_000);
+
+        ledger.set_live(p.clone(), 100, 1);
+        assert_eq!(ledger.used(), 100);
+        ledger.touch(&p, 250); // file grew
+        assert_eq!(ledger.used(), 250);
+        ledger.touch(&p, 50); // file shrank
+        assert_eq!(ledger.used(), 50);
+        ledger.set_live(p.clone(), 80, 1); // re-registered, not double-counted
+        assert_eq!(ledger.used(), 80);
+        ledger.remove(&p);
+        assert_eq!(ledger.used(), 0);
+        ledger.remove(&p); // removing the unknown is fine
+        ledger.touch(&p, 999); // touching the unknown is fine
+        assert_eq!(ledger.used(), 0);
+    }
+
+    #[test]
+    fn set_cache_on_a_vanished_file_drops_the_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("gone.db");
+        let mut ledger = DiskLedger::new(10_000);
+        ledger.set_live(p.clone(), 500, 1);
+        assert_eq!(ledger.used(), 500);
+        // The object never materialized a file (fresh object, no writes):
+        // demoting it to cache must not leave phantom bytes accounted.
+        ledger.set_cache(p, 1);
+        assert_eq!(ledger.used(), 0);
+    }
+
+    #[test]
+    fn enforce_under_budget_is_a_noop() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("c.db");
+        std::fs::write(&p, vec![0u8; 100]).unwrap();
+        let mut ledger = DiskLedger::new(10_000);
+        ledger.set_cache(p.clone(), 3);
+        let e = ledger.enforce();
+        assert_eq!(e.deleted_cache_bytes, 0);
+        assert!(e.shed_from_worker.is_none());
+        assert!(p.exists(), "under budget, nothing is touched");
+    }
+
+    #[test]
+    fn tiny_instances_still_get_the_boat_floor() {
+        let tiny = Limits::derive(64 * 1024 * 1024, 128 * 1024 * 1024);
+        assert_eq!(
+            tiny.max_boat_bytes,
+            16 * 1024 * 1024,
+            "mem/8 would be 8 MiB; the floor keeps multi-MB objects shippable"
+        );
+        assert_eq!(tiny.default_max_unshipped(), tiny.max_boat_bytes);
+    }
+
+    #[test]
     fn limits_scale_with_instance() {
         let lite = Limits::derive(256 * 1024 * 1024, 2 * 1024 * 1024 * 1024);
         assert_eq!(lite.max_boat_bytes, 32 * 1024 * 1024); // mem/8, above the 16 MiB floor

@@ -154,6 +154,10 @@ pub fn decode(bytes: &[u8]) -> anyhow::Result<Delta> {
     let file_len = u64::from_le_bytes(bytes[4..12].try_into()?);
     let page_size = u32::from_le_bytes(bytes[12..16].try_into()?);
     let n = u32::from_le_bytes(bytes[16..20].try_into()?) as usize;
+    // Every page costs at least its 8-byte header, so a count the buffer
+    // cannot possibly hold is corruption — reject it before trusting it
+    // with an allocation.
+    anyhow::ensure!(n <= (bytes.len() - 20) / 8, "delta page count exceeds payload");
     let mut pages = Vec::with_capacity(n);
     let mut at = 20;
     for _ in 0..n {
@@ -233,6 +237,66 @@ mod tests {
         let mut rebuilt = old.clone();
         apply(&mut rebuilt, &decode(&encode(&delta)).unwrap());
         assert_eq!(rebuilt, new);
+    }
+
+    #[test]
+    fn unchanged_file_diffs_to_nothing() {
+        let db = fake_db(8, 4096, 5, 0xaa);
+        let mut manifest = Manifest::of(&db, 0);
+        let delta = diff(&mut manifest, &db);
+        assert!(delta.pages.is_empty(), "identical bytes ship zero pages");
+        assert_eq!(delta.counter, 5);
+        assert_eq!(delta.file_len, db.len() as u64);
+    }
+
+    #[test]
+    fn page_size_reads_sqlite_encodings() {
+        assert_eq!(page_size(&fake_db(2, 512, 1, 0)), 512);
+        assert_eq!(page_size(&fake_db(1, 65536, 1, 0)), 65536, "64 KiB is encoded as 1");
+        assert_eq!(page_size(b"short"), 4096, "headerless files get the default");
+    }
+
+    #[test]
+    fn change_counter_of_a_headerless_file_is_zero() {
+        assert_eq!(change_counter(&[]), 0);
+        assert_eq!(change_counter(&[0u8; 99]), 0);
+        assert_eq!(change_counter(&fake_db(1, 512, 42, 0)), 42);
+    }
+
+    #[test]
+    fn decode_rejects_corruption_without_panicking() {
+        assert!(decode(&[]).is_err(), "empty");
+        assert!(decode(&[0u8; 19]).is_err(), "shorter than the header");
+
+        // A header claiming u32::MAX pages in a 28-byte buffer must be
+        // rejected up front, not fed to an allocator.
+        let mut evil = vec![0u8; 28];
+        evil[16..20].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(decode(&evil).is_err(), "absurd page count");
+
+        // One page whose declared length runs past the buffer.
+        let mut truncated = encode(&Delta {
+            counter: 1,
+            file_len: 4096,
+            page_size: 4096,
+            pages: vec![(0, vec![0xaa; 4096])],
+        });
+        truncated.truncate(100);
+        assert!(decode(&truncated).is_err(), "truncated page body");
+    }
+
+    #[test]
+    fn delta_keys_list_in_apply_order() {
+        // Zero-padding is what makes lexicographic list order numeric.
+        let mut keys = [delta_key("t", 100), delta_key("t", 2), delta_key("t", 30)];
+        keys.sort();
+        let counters: Vec<u32> = keys
+            .iter()
+            .map(|k| parse_delta_counter(k, "t").unwrap())
+            .collect();
+        assert_eq!(counters, vec![2, 30, 100]);
+        assert_eq!(parse_delta_counter("objects/t.d.junk", "t"), None);
+        assert_eq!(parse_delta_counter(&delta_key("t", 7), "other"), None);
     }
 
     /// The whole scheme leans on SQLite bumping the header change counter

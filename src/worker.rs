@@ -39,6 +39,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use tokio::sync::{mpsc, oneshot};
 
@@ -60,7 +61,7 @@ pub enum WorkerMsg {
         poll: Option<PollOpts>,
         /// Capability-holder txns run under SQLite's authorizer: every
         /// action (through CTEs and trigger cascades) must be granted.
-        cap: Option<std::sync::Arc<grants::Capability>>,
+        cap: Option<Arc<grants::Capability>>,
         /// Optimistic txns are acked after local apply and ship in the next
         /// boat; pessimistic txns hold their ack until the boat is durable
         /// (and thereby act as flush barriers for everything before them).
@@ -168,7 +169,7 @@ struct Parked {
     read_only: bool,
     optimistic: bool,
     poll: Option<PollOpts>,
-    cap: Option<std::sync::Arc<grants::Capability>>,
+    cap: Option<Arc<grants::Capability>>,
     resp: oneshot::Sender<Result<TxnResponse, ApiError>>,
     /// How many participants (in sorted order) we hold queue heads for.
     acquired: usize,
@@ -435,59 +436,27 @@ impl Worker {
         // independent components can wait for the next boat when this one
         // hits the byte cap — bounding one shipment's RAM to the budget.
         let pending = std::mem::take(&mut self.pending_txns);
-        let mut parent: Vec<usize> = (0..pending.len()).collect();
-        fn find(parent: &mut Vec<usize>, i: usize) -> usize {
-            if parent[i] != i {
-                let root = find(parent, parent[i]);
-                parent[i] = root;
-            }
-            parent[i]
-        }
-        let mut first_txn_with: HashMap<&str, usize> = HashMap::new();
-        for (i, txn) in pending.iter().enumerate() {
-            for object in &txn.participants {
-                match first_txn_with.get(object.as_str()) {
-                    Some(&j) => {
-                        let (a, b) = (find(&mut parent, i), find(&mut parent, j));
-                        parent[a] = b;
-                    }
-                    None => {
-                        first_txn_with.insert(object, i);
-                    }
-                }
-            }
-        }
-        // Components in first-appearance order, with their byte weight.
-        let mut order: Vec<usize> = Vec::new();
-        let mut comp_txns: HashMap<usize, Vec<usize>> = HashMap::new();
-        for i in 0..pending.len() {
-            let root = find(&mut parent, i);
-            comp_txns.entry(root).or_insert_with(|| {
-                order.push(root);
-                Vec::new()
-            });
-            comp_txns.get_mut(&root).unwrap().push(i);
-        }
         let mut selected: Vec<usize> = Vec::new(); // txn indices for this boat
         let mut boat_objects: HashSet<String> = HashSet::new();
         let mut boat_bytes = 0u64;
         let mut leftover: Vec<usize> = Vec::new();
-        for root in order {
-            let txns = &comp_txns[&root];
-            let comp_objects: HashSet<&String> =
-                txns.iter().flat_map(|&i| &pending[i].participants).collect();
+        for component in txn_components(&pending) {
+            let comp_objects: HashSet<&String> = component
+                .iter()
+                .flat_map(|&i| &pending[i].participants)
+                .collect();
             let comp_bytes: u64 = comp_objects
                 .iter()
                 .map(|o| self.dirty.get(*o).copied().unwrap_or(0))
                 .sum();
             // Always take at least one component, else nothing ever ships.
             if !selected.is_empty() && boat_bytes + comp_bytes > self.node.limits.max_boat_bytes {
-                leftover.extend(txns.iter().copied());
+                leftover.extend(component);
                 continue;
             }
             boat_bytes += comp_bytes;
             boat_objects.extend(comp_objects.into_iter().cloned());
-            selected.extend(txns.iter().copied());
+            selected.extend(component);
         }
         // Reassemble: leftover txns (order-preserved) stay pending; the
         // boat takes its objects out of dirty and its waiters along.
@@ -514,54 +483,14 @@ impl Worker {
         let mut items = Vec::with_capacity(objects.len());
         let mut snap_err = false;
         for id in &objects {
-            let bytes =
-                match std::fs::read(&self.objects.get(id).expect("dirty object is live").live_path)
-                {
-                    Ok(b) => b,
-                    Err(_) => {
-                        snap_err = true;
-                        break;
-                    }
-                };
-            let payload = if (bytes.len() as u64) < DELTA_MIN_BYTES {
-                ShipPayload::Snapshot {
-                    gc_deltas: self.manifests.contains_key(id),
-                    bytes,
-                }
-            } else {
-                match self.manifests.get_mut(id) {
-                    Some(m) => {
-                        let d = delta::diff(m, &bytes);
-                        let delta_size: usize = d.pages.iter().map(|(_, p)| p.len()).sum();
-                        if m.chain_len + 1 > COMPACT_CHAIN
-                            || delta_size as u64 > bytes.len() as u64 / COMPACT_FRACTION_DENOM
-                        {
-                            m.chain_len = 0;
-                            ShipPayload::Snapshot {
-                                gc_deltas: true,
-                                bytes,
-                            }
-                        } else {
-                            m.chain_len += 1;
-                            ShipPayload::Delta {
-                                counter: d.counter,
-                                bytes: delta::encode(&d),
-                            }
-                        }
-                    }
-                    None => {
-                        // First large ship: baseline with a snapshot.
-                        self.manifests.insert(id.clone(), Manifest::of(&bytes, 0));
-                        ShipPayload::Snapshot {
-                            gc_deltas: false,
-                            bytes,
-                        }
-                    }
-                }
+            let live_path = &self.objects.get(id).expect("dirty object is live").live_path;
+            let Ok(bytes) = std::fs::read(live_path) else {
+                snap_err = true;
+                break;
             };
             items.push(ShipItem {
                 object: id.clone(),
-                payload,
+                payload: self.ship_payload(id, bytes),
             });
         }
         if snap_err {
@@ -595,6 +524,44 @@ impl Worker {
             items,
             waiters,
         ));
+    }
+
+    /// How one dirty object rides the boat: small objects and compactions
+    /// (long chain, or a diff too big to be worth it) ship whole snapshots;
+    /// large objects with a healthy chain ship page deltas against their
+    /// manifest.
+    fn ship_payload(&mut self, id: &str, bytes: Vec<u8>) -> ShipPayload {
+        if (bytes.len() as u64) < DELTA_MIN_BYTES {
+            return ShipPayload::Snapshot {
+                gc_deltas: self.manifests.contains_key(id),
+                bytes,
+            };
+        }
+        let Some(m) = self.manifests.get_mut(id) else {
+            // First large ship: baseline with a snapshot.
+            self.manifests.insert(id.to_string(), Manifest::of(&bytes, 0));
+            return ShipPayload::Snapshot {
+                gc_deltas: false,
+                bytes,
+            };
+        };
+        let d = delta::diff(m, &bytes);
+        let delta_size: usize = d.pages.iter().map(|(_, p)| p.len()).sum();
+        if m.chain_len + 1 > COMPACT_CHAIN
+            || delta_size as u64 > bytes.len() as u64 / COMPACT_FRACTION_DENOM
+        {
+            m.chain_len = 0;
+            ShipPayload::Snapshot {
+                gc_deltas: true,
+                bytes,
+            }
+        } else {
+            m.chain_len += 1;
+            ShipPayload::Delta {
+                counter: d.counter,
+                bytes: delta::encode(&d),
+            }
+        }
     }
 
     async fn on_ship_done(&mut self, objects: Vec<String>, ok: bool, unpromoted: Vec<String>) {
@@ -1256,7 +1223,7 @@ impl Worker {
         participants: &[String],
         ops: &[Op],
         read_only: bool,
-        cap: Option<&std::sync::Arc<grants::Capability>>,
+        cap: Option<&Arc<grants::Capability>>,
     ) -> Result<(Vec<OpResult>, Vec<String>), ApiError> {
         // Participants are guaranteed live: advance() activates cold
         // objects (off-loop) before a txn is allowed to run.
@@ -1437,6 +1404,45 @@ fn file_change_counter(path: &std::path::Path) -> Option<u32> {
     let mut buf = [0u8; 4];
     f.read_exact(&mut buf).ok()?;
     Some(u32::from_be_bytes(buf))
+}
+
+/// Group pending txns into txn-connected components (union-find): txns
+/// sharing a participant must land under one commit record, but disjoint
+/// groups may ship on different boats. Components come back in
+/// first-appearance order, each as indices into `pending`.
+fn txn_components(pending: &[AppliedTxn]) -> Vec<Vec<usize>> {
+    fn find(parent: &mut [usize], i: usize) -> usize {
+        if parent[i] != i {
+            parent[i] = find(parent, parent[i]);
+        }
+        parent[i]
+    }
+    let mut parent: Vec<usize> = (0..pending.len()).collect();
+    let mut first_txn_with: HashMap<&str, usize> = HashMap::new();
+    for (i, txn) in pending.iter().enumerate() {
+        for object in &txn.participants {
+            match first_txn_with.get(object.as_str()) {
+                Some(&j) => {
+                    let (a, b) = (find(&mut parent, i), find(&mut parent, j));
+                    parent[a] = b;
+                }
+                None => {
+                    first_txn_with.insert(object, i);
+                }
+            }
+        }
+    }
+    let mut components: Vec<Vec<usize>> = Vec::new();
+    let mut slot_of_root: HashMap<usize, usize> = HashMap::new();
+    for i in 0..pending.len() {
+        let root = find(&mut parent, i);
+        let slot = *slot_of_root.entry(root).or_insert_with(|| {
+            components.push(Vec::new());
+            components.len() - 1
+        });
+        components[slot].push(i);
+    }
+    components
 }
 
 pub enum ShipPayload {
@@ -1934,7 +1940,105 @@ fn value_to_json(v: rusqlite::types::ValueRef<'_>) -> Value {
 mod tests {
     use super::*;
     use crate::store::FsBlobStore;
-    use std::sync::Arc;
+
+    fn applied(participants: &[&str]) -> AppliedTxn {
+        AppliedTxn {
+            participants: participants.iter().map(|s| s.to_string()).collect(),
+            waiter: None,
+        }
+    }
+
+    #[test]
+    fn txn_components_group_by_shared_participants() {
+        // {a}, {b}, {a,b} all connect; {c} stands alone.
+        let pending = vec![applied(&["a"]), applied(&["b"]), applied(&["a", "b"]), applied(&["c"])];
+        assert_eq!(txn_components(&pending), vec![vec![0, 1, 2], vec![3]]);
+
+        // Transitive: {a,b} + {b,c} + {c,d} is one chain.
+        let chain = vec![applied(&["a", "b"]), applied(&["b", "c"]), applied(&["c", "d"])];
+        assert_eq!(txn_components(&chain), vec![vec![0, 1, 2]]);
+
+        // Fully disjoint txns keep their arrival order.
+        let disjoint = vec![applied(&["x"]), applied(&["y"]), applied(&["z"])];
+        assert_eq!(txn_components(&disjoint), vec![vec![0], vec![1], vec![2]]);
+        assert!(txn_components(&[]).is_empty());
+    }
+
+    #[test]
+    fn poll_hash_is_stable_across_processes() {
+        // Clients feed hashes back as baselines after reconnects and
+        // failovers — the function must never drift or gain a seed.
+        assert_eq!(poll_hash(&[OpResult::Rows { rows: vec![] }]), "4bf9765328d07878");
+        assert_eq!(
+            poll_hash(&[OpResult::Rows { rows: vec![serde_json::json!({"n": 1})] }]),
+            "94228ea8dcfd592b"
+        );
+    }
+
+    #[test]
+    fn poll_readiness_rules() {
+        let empty = [OpResult::Rows { rows: vec![] }];
+        let full = [OpResult::Rows { rows: vec![serde_json::json!({"n": 1})] }];
+        let empty_hash = poll_hash(&empty);
+        let full_hash = poll_hash(&full);
+
+        // Condition-variable mode: fire on any non-empty result.
+        assert!(!poll_ready(&None, &empty, &empty_hash));
+        assert!(poll_ready(&None, &full, &full_hash));
+
+        // Change-detection mode: fire when the hash moved — including to
+        // EMPTY (deletes are visible), which mode one would miss.
+        assert!(poll_ready(&Some("".into()), &empty, &empty_hash), "\"\" bootstraps");
+        assert!(!poll_ready(&Some(full_hash.clone()), &full, &full_hash));
+        assert!(poll_ready(&Some(full_hash), &empty, &empty_hash));
+    }
+
+    #[test]
+    fn json_params_map_onto_sqlite_types() {
+        use rusqlite::types::Value as Sql;
+        let params = json_params(&[
+            serde_json::json!(null),
+            serde_json::json!(true),
+            serde_json::json!(42),
+            serde_json::json!(1.5),
+            serde_json::json!("hi"),
+        ])
+        .unwrap();
+        assert_eq!(
+            params,
+            vec![
+                Sql::Null,
+                Sql::Integer(1),
+                Sql::Integer(42),
+                Sql::Real(1.5),
+                Sql::Text("hi".into())
+            ]
+        );
+        // Numbers past i64 degrade to Real rather than erroring...
+        assert_eq!(json_params(&[serde_json::json!(u64::MAX)]).unwrap(), vec![Sql::Real(u64::MAX as f64)]);
+        // ...but structured params are a caller bug, said plainly.
+        assert!(json_params(&[serde_json::json!([1, 2])]).is_err());
+        assert!(json_params(&[serde_json::json!({"k": 1})]).is_err());
+    }
+
+    #[test]
+    fn sqlite_values_round_into_json() {
+        use rusqlite::types::ValueRef;
+        assert_eq!(value_to_json(ValueRef::Null), Value::Null);
+        assert_eq!(value_to_json(ValueRef::Integer(-3)), json!(-3));
+        assert_eq!(value_to_json(ValueRef::Real(2.5)), json!(2.5));
+        assert_eq!(value_to_json(ValueRef::Text(b"ok")), json!("ok"));
+        assert_eq!(value_to_json(ValueRef::Blob(&[0xde, 0xad])), json!("dead"));
+    }
+
+    #[test]
+    fn hex_roundtrip_and_rejection() {
+        assert_eq!(hex_encode(&[0x00, 0xff, 0x10]), "00ff10");
+        assert_eq!(hex_decode("00ff10").unwrap(), vec![0x00, 0xff, 0x10]);
+        assert_eq!(hex_decode("").unwrap(), Vec::<u8>::new());
+        assert!(hex_decode("abc").is_none(), "odd length");
+        assert!(hex_decode("zz").is_none(), "not hex");
+    }
 
     #[tokio::test]
     async fn recovery_rolls_forward_committed_txns() {

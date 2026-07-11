@@ -24,6 +24,8 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 #[derive(Debug)]
 pub struct ApiError {
@@ -72,12 +74,12 @@ impl IntoResponse for ApiError {
 #[derive(Clone)]
 pub enum Auth {
     Root,
-    Cap(std::sync::Arc<grants::Capability>),
+    Cap(Arc<grants::Capability>),
 }
 
 impl Auth {
     /// The capability to attach to a txn (None for root = unrestricted).
-    fn cap(&self) -> Option<std::sync::Arc<grants::Capability>> {
+    fn cap(&self) -> Option<Arc<grants::Capability>> {
         match self {
             Auth::Root => None,
             Auth::Cap(c) => Some(c.clone()),
@@ -185,7 +187,7 @@ struct ArmedWill {
     /// The grants frozen at arm time. The will runs under them even if the
     /// token has since expired: the server is keeping a promise it already
     /// authorized, not accepting a new request.
-    cap: Option<std::sync::Arc<grants::Capability>>,
+    cap: Option<Arc<grants::Capability>>,
 }
 
 #[derive(Deserialize)]
@@ -272,9 +274,9 @@ async fn ws_conn(node: Node, socket: axum::extract::ws::WebSocket, auth: Auth) {
     // frame id -> object, for polls parked right now on this connection.
     // Cancel frames look up here; socket teardown cancels the rest so a
     // dead client's polls don't linger until the object's next write.
-    let outstanding: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<u64, String>>> =
+    let outstanding: Arc<Mutex<HashMap<u64, String>>> =
         Default::default();
-    let will: std::sync::Arc<std::sync::Mutex<Option<ArmedWill>>> = Default::default();
+    let will: Arc<Mutex<Option<ArmedWill>>> = Default::default();
     while let Some(Ok(msg)) = stream.next().await {
         let Message::Text(text) = msg else {
             if matches!(msg, Message::Close(_)) {
@@ -314,8 +316,8 @@ async fn handle_ws_frame(
     node: &Node,
     auth: &Auth,
     conn: u64,
-    outstanding: &std::sync::Mutex<std::collections::HashMap<u64, String>>,
-    will: &std::sync::Mutex<Option<ArmedWill>>,
+    outstanding: &Mutex<HashMap<u64, String>>,
+    will: &Mutex<Option<ArmedWill>>,
     text: &str,
 ) -> Option<String> {
     fn deny(id: u64, e: ApiError) -> Option<String> {
@@ -448,7 +450,7 @@ fn resolve_auth(node: &Node, root_token: &str, presented: &str) -> Option<Auth> 
         return Some(Auth::Root);
     }
     grants::verify(&node.secret, presented)
-        .map(|cap| Auth::Cap(std::sync::Arc::new(cap)))
+        .map(|cap| Auth::Cap(Arc::new(cap)))
 }
 
 async fn healthz(State(node): State<Node>) -> Json<Value> {
@@ -493,7 +495,7 @@ async fn rpc_handler(
         } => RpcResp::Txn(
             crate::cluster::submit_routed(
                 &node,
-                cap.map(std::sync::Arc::new),
+                cap.map(Arc::new),
                 objects,
                 ops,
                 read_only,
@@ -740,4 +742,414 @@ async fn list_objects(
         .filter_map(|k| Some(k.strip_prefix("objects/")?.strip_suffix(".db")?.to_string()))
         .collect();
     Ok(Json(json!({ "objects": ids })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cluster::{ClaimSpec, DEFAULT_MAX_UNSHIPPED, NodeConfig, start};
+    use crate::grants::{Capability, Grant};
+    use crate::store::{BlobStore, FsBlobStore};
+    use reqwest::Method;
+
+    /// Boot a real node (HTTP server on a random port) and return its base URL.
+    async fn serve(api_token: Option<&str>) -> (tempfile::TempDir, Node, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let store: Arc<dyn BlobStore> =
+            Arc::new(FsBlobStore::new(dir.path().join("blobs")).unwrap());
+        let node = start(NodeConfig {
+            store,
+            live_dir: dir.path().join("live"),
+            logical: 4,
+            claim: ClaimSpec::All,
+            bind: "127.0.0.1:0".into(),
+            advertise: None,
+            hysteresis: 200,
+            secret: "cluster-secret".into(),
+            api_token: api_token.map(str::to_string),
+            max_unshipped: DEFAULT_MAX_UNSHIPPED,
+            limits: crate::limits::Limits::detect(),
+            fence_ttl: std::time::Duration::from_secs(60),
+        })
+        .await
+        .unwrap();
+        let base = node.advertise.clone();
+        (dir, node, base)
+    }
+
+    async fn req(method: Method, url: &str, token: Option<&str>, body: Option<Value>) -> (u16, Value) {
+        static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+        let mut r = CLIENT.get_or_init(reqwest::Client::new).request(method, url);
+        if let Some(t) = token {
+            r = r.bearer_auth(t);
+        }
+        if let Some(b) = body {
+            r = r.json(&b);
+        }
+        let resp = r.send().await.unwrap();
+        let status = resp.status().as_u16();
+        (status, resp.json().await.unwrap_or(Value::Null))
+    }
+
+    async fn post(url: &str, token: Option<&str>, body: Value) -> (u16, Value) {
+        req(Method::POST, url, token, Some(body)).await
+    }
+
+    fn exec_body(sql: &str) -> Value {
+        json!({ "sql": sql })
+    }
+
+    #[tokio::test]
+    async fn healthz_is_open_but_everything_else_is_gated() {
+        let (_dir, node, base) = serve(Some("root")).await;
+        let (status, v) = req(Method::GET, &format!("{base}/healthz"), None, None).await;
+        assert_eq!(status, 200);
+        assert_eq!(v["ok"], true);
+
+        for (method, path) in [
+            (Method::POST, "/txn"),
+            (Method::POST, "/objects/x/exec"),
+            (Method::POST, "/objects/x/query"),
+            (Method::GET, "/objects"),
+            (Method::GET, "/stats"),
+            (Method::POST, "/grant"),
+        ] {
+            let (status, v) = req(method.clone(), &format!("{base}{path}"), None, Some(json!({}))).await;
+            assert_eq!(status, 401, "{path} without a token");
+            assert!(v["error"].is_string());
+            let (status, _) = req(method, &format!("{base}{path}"), Some("wrong"), Some(json!({}))).await;
+            assert_eq!(status, 401, "{path} with a bad token");
+        }
+        node.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn root_token_drives_the_whole_http_surface() {
+        let (_dir, node, base) = serve(Some("root")).await;
+        let root = Some("root");
+
+        // exec: bare-statement sugar, then the ops form.
+        let (status, _) = post(
+            &format!("{base}/objects/acct/exec"),
+            root,
+            exec_body("CREATE TABLE account (balance INTEGER NOT NULL CHECK (balance >= 0))"),
+        )
+        .await;
+        assert_eq!(status, 200);
+        let (status, v) = post(
+            &format!("{base}/objects/acct/exec"),
+            root,
+            json!({ "ops": [
+                { "sql": "INSERT INTO account (balance) VALUES (?1)", "params": [100] }
+            ]}),
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert_eq!(v["results"][0]["rows_affected"], 1);
+
+        // A cross-object /txn (creates the second object on first write).
+        let (status, _) = post(
+            &format!("{base}/txn"),
+            root,
+            json!({
+                "objects": ["acct", "acct2"],
+                "ops": [
+                    { "object": "acct2", "sql": "CREATE TABLE account (balance INTEGER)" },
+                    { "object": "acct2", "sql": "INSERT INTO account VALUES (60)" },
+                    { "object": "acct", "sql": "UPDATE account SET balance = balance - 60" }
+                ]
+            }),
+        )
+        .await;
+        assert_eq!(status, 200);
+
+        // query sees the committed state.
+        let (status, v) = post(
+            &format!("{base}/objects/acct/query"),
+            root,
+            exec_body("SELECT balance FROM account"),
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert_eq!(v["rows"][0]["balance"], 40);
+
+        // Listing and stats are root-only conveniences.
+        let (status, v) = req(Method::GET, &format!("{base}/objects"), root, None).await;
+        assert_eq!(status, 200);
+        let ids: Vec<&str> = v["objects"].as_array().unwrap().iter().map(|s| s.as_str().unwrap()).collect();
+        assert!(ids.contains(&"acct") && ids.contains(&"acct2"));
+        let (status, v) = req(Method::GET, &format!("{base}/stats"), root, None).await;
+        assert_eq!(status, 200);
+        assert!(v["total_txns"].as_u64().unwrap() >= 3);
+        node.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn capability_tokens_are_scoped_over_http() {
+        let (_dir, node, base) = serve(Some("root")).await;
+        let root = Some("root");
+        post(&format!("{base}/objects/log-1/exec"), root, exec_body("CREATE TABLE t (n INTEGER)")).await;
+
+        let (status, v) = post(
+            &format!("{base}/grant"),
+            root,
+            json!({ "grants": [{ "objects": "log-*", "verbs": ["insert", "read"] }], "ttl_secs": 600 }),
+        )
+        .await;
+        assert_eq!(status, 200);
+        let token = v["token"].as_str().unwrap().to_string();
+        let cap = Some(token.as_str());
+
+        // Granted: append and read, on matching objects only.
+        let (status, _) = post(&format!("{base}/objects/log-1/exec"), cap, exec_body("INSERT INTO t (n) VALUES (1)")).await;
+        assert_eq!(status, 200);
+        let (status, v) = post(&format!("{base}/objects/log-1/query"), cap, exec_body("SELECT n FROM t")).await;
+        assert_eq!(status, 200);
+        assert_eq!(v["rows"][0]["n"], 1);
+
+        // The authorizer catches a rewrite at prepare time...
+        let (status, v) = post(&format!("{base}/objects/log-1/exec"), cap, exec_body("UPDATE t SET n = 9")).await;
+        assert_eq!(status, 400);
+        assert!(v["error"].as_str().unwrap().contains("not authorized"));
+        // ...and the pre-filter refuses objects outside the grant outright.
+        let (status, _) = post(&format!("{base}/objects/other/exec"), cap, exec_body("INSERT INTO t (n) VALUES (1)")).await;
+        assert_eq!(status, 403);
+
+        // Root-only surfaces stay root-only.
+        for path in ["/objects", "/stats"] {
+            let (status, _) = req(Method::GET, &format!("{base}{path}"), cap, None).await;
+            assert_eq!(status, 403, "{path} must require root");
+        }
+        let (status, _) = post(
+            &format!("{base}/grant"),
+            cap,
+            json!({ "grants": [{ "objects": "*", "verbs": ["write"] }], "ttl_secs": 60 }),
+        )
+        .await;
+        assert_eq!(status, 403, "capabilities must not mint capabilities");
+        node.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn grant_endpoint_validates_its_input() {
+        let (_dir, node, base) = serve(Some("root")).await;
+        let root = Some("root");
+        let (status, v) = post(
+            &format!("{base}/grant"),
+            root,
+            json!({ "grants": [{ "objects": "x", "verbs": ["fly"] }], "ttl_secs": 60 }),
+        )
+        .await;
+        assert_eq!(status, 400);
+        assert!(v["error"].as_str().unwrap().contains("fly"));
+        let (status, _) = post(&format!("{base}/grant"), root, json!({ "grants": [], "ttl_secs": 60 })).await;
+        assert_eq!(status, 400);
+        node.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn query_rejects_writes_and_invalid_ids_reject_everywhere() {
+        let (_dir, node, base) = serve(None).await; // open node: everyone is root
+        let (status, v) = post(&format!("{base}/objects/q1/query"), None, exec_body("CREATE TABLE t (n INTEGER)")).await;
+        assert_eq!(status, 400);
+        assert!(v["error"].as_str().unwrap().contains("read-only"));
+
+        for bad in ["_meta", "has.dot"] {
+            let (status, v) = post(&format!("{base}/objects/{bad}/exec"), None, exec_body("SELECT 1")).await;
+            assert_eq!(status, 400, "{bad:?}");
+            assert!(v["error"].as_str().unwrap().contains("invalid object id"));
+        }
+        node.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn internal_rpc_requires_the_cluster_secret() {
+        let (_dir, node, base) = serve(Some("root")).await;
+        let rpc_body = json!({ "Txn": {
+            "objects": ["rpcobj"],
+            "ops": [{ "object": "rpcobj", "sql": "CREATE TABLE t (n INTEGER)", "params": [] }],
+            "read_only": false
+        }});
+        let client = reqwest::Client::new();
+
+        let resp = client.post(format!("{base}/internal/rpc")).json(&rpc_body).send().await.unwrap();
+        assert_eq!(resp.status().as_u16(), 401, "no secret header");
+        let resp = client
+            .post(format!("{base}/internal/rpc"))
+            .header(crate::rpc::SECRET_HEADER, "wrong")
+            .json(&rpc_body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 401, "bad secret");
+
+        let resp = client
+            .post(format!("{base}/internal/rpc"))
+            .header(crate::rpc::SECRET_HEADER, "cluster-secret")
+            .json(&rpc_body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 200);
+        let v: Value = resp.json().await.unwrap();
+        assert!(v["Txn"]["Ok"]["txn_id"].is_string(), "got: {v}");
+        node.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn http_poll_replies_with_rows_and_hash() {
+        let (_dir, node, base) = serve(None).await;
+        post(
+            &format!("{base}/objects/chan/exec"),
+            None,
+            json!({ "ops": [
+                { "sql": "CREATE TABLE msgs (id INTEGER PRIMARY KEY AUTOINCREMENT, body TEXT)" },
+                { "sql": "INSERT INTO msgs (body) VALUES ('hello')" }
+            ]}),
+        )
+        .await;
+        let (status, v) = post(
+            &format!("{base}/objects/chan/poll"),
+            None,
+            json!({ "sql": "SELECT body FROM msgs WHERE id > ?1", "params": [0] }),
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert_eq!(v["rows"][0]["body"], "hello");
+        assert!(v["hash"].is_string(), "change-detection needs the hash to feed back");
+        node.shutdown().await;
+    }
+
+    // ------------------------------------------------------------ WS frames
+    //
+    // The socket is plumbing; the protocol lives in handle_ws_frame, which
+    // is testable directly: JSON in, JSON out.
+
+    async fn frame(
+        node: &Node,
+        auth: &Auth,
+        outstanding: &Mutex<HashMap<u64, String>>,
+        will: &Mutex<Option<ArmedWill>>,
+        text: &str,
+    ) -> Option<Value> {
+        handle_ws_frame(node, auth, 1, outstanding, will, text)
+            .await
+            .map(|s| serde_json::from_str(&s).unwrap())
+    }
+
+    fn fresh_conn_state() -> (Mutex<HashMap<u64, String>>, Mutex<Option<ArmedWill>>) {
+        (Mutex::new(HashMap::new()), Mutex::new(None))
+    }
+
+    #[tokio::test]
+    async fn ws_frames_run_transactions_and_report_errors() {
+        let (_dir, node, _base) = serve(None).await;
+        let (outstanding, will) = fresh_conn_state();
+
+        // Objects may be omitted — inferred from the ops.
+        let v = frame(&node, &Auth::Root, &outstanding, &will,
+            r#"{"id":1,"ops":[{"object":"wsobj","sql":"CREATE TABLE t (n INTEGER)"}]}"#).await.unwrap();
+        assert_eq!(v["id"], 1);
+        assert!(v["result"]["txn_id"].is_string());
+
+        let v = frame(&node, &Auth::Root, &outstanding, &will,
+            r#"{"id":2,"read_only":true,"ops":[{"object":"wsobj","sql":"SELECT COUNT(*) AS c FROM t"}]}"#).await.unwrap();
+        assert_eq!(v["result"]["results"][0]["rows"][0]["c"], 0);
+
+        // A failing op reports the rollback with its status, same id.
+        let v = frame(&node, &Auth::Root, &outstanding, &will,
+            r#"{"id":3,"ops":[{"object":"wsobj","sql":"INSERT INTO missing VALUES (1)"}]}"#).await.unwrap();
+        assert_eq!(v["id"], 3);
+        assert_eq!(v["status"], 400);
+        assert!(v["error"].as_str().unwrap().contains("rolled back"));
+
+        // Unparseable frames still get an answer (id unknown: null).
+        let v = frame(&node, &Auth::Root, &outstanding, &will, "not json").await.unwrap();
+        assert!(v["id"].is_null());
+        assert!(v["error"].as_str().unwrap().contains("bad frame"));
+        node.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn ws_frames_enforce_capability_verbs() {
+        let (_dir, node, _base) = serve(None).await;
+        let (outstanding, will) = fresh_conn_state();
+        frame(&node, &Auth::Root, &outstanding, &will,
+            r#"{"id":1,"ops":[{"object":"wslog","sql":"CREATE TABLE t (n INTEGER)"}]}"#).await;
+
+        let appender = Auth::Cap(Arc::new(Capability {
+            grants: vec![Grant { objects: "wslog".into(), verbs: vec!["insert".into()] }],
+            exp: u64::MAX,
+            sub: None,
+        }));
+        let v = frame(&node, &appender, &outstanding, &will,
+            r#"{"id":2,"ops":[{"object":"wslog","sql":"INSERT INTO t (n) VALUES (1)"}]}"#).await.unwrap();
+        assert!(v["result"].is_object(), "insert is granted: {v}");
+
+        let v = frame(&node, &appender, &outstanding, &will,
+            r#"{"id":3,"read_only":true,"ops":[{"object":"wslog","sql":"SELECT n FROM t"}]}"#).await.unwrap();
+        assert_eq!(v["status"], 403, "insert does not imply read: {v}");
+        node.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn ws_wills_arm_disarm_and_validate() {
+        let (_dir, node, _base) = serve(None).await;
+        let (outstanding, will) = fresh_conn_state();
+
+        let v = frame(&node, &Auth::Root, &outstanding, &will,
+            r#"{"id":1,"will":{"ops":[{"object":"pres","sql":"DELETE FROM p WHERE u = 's1'"}]}}"#).await.unwrap();
+        assert_eq!(v["result"]["will"], "armed");
+        assert_eq!(will.lock().unwrap().as_ref().unwrap().objects, vec!["pres"]);
+
+        // Re-arming replaces; empty ops disarm.
+        frame(&node, &Auth::Root, &outstanding, &will,
+            r#"{"id":2,"will":{"ops":[{"object":"other","sql":"DELETE FROM p"}]}}"#).await.unwrap();
+        assert_eq!(will.lock().unwrap().as_ref().unwrap().objects, vec!["other"]);
+        let v = frame(&node, &Auth::Root, &outstanding, &will, r#"{"id":3,"will":{"ops":[]}}"#).await.unwrap();
+        assert_eq!(v["result"]["will"], "disarmed");
+        assert!(will.lock().unwrap().is_none());
+
+        // A bad will is refused at arm time, while the client can hear it.
+        let v = frame(&node, &Auth::Root, &outstanding, &will,
+            r#"{"id":4,"will":{"ops":[{"object":"_nope","sql":"DELETE FROM p"}]}}"#).await.unwrap();
+        assert!(v["error"].as_str().unwrap().contains("invalid object id"));
+        assert!(will.lock().unwrap().is_none(), "a refused will must not arm");
+        node.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn ws_cancel_clears_the_outstanding_entry() {
+        let (_dir, node, _base) = serve(None).await;
+        let (outstanding, will) = fresh_conn_state();
+        outstanding.lock().unwrap().insert(9, "chan".into());
+
+        // Cancel is fire-and-forget: no reply frame, entry gone.
+        let reply = frame(&node, &Auth::Root, &outstanding, &will, r#"{"id":9,"cancel":true}"#).await;
+        assert!(reply.is_none());
+        assert!(outstanding.lock().unwrap().is_empty());
+
+        // Canceling something unknown is a quiet no-op.
+        let reply = frame(&node, &Auth::Root, &outstanding, &will, r#"{"id":404,"cancel":true}"#).await;
+        assert!(reply.is_none());
+        node.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn resolve_auth_prefers_root_and_verifies_capability_signatures() {
+        let (_dir, node, _base) = serve(Some("root-token")).await;
+        assert!(matches!(resolve_auth(&node, "root-token", "root-token"), Some(Auth::Root)));
+        assert!(resolve_auth(&node, "root-token", "junk").is_none());
+
+        let cap = Capability {
+            grants: vec![Grant { objects: "x".into(), verbs: vec!["read".into()] }],
+            exp: u64::MAX,
+            sub: None,
+        };
+        let good = grants::mint(&node.secret, &cap);
+        assert!(matches!(resolve_auth(&node, "root-token", &good), Some(Auth::Cap(_))));
+        let forged = grants::mint("attacker-secret", &cap);
+        assert!(resolve_auth(&node, "root-token", &forged).is_none());
+        node.shutdown().await;
+    }
 }

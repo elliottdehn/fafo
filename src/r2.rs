@@ -462,6 +462,64 @@ mod tests {
         assert_eq!(civil_from_days(19_723), (2024, 1, 1)); // leap year
         assert_eq!(civil_from_days(19_782), (2024, 2, 29));
         assert_eq!(civil_from_days(20_643), (2026, 7, 9));
+        assert_eq!(civil_from_days(365), (1971, 1, 1));
+        assert_eq!(civil_from_days(11_016), (2000, 2, 29)); // century leap day
+    }
+
+    #[test]
+    fn uri_encoding_follows_sigv4_rules() {
+        assert_eq!(uri_encode("objects/a.db", false), "objects/a.db", "slash passes in paths");
+        assert_eq!(uri_encode("objects/a.db", true), "objects%2Fa.db", "but not in query values");
+        assert_eq!(uri_encode("a b", true), "a%20b", "space is %20, never +");
+        assert_eq!(uri_encode("A-Za-z0-9-._~", true), "A-Za-z0-9-._~", "unreserved pass through");
+        assert_eq!(uri_encode("é", true), "%C3%A9", "UTF-8 bytes, uppercase hex");
+    }
+
+    #[test]
+    fn canonical_query_sorts_and_encodes() {
+        let q = vec![
+            ("prefix".to_string(), "objects/".to_string()),
+            ("list-type".to_string(), "2".to_string()),
+        ];
+        assert_eq!(canonical_query(&q), "list-type=2&prefix=objects%2F");
+        assert_eq!(canonical_query(&[]), "");
+    }
+
+    #[test]
+    fn tag_extraction_handles_absent_and_unclosed_tags() {
+        assert!(extract_tags("<A>x</A>", "Key").is_empty());
+        assert_eq!(extract_tags("<Key>only-this</Key><Key>unclosed", "Key"), vec!["only-this"]);
+        assert!(extract_tags("", "Key").is_empty());
+    }
+
+    #[tokio::test]
+    async fn retries_stop_at_first_success_and_give_up_after_three() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let store = R2BlobStore::new("https://acct.example.com", "b", "k", "s").unwrap();
+
+        // Transient failure, then success: two attempts, value delivered.
+        let attempts = AtomicUsize::new(0);
+        let got: u32 = store
+            .with_retries(|| {
+                let n = attempts.fetch_add(1, Ordering::Relaxed);
+                async move { Ok((n >= 1).then_some(7)) }
+            })
+            .await
+            .unwrap();
+        assert_eq!(got, 7);
+        assert_eq!(attempts.load(Ordering::Relaxed), 2);
+
+        // Permanent transient-ness: exactly RETRIES attempts, then the error.
+        let attempts = AtomicUsize::new(0);
+        let err = store
+            .with_retries(|| {
+                attempts.fetch_add(1, Ordering::Relaxed);
+                async move { Ok(None::<u32>) }
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(attempts.load(Ordering::Relaxed), RETRIES);
+        assert!(err.to_string().contains("transient"));
     }
 
     #[test]

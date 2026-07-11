@@ -172,3 +172,38 @@ pub async fn adopt(
         _ => anyhow::bail!("rpc protocol mismatch"),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wire_errors_carry_status_across_the_boundary() {
+        let api = ApiError::bad_request("nope");
+        let wire = WireError::from(api);
+        assert_eq!(wire.status, 400);
+        let back = ApiError::from(wire);
+        assert_eq!(back.status, axum::http::StatusCode::BAD_REQUEST);
+        assert_eq!(back.message, "nope");
+
+        // A status a peer invented must degrade safely, not panic. (Codes
+        // 100-999 are all representable; only true garbage hits the 500.)
+        let alien = WireError { status: 42, message: "corrupt".into() };
+        assert_eq!(ApiError::from(alien).status, axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[test]
+    fn requests_survive_json_and_old_peers_can_omit_new_fields() {
+        // A Txn from a peer built before `optimistic`/`cap` existed.
+        let old = r#"{"Txn":{"objects":["a"],"ops":[],"read_only":false}}"#;
+        let req: Request = serde_json::from_str(old).unwrap();
+        match req {
+            Request::Txn { optimistic, cap, objects, .. } => {
+                assert!(!optimistic, "defaults off");
+                assert!(cap.is_none(), "defaults to root");
+                assert_eq!(objects, vec!["a"]);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+}

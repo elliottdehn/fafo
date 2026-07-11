@@ -163,3 +163,132 @@ fn walk(dir: &Path, root: &Path, out: &mut Vec<String>) -> anyhow::Result<()> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    fn store() -> (tempfile::TempDir, FsBlobStore) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FsBlobStore::new(dir.path().join("blobs")).unwrap();
+        (dir, store)
+    }
+
+    #[tokio::test]
+    async fn put_get_delete_roundtrip() {
+        let (_dir, s) = store();
+        assert_eq!(s.get("a/b.json").await.unwrap(), None);
+        s.put("a/b.json", b"one").await.unwrap();
+        assert_eq!(s.get("a/b.json").await.unwrap().unwrap(), b"one");
+        s.put("a/b.json", b"two").await.unwrap();
+        assert_eq!(s.get("a/b.json").await.unwrap().unwrap(), b"two", "put overwrites");
+        s.delete("a/b.json").await.unwrap();
+        assert_eq!(s.get("a/b.json").await.unwrap(), None);
+        s.delete("a/b.json").await.unwrap(); // deleting a missing key is fine
+    }
+
+    #[tokio::test]
+    async fn create_is_first_writer_wins() {
+        let (_dir, s) = store();
+        assert!(s.create("lease.json", b"alpha").await.unwrap());
+        assert!(!s.create("lease.json", b"beta").await.unwrap());
+        assert_eq!(
+            s.get("lease.json").await.unwrap().unwrap(),
+            b"alpha",
+            "the loser must not clobber the winner's content"
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_creates_elect_exactly_one_winner() {
+        let (_dir, s) = store();
+        let s = Arc::new(s);
+        let mut tasks = Vec::new();
+        for i in 0..16 {
+            let s = s.clone();
+            tasks.push(tokio::spawn(async move {
+                s.create("race.json", format!("claimer-{i}").as_bytes())
+                    .await
+                    .unwrap()
+            }));
+        }
+        let mut winners = 0;
+        for t in tasks {
+            if t.await.unwrap() {
+                winners += 1;
+            }
+        }
+        assert_eq!(winners, 1, "create-if-absent is the consensus primitive");
+    }
+
+    #[tokio::test]
+    async fn list_walks_only_the_prefix() {
+        let (_dir, s) = store();
+        s.put("objects/a.db", b"x").await.unwrap();
+        s.put("objects/a.d.0000000003", b"x").await.unwrap();
+        s.put("objects/b.db", b"x").await.unwrap();
+        s.put("_lease/b0/e1.json", b"x").await.unwrap();
+        assert_eq!(
+            s.list("objects/a.d.").await.unwrap(),
+            vec!["objects/a.d.0000000003"]
+        );
+        assert_eq!(s.list("objects/").await.unwrap().len(), 3);
+        assert_eq!(s.list("_lease/").await.unwrap(), vec!["_lease/b0/e1.json"]);
+        assert!(s.list("nothing/here/").await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn traversal_and_malformed_keys_are_rejected() {
+        let (_dir, s) = store();
+        for key in ["../escape", "a/../b", "a//b", "./a", "a/./b"] {
+            assert!(s.put(key, b"x").await.is_err(), "{key:?} must be rejected");
+            assert!(s.get(key).await.is_err(), "{key:?} must be rejected");
+        }
+    }
+
+    #[tokio::test]
+    async fn get_range_clamps_to_the_file() {
+        let (_dir, s) = store();
+        s.put("f", b"0123456789").await.unwrap();
+        assert_eq!(s.get_range("f", 2, 4).await.unwrap().unwrap(), b"2345");
+        assert_eq!(s.get_range("f", 8, 100).await.unwrap().unwrap(), b"89");
+        assert_eq!(s.get_range("f", 50, 4).await.unwrap().unwrap(), b"");
+        assert_eq!(s.get_range("missing", 0, 4).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn trait_default_get_range_matches_the_override() {
+        // Callers must not care which impl serves the peek.
+        struct Defaulted(FsBlobStore);
+        #[async_trait]
+        impl BlobStore for Defaulted {
+            async fn get(&self, key: &str) -> anyhow::Result<Option<Vec<u8>>> {
+                self.0.get(key).await
+            }
+            async fn put(&self, key: &str, bytes: &[u8]) -> anyhow::Result<()> {
+                self.0.put(key, bytes).await
+            }
+            async fn delete(&self, key: &str) -> anyhow::Result<()> {
+                self.0.delete(key).await
+            }
+            async fn list(&self, prefix: &str) -> anyhow::Result<Vec<String>> {
+                self.0.list(prefix).await
+            }
+            async fn create(&self, key: &str, bytes: &[u8]) -> anyhow::Result<bool> {
+                self.0.create(key, bytes).await
+            }
+        }
+        let (_dir, s) = store();
+        s.put("f", b"0123456789").await.unwrap();
+        let d = Defaulted(FsBlobStore::new(s.root.clone()).unwrap());
+        for (offset, len) in [(0, 4), (2, 4), (8, 100), (50, 4)] {
+            assert_eq!(
+                d.get_range("f", offset, len).await.unwrap(),
+                s.get_range("f", offset, len).await.unwrap(),
+                "offset {offset} len {len}"
+            );
+        }
+        assert_eq!(d.get_range("missing", 0, 4).await.unwrap(), None);
+    }
+}
