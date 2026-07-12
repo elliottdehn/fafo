@@ -93,6 +93,11 @@ pub enum WorkerMsg {
     /// Disk pressure: deactivate idle clean objects (their files become
     /// commuter cache, which the ledger may then reclaim).
     Shed,
+    /// Periodic (FAFO_LOG_PRIMARY): re-check parked durable polls against the
+    /// committed log. A peer may have committed to an object we serve polls
+    /// for without any local write to trigger a re-check, leaving the poll's
+    /// live conn stale — this catches that.
+    RecheckPolls,
     /// Internal: a spawned take task finished.
     Taken {
         txn: u64,
@@ -266,6 +271,23 @@ pub fn spawn(node: Node, id: usize, live_dir: PathBuf) -> anyhow::Result<mpsc::U
     std::fs::create_dir_all(&live_dir)?;
     let (tx, mut rx) = mpsc::unbounded_channel();
     let tracker = node.clone();
+    // Under FAFO_LOG_PRIMARY, tick the worker to re-check parked durable
+    // polls: a peer can commit to an object we serve polls for with no local
+    // write to trigger a re-check, so without this a long-poll on a stale
+    // live conn would hang until it times out.
+    if std::env::var_os("FAFO_LOG_PRIMARY").is_some() {
+        let ptx = tx.clone();
+        let pnode = node.clone();
+        node.spawn_tracked(async move {
+            let interval = pnode.fence_ttl / 3;
+            loop {
+                pnode.node_clock.sleep_node(interval).await;
+                if ptx.send(WorkerMsg::RecheckPolls).is_err() {
+                    break;
+                }
+            }
+        });
+    }
     // Seed explicit ownership (with handoff generations) from the boot
     // reconciliation of durable checkpoints — the dual-claim winners.
     let owned = node
@@ -491,6 +513,36 @@ impl Worker {
                 }
                 if shed_any {
                     self.node.enforce_disk();
+                }
+            }
+            WorkerMsg::RecheckPolls => {
+                // For each object with parked polls that we aren't writing:
+                // if a peer advanced the committed log past our live conn,
+                // re-fold IN PLACE and fire the (now-satisfiable) polls.
+                let objects: Vec<String> = self.polls.keys().cloned().collect();
+                for object in objects {
+                    if self.unshipped(&object) {
+                        continue;
+                    }
+                    // Refresh a stale live conn (a peer advanced the log with
+                    // no local trigger) before re-checking.
+                    let cs = crate::objlog::committed_seq(self.node.store.as_ref(), &object)
+                        .await
+                        .unwrap_or(0);
+                    if cs > self.log_seq.get(&object).copied().unwrap_or(0)
+                        && let Ok((image, seq)) =
+                            crate::objlog::fold_committed(self.node.store.as_ref(), &object).await
+                        && materialize(&mut self.objects, &object, &self.live_dir, &image).is_ok()
+                    {
+                        self.log_seq.insert(object.clone(), seq);
+                    }
+                    // Fire any parked poll now satisfied (whether we re-folded
+                    // or a prior write already made it current).
+                    for durable in [true, false] {
+                        for (resp, fired) in self.take_fired_polls(&object, durable) {
+                            let _ = resp.send(Ok(fired));
+                        }
+                    }
                 }
             }
             WorkerMsg::Taken {
@@ -1308,6 +1360,37 @@ impl Worker {
         fired
     }
 
+    /// A durable poll on a CLEAN object that won't fire may be reading a
+    /// STALE live conn — a peer committed to the object's log while we
+    /// weren't writing it, and only the write path rebases. Re-fold the
+    /// committed prefix IN PLACE (no revert, so no churn) and re-run the
+    /// poll; return the response if it now fires. Caller guarantees the
+    /// object is not unshipped (so no local writes are lost).
+    async fn refresh_stale_poll(
+        &mut self,
+        object: &str,
+        po: &PollOpts,
+        op: &Op,
+    ) -> Option<TxnResponse> {
+        let (image, seq) = crate::objlog::fold_committed(self.node.store.as_ref(), object)
+            .await
+            .ok()?;
+        if seq <= self.log_seq.get(object).copied().unwrap_or(0) {
+            return None; // our live conn is already current
+        }
+        materialize(&mut self.objects, object, &self.live_dir, &image).ok()?;
+        self.log_seq.insert(object.to_string(), seq);
+        let obj = self.objects.get(object)?;
+        let result = run_op(&obj.conn, &op.sql, &op.params).ok()?;
+        let results = vec![result];
+        let hash = poll_hash(&results);
+        poll_ready(&po.baseline, &results, &hash).then(|| TxnResponse {
+            txn_id: format!("w{}-poll-refresh", self.id),
+            results,
+            hash: Some(hash),
+        })
+    }
+
     /// This object's parked polls cannot be honored here anymore
     /// (migration, revert, shutdown): fail them all so clients re-poll.
     fn fail_polls(&mut self, object: &str, reason: &str) {
@@ -1624,16 +1707,37 @@ impl Worker {
                                 response.hash = Some(hash);
                                 let _ = p.resp.send(Ok(response));
                             } else {
-                                let op = &p.ops[0];
-                                self.polls.entry(object).or_default().push(PendingPoll {
-                                    conn: po.conn,
-                                    frame: po.frame,
-                                    sql: op.sql.clone(),
-                                    params: op.params.clone(),
-                                    durable: po.durable,
-                                    baseline: po.baseline,
-                                    resp: p.resp,
-                                });
+                                // Under FAFO_LOG_PRIMARY a durable poll that
+                                // won't fire may be reading a STALE live conn:
+                                // a peer committed to this object's log while
+                                // we weren't writing it, and only the WRITE
+                                // path rebases. If the object is CLEAN (no
+                                // local writes to lose) and the committed
+                                // prefix has advanced past our live conn,
+                                // re-fold it IN PLACE — no revert, no churn —
+                                // then re-run the poll against the fresh state.
+                                let refreshed = if po.durable
+                                    && std::env::var_os("FAFO_LOG_PRIMARY").is_some()
+                                    && !self.unshipped(&object)
+                                {
+                                    self.refresh_stale_poll(&object, &po, &p.ops[0]).await
+                                } else {
+                                    None
+                                };
+                                if let Some(resp) = refreshed {
+                                    let _ = p.resp.send(Ok(resp));
+                                } else {
+                                    let op = &p.ops[0];
+                                    self.polls.entry(object).or_default().push(PendingPoll {
+                                        conn: po.conn,
+                                        frame: po.frame,
+                                        sql: op.sql.clone(),
+                                        params: op.params.clone(),
+                                        durable: po.durable,
+                                        baseline: po.baseline,
+                                        resp: p.resp,
+                                    });
+                                }
                             }
                         }
                         None => {
