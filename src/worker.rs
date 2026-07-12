@@ -49,6 +49,9 @@ use tokio::sync::{mpsc, oneshot};
 const REHOME_AFTER: u32 = 3;
 const VISIT_WINDOW: u64 = 1000;
 const TAKE_RETRIES: usize = 8;
+/// Log-structured compaction fires once an object's committed tail (entries
+/// above its base) exceeds this, bounding fold cost to ~this many entries.
+const LOG_COMPACT_KEEP: u64 = 8;
 
 pub enum WorkerMsg {
     Submit {
@@ -2177,7 +2180,7 @@ async fn ship_task(
                     // so this checks them exactly. Off unless FAFO_LOG_CHECK.
                     if is_snapshot && std::env::var_os("FAFO_LOG_CHECK").is_some() {
                         if let Ok((folded, _)) =
-                            crate::objlog::fold_committed(node.store.as_ref(), &item.object, Vec::new())
+                            crate::objlog::fold_committed(node.store.as_ref(), &item.object)
                                 .await
                             && folded.as_slice() != bytes.as_slice()
                         {
@@ -2193,6 +2196,19 @@ async fn ship_task(
             }
             if !unpromoted.is_empty() && std::env::var_os("FAFO_DST_LOG").is_some() {
                 eprintln!("boat {staging_id} committed but unpromoted: {unpromoted:?}");
+            }
+            // Compaction: once an object's committed tail exceeds the keep
+            // window, fold it into a fresh base and trim, so fetch_image only
+            // ever folds a bounded tail. Cheap no-op when the tail is short.
+            if log_primary {
+                for obj in &objects {
+                    if let Err(e) =
+                        crate::objlog::compact(node.store.as_ref(), obj, LOG_COMPACT_KEEP).await
+                        && std::env::var_os("FAFO_DST_LOG").is_some()
+                    {
+                        eprintln!("compact {obj}: {e}");
+                    }
+                }
             }
             if unpromoted.is_empty() && !log_primary {
                 if !inline {

@@ -32,6 +32,33 @@ pub fn parse_log_seq(key: &str, id: &str) -> Option<u64> {
     key.strip_prefix(&format!("objects/{id}.L."))?.parse().ok()
 }
 
+/// A compacted base holds the folded image AT a sequence: everything at or
+/// below it is subsumed, so the reader only folds the log entries above it.
+pub fn base_seq_key(id: &str, seq: u64) -> String {
+    format!("objects/{id}.B.{seq:020}")
+}
+pub fn parse_base_seq(key: &str, id: &str) -> Option<u64> {
+    key.strip_prefix(&format!("objects/{id}.B."))?.parse().ok()
+}
+
+/// The highest compacted base (image, seq), or (empty, 0) if none — the
+/// starting point for a fold.
+pub async fn read_base(store: &dyn BlobStore, id: &str) -> anyhow::Result<(Vec<u8>, u64)> {
+    let mut best: Option<u64> = None;
+    for k in store.list(&format!("objects/{id}.B.")).await? {
+        if let Some(s) = parse_base_seq(&k, id) {
+            best = Some(best.map_or(s, |b| b.max(s)));
+        }
+    }
+    match best {
+        Some(seq) => {
+            let img = store.get(&base_seq_key(id, seq)).await?.unwrap_or_default();
+            Ok((img, seq))
+        }
+        None => Ok((Vec::new(), 0)),
+    }
+}
+
 /// The commit record — its PRESENCE is the atomic commit decision. A log
 /// entry counts as committed iff its txn's record exists. (Same key as
 /// worker::txn_key; mirrored here so the layout lives in one place.)
@@ -119,15 +146,23 @@ pub fn fold(base: Vec<u8>, entries: &[LogPayload]) -> anyhow::Result<Vec<u8>> {
     Ok(image)
 }
 
-/// The highest committed seq of `id` — the contiguous committed prefix
-/// length — without folding payloads. The next write goes at this + 1.
+/// The highest committed seq of `id` — the compacted base seq plus the
+/// contiguous committed run of log entries above it — without folding
+/// payloads. The next write goes at this + 1.
 pub async fn committed_seq(store: &dyn BlobStore, id: &str) -> anyhow::Result<u64> {
+    let (_, base_seq) = read_base(store, id).await?;
     let mut keys = store.list(&format!("objects/{id}.L.")).await?;
     keys.sort();
-    let mut seq = 0u64;
+    let mut seq = base_seq;
     for k in &keys {
         let Some(this_seq) = parse_log_seq(k, id) else { continue };
-        let Some(b) = store.get(k).await? else { continue };
+        if this_seq <= base_seq {
+            continue; // subsumed by the base
+        }
+        if this_seq != seq + 1 {
+            break; // a gap: the committed prefix ends here
+        }
+        let Some(b) = store.get(k).await? else { break };
         let Some(entry) = decode_entry(&b) else { break };
         if !committed(store, &entry.txn).await {
             break;
@@ -195,18 +230,25 @@ pub async fn read_seq(store: &dyn BlobStore, id: &str) -> u64 {
 /// first gap or uncommitted/pending entry (a page-delta at seq N is only
 /// valid applied on the image at seq N-1, so the prefix must be contiguous).
 /// Returns (image, highest committed seq).
-pub async fn fold_committed(
-    store: &dyn BlobStore,
-    id: &str,
-    base: Vec<u8>,
-) -> anyhow::Result<(Vec<u8>, u64)> {
+pub async fn fold_committed(store: &dyn BlobStore, id: &str) -> anyhow::Result<(Vec<u8>, u64)> {
+    let (base, base_seq) = read_base(store, id).await?;
     let mut keys = store.list(&format!("objects/{id}.L.")).await?;
     keys.sort();
-    let mut payloads: Vec<LogPayload> = Vec::with_capacity(keys.len());
-    let mut seq = 0u64;
+    let mut payloads: Vec<LogPayload> = Vec::new();
+    let mut seq = base_seq;
     for k in &keys {
         let Some(this_seq) = parse_log_seq(k, id) else { continue };
-        let Some(b) = store.get(k).await? else { continue };
+        if this_seq <= base_seq {
+            continue; // subsumed by the compacted base
+        }
+        if this_seq != seq + 1 {
+            break; // a gap: the committed prefix ends here
+        }
+        let Some(b) = store.get(k).await? else {
+            // Deleted under us by a concurrent compaction: fail so the caller
+            // re-reads the fresh base rather than folding across a hole.
+            anyhow::bail!("log entry {k} vanished mid-fold (compaction race); retry");
+        };
         let Some(entry) = decode_entry(&b) else { break };
         if !committed(store, &entry.txn).await {
             break; // pending/aborted: the committed prefix ends here
@@ -215,6 +257,34 @@ pub async fn fold_committed(
         seq = this_seq;
     }
     Ok((fold(base, &payloads)?, seq))
+}
+
+/// Compaction: fold the committed prefix into a fresh base at its seq, then
+/// trim the log entries and older bases it subsumes. Bounds fold cost to the
+/// entries ABOVE the base. Write-new-base-BEFORE-delete so a concurrent
+/// reader always sees a consistent (base, tail): it either reads the old base
+/// + full log, or the new base + trimmed log. Only worth doing once the tail
+/// exceeds `keep`.
+pub async fn compact(store: &dyn BlobStore, id: &str, keep: u64) -> anyhow::Result<()> {
+    let (image, seq) = fold_committed(store, id).await?;
+    let (_, base_seq) = read_base(store, id).await?;
+    if seq < base_seq + keep {
+        return Ok(()); // tail too short to bother
+    }
+    // 1. Publish the new base at the committed seq.
+    store.put(&base_seq_key(id, seq), &image).await?;
+    // 2. Trim: log entries at or below it, and any older base.
+    for k in store.list(&format!("objects/{id}.L.")).await? {
+        if parse_log_seq(&k, id).is_some_and(|s| s <= seq) {
+            store.delete(&k).await?;
+        }
+    }
+    for k in store.list(&format!("objects/{id}.B.")).await? {
+        if parse_base_seq(&k, id).is_some_and(|s| s < seq) {
+            store.delete(&k).await?;
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
