@@ -1319,10 +1319,26 @@ impl Worker {
         }
         self.meta.insert(object.to_string(), meta);
         self.owned.insert(object.to_string(), tm.generation);
-        // A migrated-in object's live state reflects the durable committed
-        // seq; record it so this worker's first ship rebases if a fork peer
-        // has committed past it.
-        if std::env::var_os("FAFO_LOG_PRIMARY").is_some() {
+        // A migrated-in object must be re-folded from the durable committed
+        // log, NOT served from a stale live file we happen to still have cached
+        // from a PREVIOUS tenure: while the object was away a peer may have
+        // committed past our cached seq, and shipping a snapshot built on that
+        // cache OVERWRITES the peer's committed write at a fresh seq (a
+        // two-writer fork — torn transfer / conservation, the last --pause
+        // residual). Purge the cache so the next access re-activates off the
+        // committed fold; seed log_seq so the first ship still rebases if a
+        // peer raced us in the meantime.
+        if std::env::var_os("FAFO_LOG_PRIMARY").is_some() && !self.dirty.contains_key(object) {
+            // CLEAN re-acquire only. Drop any cache from a prior tenure (a peer
+            // may have committed while we were away) and re-baseline log_seq to
+            // the committed seq, so the next access re-folds and the first ship
+            // rebases if a peer raced us. A DIRTY object is deliberately left
+            // ALONE: its live file carries unshipped writes built on an OLDER
+            // base, so advancing log_seq to the committed seq here would tell
+            // the rebase guard those writes are current and let them ship as a
+            // snapshot that OVERWRITES a peer's committed write (a two-writer
+            // fork). Leaving log_seq at the writes' base makes that ship rebase.
+            purge(&mut self.objects, object);
             let seq = crate::objlog::committed_seq(self.node.store.as_ref(), object)
                 .await
                 .unwrap_or(0);

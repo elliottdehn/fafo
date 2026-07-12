@@ -280,7 +280,16 @@ pub async fn prewrite(
                 if abort_txn(store, &held.txn).await? {
                     delete_if_txn(store, &key, &held.txn).await?;
                 } else {
-                    seq += 1; // it committed under us; step over it
+                    // The holder COMMITTED under us (our abort lost the race).
+                    // That is a committed rival exactly like the Some(true) arm:
+                    // our payload was computed against a state that does not
+                    // include it, so we MUST NOT ship over it — stepping to the
+                    // next seq would commit our stale snapshot on top, silently
+                    // dropping the rival's committed write (a two-writer fork:
+                    // torn transfer / conservation, the last --pause residual;
+                    // it only bit here because a store-fault-timed outcome read
+                    // showed the committed entry as pending). Rebase instead.
+                    return Ok(None);
                 }
             }
         }
