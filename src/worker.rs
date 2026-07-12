@@ -113,6 +113,9 @@ pub enum WorkerMsg {
         /// failed: the blob store is behind acked local state. The worker
         /// self-heals by re-shipping these from the live file.
         unpromoted: Vec<String>,
+        /// Under FAFO_LOG_PRIMARY: the object whose prewrite lost to a peer
+        /// (a fork). The worker reconciles ownership for it.
+        rebased: Option<String>,
     },
     /// Internal: a spawned activation fetch finished. Blob I/O for cold
     /// objects happens off-loop so one cold tenant can't stall the others.
@@ -555,7 +558,8 @@ impl Worker {
                 objects,
                 ok,
                 unpromoted,
-            } => self.on_ship_done(objects, ok, unpromoted).await,
+                rebased,
+            } => self.on_ship_done(objects, ok, unpromoted, rebased).await,
             WorkerMsg::Activated {
                 txn,
                 object,
@@ -832,8 +836,53 @@ impl Worker {
         }
     }
 
-    async fn on_ship_done(&mut self, objects: Vec<String>, ok: bool, unpromoted: Vec<String>) {
+    async fn on_ship_done(
+        &mut self,
+        objects: Vec<String>,
+        ok: bool,
+        unpromoted: Vec<String>,
+        rebased: Option<String>,
+    ) {
         self.inflight = None;
+        // Fork reconciliation (FAFO_LOG_PRIMARY): our prewrite lost to a peer
+        // that committed at our seq. If a HIGHER-or-equal generation owner now
+        // holds the object durably, RELINQUISH it — stop racing and route
+        // future txns to the winner. This converges the pause-fork leapfrog
+        // (otherwise both nodes rebase-and-retry each other forever).
+        if let Some(obj) = rebased {
+            use crate::cluster::Claim;
+            let my_gen = self.owned.get(&obj).copied().unwrap_or(0);
+            let claim = crate::cluster::durable_claim(self.node.store.as_ref(), &obj).await;
+            if let Claim::Owned(w, g) | Claim::Transit(w, g) = claim
+                && w != self.id
+                && w != usize::MAX
+                && g >= my_gen
+            {
+                if std::env::var_os("FAFO_DST_LOG").is_some() {
+                    eprintln!(
+                        "w{} relinquishing {obj} to w{w} (durable gen {g} >= mine {my_gen})",
+                        self.id
+                    );
+                }
+                self.owned.remove(&obj);
+                self.log_seq.remove(&obj);
+                self.meta.remove(&obj);
+                self.manifests.remove(&obj);
+                if let Some(bytes) = self.dirty.remove(&obj) {
+                    self.dirty_bytes = self.dirty_bytes.saturating_sub(bytes);
+                }
+                purge(&mut self.objects, &obj);
+                self.fail_polls(&obj, "object claimed elsewhere; re-poll");
+                // Route future txns to the durable owner so the client's retry
+                // lands on the winner instead of bouncing back here.
+                self.node
+                    .routing
+                    .write()
+                    .unwrap()
+                    .exceptions
+                    .insert(obj.clone(), w);
+            }
+        }
         if ok {
             self.node.stats.ships.fetch_add(1, Ordering::Relaxed);
             // Log-primary: the boat committed one entry per object at
@@ -2208,6 +2257,7 @@ async fn ship_task(
     // switch that flips all these entries to committed at once; a fork that
     // stole one of our seqs fails a create here, so we abort before
     // committing and never tear the txn. (protosim validated this.)
+    let mut rebased: Option<String> = None;
     if err.is_none() && std::env::var_os("FAFO_LOG_PRIMARY").is_some() {
         let born = node.node_clock.now().as_millis() as u64;
         // A live worker commits well within fence_ttl; only a lock older than
@@ -2232,6 +2282,11 @@ async fn ship_task(
             {
                 Ok(Some(_)) => {}
                 Ok(None) => {
+                    // A peer committed to this object at our seq: we are a
+                    // fork loser. Remember it so the worker can reconcile
+                    // ownership (relinquish if a higher generation owns it),
+                    // converging the leapfrog instead of retrying forever.
+                    rebased = Some(item.object.clone());
                     err = Some(format!("log seq for {} superseded", item.object));
                     break;
                 }
@@ -2376,6 +2431,7 @@ async fn ship_task(
                 objects,
                 ok: true,
                 unpromoted,
+                rebased: None,
             });
         }
         Some(e) => {
@@ -2391,6 +2447,7 @@ async fn ship_task(
                 objects,
                 ok: false,
                 unpromoted: Vec::new(),
+                rebased,
             });
         }
     }

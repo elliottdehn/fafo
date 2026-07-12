@@ -70,12 +70,10 @@ pub fn outcome_key(txn: &str) -> String {
 /// Commit `txn`: create its outcome as committed. Returns false if a resolver
 /// already aborted it (we lost the race) — the caller must NOT ack.
 pub async fn commit_txn(store: &dyn BlobStore, txn: &str) -> anyhow::Result<bool> {
-    let won = store.create(&outcome_key(txn), &[1]).await?;
-    let ok = won || committed(store, txn).await;
-    if std::env::var_os("FAFO_DST_LOG").is_some() {
-        eprintln!("commit {txn} -> {ok} (won={won})");
+    if store.create(&outcome_key(txn), &[1]).await? {
+        return Ok(true);
     }
-    Ok(ok)
+    Ok(committed(store, txn).await) // maybe an idempotent retry of our own commit
 }
 
 /// Abort `txn`: create its outcome as aborted. Returns true if we won (or it
@@ -231,9 +229,6 @@ pub async fn prewrite(
     for _ in 0..64 {
         let key = log_key(id, seq);
         if store.create(&key, entry).await? {
-            if std::env::var_os("FAFO_DST_LOG").is_some() {
-                eprintln!("prewrite {txn} {id}@{seq}");
-            }
             return Ok(Some(seq));
         }
         // Occupied — decide by the holder.
