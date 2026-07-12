@@ -237,6 +237,13 @@ struct Worker {
     /// Page-hash manifests for large objects (delta shipping). Built on
     /// activation or first large ship; dropped on evict.
     manifests: Map<String, Manifest>,
+    /// Under FAFO_LOG_PRIMARY: the committed log seq each object's LIVE file
+    /// reflects. Seeded at activation/admit, +1 per committed ship. If the
+    /// durable committed_seq has moved past it (a fork peer committed), our
+    /// live file is stale — the prewrite aborts and the object rebases
+    /// (revert -> re-activate off the committed fold) instead of shipping a
+    /// snapshot that would clobber the peer's commit.
+    log_seq: Map<String, u64>,
     /// Objects in the currently shipping boat (at most one boat in flight;
     /// the next launches the moment it lands, if anything is dirty).
     inflight: Option<Set<String>>,
@@ -290,6 +297,7 @@ pub fn spawn(node: Node, id: usize, live_dir: PathBuf) -> anyhow::Result<mpsc::U
         dirty_bytes: 0,
         pending_txns: Vec::new(),
         manifests: Map::default(),
+        log_seq: Map::default(),
         inflight: None,
         polls: Map::default(),
         needs_service: Vec::new(),
@@ -683,6 +691,7 @@ impl Worker {
             items.push(ShipItem {
                 object: id.clone(),
                 payload: self.ship_payload(id, bytes),
+                expected_seq: self.log_seq.get(id).copied().unwrap_or(0),
             });
         }
         if snap_err {
@@ -775,6 +784,15 @@ impl Worker {
         self.inflight = None;
         if ok {
             self.node.stats.ships.fetch_add(1, Ordering::Relaxed);
+            // Log-primary: the boat committed one entry per object at
+            // expected_seq+1, so our live file now reflects that seq.
+            if std::env::var_os("FAFO_LOG_PRIMARY").is_some() {
+                for id in &objects {
+                    if let Some(s) = self.log_seq.get_mut(id) {
+                        *s += 1;
+                    }
+                }
+            }
             // Promotion failures leave the blob store behind acked local
             // state even though the commit record landed (recovery would
             // roll it forward at next boot — but a live take would activate
@@ -880,6 +898,9 @@ impl Worker {
             purge(&mut self.objects, id);
             self.meta.remove(id);
             self.manifests.remove(id);
+            // Drop the rebase baseline: re-activation reseeds it from the
+            // fresh committed fold.
+            self.log_seq.remove(id);
             if let Some(bytes) = self.dirty.remove(id) {
                 self.dirty_bytes = self.dirty_bytes.saturating_sub(bytes);
             }
@@ -1061,11 +1082,16 @@ impl Worker {
         if let Some(p) = self.parked.get_mut(&txn) {
             p.activating = false;
         }
+        let log_primary = std::env::var_os("FAFO_LOG_PRIMARY").is_some();
         let outcome = result.and_then(|(image, chain_total)| {
             if self.owns(&object) && !self.objects.contains_key(&object) {
                 materialize(&mut self.objects, &object, &self.live_dir, &image)
                     .map_err(|e| e.to_string())?;
-                if image.len() as u64 >= DELTA_MIN_BYTES {
+                if log_primary {
+                    // chain_total carries the committed seq the live file now
+                    // reflects — the rebase baseline.
+                    self.log_seq.insert(object.clone(), chain_total as u64);
+                } else if image.len() as u64 >= DELTA_MIN_BYTES {
                     self.manifests
                         .insert(object.clone(), Manifest::of(&image, chain_total));
                 }
@@ -1192,6 +1218,15 @@ impl Worker {
         }
         self.meta.insert(object.to_string(), meta);
         self.owned.insert(object.to_string(), tm.generation);
+        // A migrated-in object's live state reflects the durable committed
+        // seq; record it so this worker's first ship rebases if a fork peer
+        // has committed past it.
+        if std::env::var_os("FAFO_LOG_PRIMARY").is_some() {
+            let seq = crate::objlog::committed_seq(self.node.store.as_ref(), object)
+                .await
+                .unwrap_or(0);
+            self.log_seq.insert(object.to_string(), seq);
+        }
         self.transit.remove(object);
         {
             let mut routing = self.node.routing.write().unwrap();
@@ -1971,6 +2006,10 @@ pub enum ShipPayload {
 pub struct ShipItem {
     pub object: String,
     pub payload: ShipPayload,
+    /// The committed seq this snapshot builds on (FAFO_LOG_PRIMARY). The
+    /// prewrite lands at expected_seq+1 and aborts if durable committed_seq
+    /// has moved past it — the rebase signal.
+    pub expected_seq: u64,
 }
 
 impl ShipItem {
@@ -2081,6 +2120,7 @@ async fn ship_task(
                 &item.object,
                 &staging_id,
                 &entry,
+                item.expected_seq,
                 born,
                 ttl_ms,
             )

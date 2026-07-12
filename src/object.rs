@@ -52,14 +52,14 @@ pub async fn fetch_image(
     // committed prefix. The base/delta path below becomes a compaction cache
     // only (step 4). The u32 (delta chain length) is meaningless here, so 0.
     if std::env::var_os("FAFO_LOG_PRIMARY").is_some() {
-        let (image, _seq) = crate::objlog::fold_committed(store.as_ref(), id).await?;
+        let (image, seq) = crate::objlog::fold_committed(store.as_ref(), id).await?;
         if std::env::var_os("FAFO_DST_LOG").is_some() {
-            eprintln!(
-                "activate {id}: log-fold {} bytes @seq {_seq}",
-                image.len()
-            );
+            eprintln!("activate {id}: log-fold {} bytes @seq {seq}", image.len());
         }
-        return Ok((image, 0));
+        // The u32 slot carries the committed seq the live file now reflects
+        // (the delta chain length is meaningless under the log). The worker
+        // records it as log_seq to detect a stale live file later.
+        return Ok((image, seq as u32));
     }
     let base_counter = store
         .get_range(&object_key(id), crate::delta::HEADER_CHANGE_COUNTER as u64, 4)

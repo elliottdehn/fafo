@@ -216,10 +216,18 @@ pub async fn prewrite(
     id: &str,
     txn: &str,
     entry: &[u8],
+    expected: u64,
     now_ms: u64,
     ttl_ms: u64,
 ) -> anyhow::Result<Option<u64>> {
-    let mut seq = committed_seq(store, id).await? + 1;
+    // Rebase guard: our snapshot builds on `expected`. If the durable
+    // committed prefix has moved past it, a fork peer committed a change our
+    // live file never saw — shipping would clobber it. Abort so the worker
+    // reverts and re-activates off the fresh committed fold.
+    if committed_seq(store, id).await? != expected {
+        return Ok(None);
+    }
+    let mut seq = expected + 1;
     for _ in 0..64 {
         let key = log_key(id, seq);
         if store.create(&key, entry).await? {
