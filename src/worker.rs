@@ -2388,7 +2388,17 @@ async fn ship_task(
             // Compaction: once an object's committed tail exceeds the keep
             // window, fold it into a fresh base and trim, so fetch_image only
             // ever folds a bounded tail. Cheap no-op when the tail is short.
-            if log_primary {
+            //
+            // Only compact while we STILL hold the lease. Compaction is a
+            // destructive read-modify-write on the durable log (put base,
+            // delete the folded tail); if ownership moved after our commit —
+            // acct-0 churns through owners under the pause fault — a superseded
+            // node folding from its stale view would publish a base MISSING a
+            // committed entry the new owner had added, then delete that entry's
+            // log key: the committed write vanishes (a two-writer fork; torn
+            // transfer / conservation, simulator --pause). verify_leases is the
+            // same storage-verified fence the commit gate uses.
+            if log_primary && crate::cluster::verify_leases(&node).await {
                 for obj in &objects {
                     if let Err(e) =
                         crate::objlog::compact(node.store.as_ref(), obj, LOG_COMPACT_KEEP).await
