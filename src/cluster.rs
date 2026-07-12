@@ -812,7 +812,30 @@ pub async fn start(cfg: NodeConfig) -> anyhow::Result<Node> {
     };
 
     // Current block-lease holders (one list; so we can route to peers).
-    let leases = load_leases(cfg.store.as_ref(), blocks).await?;
+    let mut leases = load_leases(cfg.store.as_ref(), blocks).await?;
+
+    // BOOT WITH NOTHING: any UNRELEASED lease still naming our own address is
+    // a CRASHED predecessor's — this fresh incarnation has written no lease
+    // yet and holds nothing. A crash skips the graceful release, so without
+    // this the block stays leased to an address that is now alive but hosts
+    // NOTHING: peers see the holder alive and never reclaim (dead-holder
+    // path), we don't host it either, and every take there dead-ends
+    // NotMine{None} forever (the pause-fault orphan, e.g. erc20 tok-supply,
+    // that starved the whole phase). Release them so the cluster can
+    // redistribute the work — to a peer or to us, but only ever through the
+    // normal claim/handoff path, never by resurrecting our old ownership
+    // (which forks: it races the redistribution that happened while we were
+    // gone). We do NOT resurrect; we come back empty and reacquire fresh.
+    for (&b, lease) in leases.iter_mut() {
+        if lease.addr == advertise && !lease.released {
+            let _ = cfg
+                .store
+                .create(&tombstone_key(b, lease.epoch), b"released")
+                .await;
+            lease.released = true;
+        }
+    }
+
     let addrs: Map<usize, String> = leases
         .iter()
         .map(|(b, lease)| (*b, lease.addr.clone()))
