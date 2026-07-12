@@ -59,16 +59,44 @@ pub async fn read_base(store: &dyn BlobStore, id: &str) -> anyhow::Result<(Vec<u
     }
 }
 
-/// The commit record — its PRESENCE is the atomic commit decision. A log
-/// entry counts as committed iff its txn's record exists. (Same key as
-/// worker::txn_key; mirrored here so the layout lives in one place.)
-pub fn commit_key(txn: &str) -> String {
-    format!("txns/{txn}.json")
+/// The single atomic commit/abort decision for a txn. Commit and abort both
+/// race to `create` it (create-if-absent), so EXACTLY ONE wins — a resumed
+/// zombie can never disagree with the peer that resolved it. Value: [1] =
+/// committed, [0] = aborted. (protosim proved this closes the fork.)
+pub fn outcome_key(txn: &str) -> String {
+    format!("txns/{txn}.O")
 }
 
-/// A log entry's txn is committed iff its commit record is present.
+/// Commit `txn`: create its outcome as committed. Returns false if a resolver
+/// already aborted it (we lost the race) — the caller must NOT ack.
+pub async fn commit_txn(store: &dyn BlobStore, txn: &str) -> anyhow::Result<bool> {
+    let won = store.create(&outcome_key(txn), &[1]).await?;
+    let ok = won || committed(store, txn).await;
+    if std::env::var_os("FAFO_DST_LOG").is_some() {
+        eprintln!("commit {txn} -> {ok} (won={won})");
+    }
+    Ok(ok)
+}
+
+/// Abort `txn`: create its outcome as aborted. Returns true if we won (or it
+/// was already aborted), false if it committed first (leave it alone).
+pub async fn abort_txn(store: &dyn BlobStore, txn: &str) -> anyhow::Result<bool> {
+    if store.create(&outcome_key(txn), &[0]).await? {
+        return Ok(true);
+    }
+    Ok(matches!(outcome(store, txn).await?, Some(false)))
+}
+
+pub async fn outcome(store: &dyn BlobStore, txn: &str) -> anyhow::Result<Option<bool>> {
+    Ok(store
+        .get(&outcome_key(txn))
+        .await?
+        .map(|b| b.first() == Some(&1)))
+}
+
+/// A log entry's txn is committed iff its outcome is Committed.
 pub async fn committed(store: &dyn BlobStore, txn: &str) -> bool {
-    store.get(&commit_key(txn)).await.ok().flatten().is_some()
+    matches!(outcome(store, txn).await, Ok(Some(true)))
 }
 
 /// A log entry's payload: a full snapshot (self-contained) or a page-delta
@@ -79,25 +107,29 @@ pub enum LogPayload {
     Delta(Vec<u8>), // exactly `delta::encode(&d)` bytes
 }
 
-/// One log entry: the txn that wrote it (so a reader can check the entry is
-/// committed) plus its payload. Wire: tag(1) | txn_len(2 BE) | txn | payload.
+/// One log entry: the txn that wrote it (so a reader can check its outcome),
+/// the node-clock time it was prewritten (so a resolver only reclaims a lock
+/// aged past the TTL, never a live rival mid-commit), and its payload.
+/// Wire: tag(1) | born(8 BE) | txn_len(2 BE) | txn | payload.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LogEntry {
     pub txn: String,
+    pub born: u64,
     pub payload: LogPayload,
 }
 
 const TAG_SNAPSHOT: u8 = 0;
 const TAG_DELTA: u8 = 1;
 
-pub fn encode_entry(txn: &str, p: &LogPayload) -> Vec<u8> {
+pub fn encode_entry(txn: &str, born: u64, p: &LogPayload) -> Vec<u8> {
     let (tag, body): (u8, &[u8]) = match p {
         LogPayload::Snapshot(b) => (TAG_SNAPSHOT, b),
         LogPayload::Delta(b) => (TAG_DELTA, b),
     };
     let t = txn.as_bytes();
-    let mut out = Vec::with_capacity(3 + t.len() + body.len());
+    let mut out = Vec::with_capacity(11 + t.len() + body.len());
     out.push(tag);
+    out.extend_from_slice(&born.to_be_bytes());
     out.extend_from_slice(&(t.len() as u16).to_be_bytes());
     out.extend_from_slice(t);
     out.extend_from_slice(body);
@@ -106,6 +138,8 @@ pub fn encode_entry(txn: &str, p: &LogPayload) -> Vec<u8> {
 
 pub fn decode_entry(bytes: &[u8]) -> Option<LogEntry> {
     let (&tag, rest) = bytes.split_first()?;
+    let born = u64::from_be_bytes(rest.get(..8)?.try_into().ok()?);
+    let rest = rest.get(8..)?;
     let tlen = u16::from_be_bytes([*rest.first()?, *rest.get(1)?]) as usize;
     let rest = rest.get(2..)?;
     let txn = String::from_utf8(rest.get(..tlen)?.to_vec()).ok()?;
@@ -115,18 +149,18 @@ pub fn decode_entry(bytes: &[u8]) -> Option<LogEntry> {
         TAG_DELTA => LogPayload::Delta(body),
         _ => return None,
     };
-    Some(LogEntry { txn, payload })
+    Some(LogEntry { txn, born, payload })
 }
 
 /// Encode a log entry from the exact bytes a boat produced (snapshot image or
-/// encoded delta), stamped with the committing txn.
-pub fn entry_from_ship(txn: &str, is_snapshot: bool, bytes: &[u8]) -> Vec<u8> {
+/// encoded delta), stamped with the committing txn and its birth time.
+pub fn entry_from_ship(txn: &str, born: u64, is_snapshot: bool, bytes: &[u8]) -> Vec<u8> {
     let p = if is_snapshot {
         LogPayload::Snapshot(bytes.to_vec())
     } else {
         LogPayload::Delta(bytes.to_vec())
     };
-    encode_entry(txn, &p)
+    encode_entry(txn, born, &p)
 }
 
 /// Fold a base image and an ordered run of log entries into the current
@@ -182,11 +216,16 @@ pub async fn prewrite(
     id: &str,
     txn: &str,
     entry: &[u8],
+    now_ms: u64,
+    ttl_ms: u64,
 ) -> anyhow::Result<Option<u64>> {
     let mut seq = committed_seq(store, id).await? + 1;
     for _ in 0..64 {
         let key = log_key(id, seq);
         if store.create(&key, entry).await? {
+            if std::env::var_os("FAFO_DST_LOG").is_some() {
+                eprintln!("prewrite {txn} {id}@{seq}");
+            }
             return Ok(Some(seq));
         }
         // Occupied — decide by the holder.
@@ -199,16 +238,52 @@ pub async fn prewrite(
         if held.txn == txn {
             return Ok(Some(seq)); // already ours (idempotent retry)
         }
-        if committed(store, &held.txn).await {
-            seq += 1; // a committed rival owns this seq; take the next
-            continue;
+        match outcome(store, &held.txn).await? {
+            Some(true) => {
+                // A COMMITTED rival owns this seq: our view is stale (it
+                // committed a change we never saw), so our payload — computed
+                // against an older state — would clobber its txn if shipped at
+                // a higher seq. Abort; the worker reverts, re-activates on the
+                // fresh committed prefix, and re-runs the txn (rebase). This
+                // is what protosim did implicitly by re-reading on every retry.
+                return Ok(None);
+            }
+            Some(false) => {
+                // Aborted: roll the lock back and retake this seq.
+                delete_if_txn(store, &key, &held.txn).await?;
+            }
+            None => {
+                // Pending. A FRESH lock is a live peer about to commit — do
+                // NOT steal it; abort our own attempt (the caller retries
+                // later, by which point the holder has committed or aged).
+                // Only an AGED lock (past the TTL) is a dead orphan we may
+                // reclaim — and we reclaim it through the single outcome key
+                // (abort_txn), so a resumed holder's commit loses the race
+                // and never disagrees with us.
+                if now_ms.saturating_sub(held.born) <= ttl_ms {
+                    return Ok(None);
+                }
+                if abort_txn(store, &held.txn).await? {
+                    delete_if_txn(store, &key, &held.txn).await?;
+                } else {
+                    seq += 1; // it committed under us; step over it
+                }
+            }
         }
-        // Uncommitted rival. In the single-writer model this is a crashed
-        // orphan — clear it and retake. (Under a fork this needs a TTL guard;
-        // that lands with the pause-fault resolution, step 3+.)
-        store.delete(&key).await?;
     }
     Ok(None)
+}
+
+/// Delete a log entry only if it still belongs to `txn` — never erase a
+/// reclaimer's entry that took the freed slot (the tid-safe rollback
+/// protosim needed).
+async fn delete_if_txn(store: &dyn BlobStore, key: &str, txn: &str) -> anyhow::Result<()> {
+    if let Some(b) = store.get(key).await?
+        && decode_entry(&b).is_some_and(|e| e.txn == txn)
+    {
+        store.delete(key).await?;
+    }
+    Ok(())
 }
 
 /// The object's current durable sequence marker (0 if none). An 8-byte
@@ -311,13 +386,13 @@ mod tests {
     fn entry_roundtrips_both_kinds() {
         let snap = LogPayload::Snapshot(vec![1, 2, 3]);
         assert_eq!(
-            decode_entry(&encode_entry("b655-7", &snap)),
-            Some(LogEntry { txn: "b655-7".into(), payload: snap })
+            decode_entry(&encode_entry("b655-7", 4200, &snap)),
+            Some(LogEntry { txn: "b655-7".into(), born: 4200, payload: snap })
         );
         let d = LogPayload::Delta(vec![9, 8, 7]);
         assert_eq!(
-            decode_entry(&encode_entry("t2-c1-9", &d)),
-            Some(LogEntry { txn: "t2-c1-9".into(), payload: d })
+            decode_entry(&encode_entry("t2-c1-9", 0, &d)),
+            Some(LogEntry { txn: "t2-c1-9".into(), born: 0, payload: d })
         );
         assert_eq!(decode_entry(&[]), None);
     }

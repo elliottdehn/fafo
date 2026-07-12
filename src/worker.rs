@@ -726,6 +726,18 @@ impl Worker {
     /// large objects with a healthy chain ship page deltas against their
     /// manifest.
     fn ship_payload(&mut self, id: &str, bytes: Vec<u8>) -> ShipPayload {
+        // Under FAFO_LOG_PRIMARY a log entry must be self-contained: a page-
+        // delta is relative to the writer's manifest, which can diverge from
+        // the committed seq under a fork/migration and corrupt the fold. A
+        // full snapshot composes trivially in any order. Compaction bounds
+        // the log, so the cost is write size, not fold cost. (Deltas can come
+        // back once the manifest is proven to track the committed seq.)
+        if std::env::var_os("FAFO_LOG_PRIMARY").is_some() {
+            return ShipPayload::Snapshot {
+                gc_deltas: false,
+                bytes,
+            };
+        }
         if (bytes.len() as u64) < DELTA_MIN_BYTES {
             return ShipPayload::Snapshot {
                 gc_deltas: self.manifests.contains_key(id),
@@ -2054,16 +2066,23 @@ async fn ship_task(
     // stole one of our seqs fails a create here, so we abort before
     // committing and never tear the txn. (protosim validated this.)
     if err.is_none() && std::env::var_os("FAFO_LOG_PRIMARY").is_some() {
+        let born = node.node_clock.now().as_millis() as u64;
+        // A live worker commits well within fence_ttl; only a lock older than
+        // that (with skew slack) is a dead orphan a peer may reclaim.
+        let ttl_ms =
+            (node.fence_ttl.as_millis() as f64 * crate::cluster::SKEW_TOLERANCE) as u64;
         let mut sorted: Vec<&ShipItem> = items.iter().collect();
         sorted.sort_by(|a, b| a.object.cmp(&b.object));
         for item in sorted {
             let is_snap = matches!(item.payload, ShipPayload::Snapshot { .. });
-            let entry = crate::objlog::entry_from_ship(&staging_id, is_snap, item.bytes());
+            let entry = crate::objlog::entry_from_ship(&staging_id, born, is_snap, item.bytes());
             match crate::objlog::prewrite(
                 node.store.as_ref(),
                 &item.object,
                 &staging_id,
                 &entry,
+                born,
+                ttl_ms,
             )
             .await
             {
@@ -2099,14 +2118,25 @@ async fn ship_task(
         } else {
             Vec::new()
         };
-        let record = serde_json::to_vec(&TxnRecord {
-            txn_id: staging_id.clone(),
-            objects: objects.clone(),
-            inline: inline_items,
-        })
-        .expect("record serializes");
-        if let Err(e) = node.store.put(&txn_key(&staging_id), &record).await {
-            err = Some(e.to_string());
+        if std::env::var_os("FAFO_LOG_PRIMARY").is_some() {
+            // The atomic commit switch: create the outcome key. If a resolver
+            // aborted us while we were slow/paused, this loses and we must not
+            // ack — the prewritten entries stay pending and get reclaimed.
+            match crate::objlog::commit_txn(node.store.as_ref(), &staging_id).await {
+                Ok(true) => {}
+                Ok(false) => err = Some("commit aborted by a resolver; retry".into()),
+                Err(e) => err = Some(e.to_string()),
+            }
+        } else {
+            let record = serde_json::to_vec(&TxnRecord {
+                txn_id: staging_id.clone(),
+                objects: objects.clone(),
+                inline: inline_items,
+            })
+            .expect("record serializes");
+            if let Err(e) = node.store.put(&txn_key(&staging_id), &record).await {
+                err = Some(e.to_string());
+            }
         }
     }
 
@@ -2151,47 +2181,6 @@ async fn ship_task(
                 }
                 if node.store.put(&key, bytes).await.is_err() {
                     unpromoted.push(item.object.clone());
-                } else if std::env::var_os("FAFO_LOG_WRITE").is_some() {
-                    // STEP 1 (transitional, OFF by default): mirror this
-                    // promotion into the log-structured layout, keyed by a
-                    // per-object commit sequence. NOTHING reads it yet — step
-                    // 2 switches the read path — so it is best-effort and can
-                    // never affect the commit that already landed. Gated
-                    // because the extra store ops add real latency (they are
-                    // an ADDITION here; steps 2-4 make the log the primary
-                    // store and REMOVE the base/delta writes). In the
-                    // supported fork-free model each object has one writer, so
-                    // the sequence advances cleanly; a fork's colliding seqs
-                    // are harmless while the log is unread (step 3 fences).
-                    let is_snapshot = matches!(item.payload, ShipPayload::Snapshot { .. });
-                    let seq = crate::objlog::read_seq(node.store.as_ref(), &item.object).await + 1;
-                    let entry = crate::objlog::entry_from_ship(&staging_id, is_snapshot, bytes);
-                    let _ = node
-                        .store
-                        .put(&crate::objlog::log_key(&item.object, seq), &entry)
-                        .await;
-                    let _ = node
-                        .store
-                        .put(&crate::objlog::seq_key(&item.object), &seq.to_be_bytes())
-                        .await;
-                    // Optional validation: the folded committed log must
-                    // byte-match the image we just promoted. Small objects
-                    // (the conservation-critical ones) always ship snapshots,
-                    // so this checks them exactly. Off unless FAFO_LOG_CHECK.
-                    if is_snapshot && std::env::var_os("FAFO_LOG_CHECK").is_some() {
-                        if let Ok((folded, _)) =
-                            crate::objlog::fold_committed(node.store.as_ref(), &item.object)
-                                .await
-                            && folded.as_slice() != bytes.as_slice()
-                        {
-                            eprintln!(
-                                "LOG MISMATCH {} seq{seq}: folded {} != image {} bytes",
-                                item.object,
-                                folded.len(),
-                                bytes.len()
-                            );
-                        }
-                    }
                 }
             }
             if !unpromoted.is_empty() && std::env::var_os("FAFO_DST_LOG").is_some() {
