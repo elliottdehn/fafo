@@ -926,15 +926,12 @@ pub async fn start(cfg: NodeConfig) -> anyhow::Result<Node> {
     let mut addr_alive: Map<String, bool> = Map::default();
     let mut claimed = 0usize;
     for b in candidate_blocks {
-        if claimed >= quota_blocks {
-            break;
-        }
-        let next_epoch = match leases.get(&b) {
+        // Claimable when: cleanly released, held by our own predecessor
+        // identity, or the holder is dead.
+        let existing = leases.get(&b);
+        let claimable = match existing {
             Some(lease) => {
-                // Claimable when: cleanly released, held by our own
-                // predecessor identity (rolling deploy of a named
-                // instance), or the holder is dead.
-                let claimable = if lease.released || lease.addr == advertise {
+                if lease.released || lease.addr == advertise {
                     true
                 } else {
                     let alive = match addr_alive.get(&lease.addr) {
@@ -946,18 +943,36 @@ pub async fn start(cfg: NodeConfig) -> anyhow::Result<Node> {
                         }
                     };
                     !alive
-                };
-                if !claimable {
-                    continue;
                 }
-                // Taking over WITHOUT a tombstone means the holder may be
-                // paused, not dead: wait out its fencing TTL before our
-                // first write, so its last stale commits (if any) land
-                // strictly before we read or write anything.
-                if !lease.released {
-                    let mut ew = node.earliest_write.lock().unwrap();
-                    *ew = (*ew).max(node.node_clock.now() + cfg.fence_ttl.mul_f64(SKEW_TOLERANCE));
-                }
+            }
+            None => true,
+        };
+        if !claimable {
+            continue;
+        }
+        // A claimable EXISTING lease is ORPHANED work: its objects are
+        // unreachable until some node re-hosts the block, so it MUST be
+        // absorbed and BYPASSES the quota. The quota only balances the FRESH
+        // pool (blocks with no lease — the initial cluster split). Without
+        // this, a pause fault leaves released blocks that neither survivor's
+        // quota reaches, orphaning their objects: a taker then hangs forever
+        // taking tok-supply / an account (gather deadlock, simulator --pause).
+        let is_orphan = existing.is_some();
+        if !is_orphan && claimed >= quota_blocks {
+            continue;
+        }
+        let next_epoch = match existing {
+            Some(lease) => {
+                // Wait out the fencing TTL before our first write on ANY
+                // reclaim of an existing lease, so a predecessor's last stale
+                // commits land strictly before we read or write. We fence even
+                // a RELEASED lease: boot-release tombstones a CRASHED
+                // predecessor (not a graceful shutdown), whose in-flight boat
+                // may still be settling, and reclaiming it fence-free raced
+                // that straggler into a two-writer fork (conservation/torn,
+                // simulator --pause).
+                let mut ew = node.earliest_write.lock().unwrap();
+                *ew = (*ew).max(node.node_clock.now() + cfg.fence_ttl.mul_f64(SKEW_TOLERANCE));
                 lease.epoch + 1
             }
             None => 1,
@@ -980,16 +995,33 @@ pub async fn start(cfg: NodeConfig) -> anyhow::Result<Node> {
             .unwrap()
             .addrs
             .insert(b, advertise.clone());
-        claimed += 1;
+        // Only FRESH claims count against the quota; absorbing orphaned work
+        // is mandatory, not part of the balanced share.
+        if !is_orphan {
+            claimed += 1;
+        }
     }
 
-    // Name this boot: address hash + the highest epoch we just claimed.
-    // Epochs only go up, so two boots of one node can never share a tag.
-    let boot_epoch = node.epochs.read().unwrap().values().max().copied().unwrap_or(0);
-    let _ = node.tag.set(format!(
-        "{:08x}e{boot_epoch}",
-        fnv1a(advertise.as_bytes()) as u32
-    ));
+    // Name this boot UNIQUELY. The old tag was address-hash + highest claimed
+    // epoch, on the assumption "epochs only go up so two boots never share a
+    // tag" — but that is FALSE: a reboot can claim a DIFFERENT block set whose
+    // max epoch equals an earlier incarnation's, so two incarnations shared a
+    // tag. Since ship_seq (and the ws conn counter) reset to 0 each boot, that
+    // collided staging-ids: two UNRELATED txns got the same id and thus the
+    // same single outcome key, so one committing made the other "commit"
+    // without its own legs durable — a torn cross-object transfer (simulator
+    // --pause). Draw a durable, monotone-and-never-repeating nonce (blob-store
+    // version of a per-node boot key) so no two boots can ever collide.
+    let boot_key = format!("_boot/{:08x}", fnv1a(advertise.as_bytes()) as u32);
+    let mut nonce = 0u64;
+    for _ in 0..64 {
+        let v = node.store.version(&boot_key).await.unwrap_or(0);
+        if let Ok(Some(nv)) = node.store.put_cas(&boot_key, v, advertise.as_bytes()).await {
+            nonce = nv;
+            break;
+        }
+    }
+    let _ = node.tag.set(format!("{:08x}b{nonce}", fnv1a(advertise.as_bytes()) as u32));
 
     // Claiming just created/verified our leases: stamp it.
     *node.verified.lock().unwrap() = (node.node_clock.now(), std::time::SystemTime::now());
