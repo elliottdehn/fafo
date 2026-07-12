@@ -1831,6 +1831,32 @@ trace tail:
         // covers exactly the poll mode that promises it.
     }
 
+    /// Fold an object straight from the durable store (bypassing every node
+    /// cache) and read its writes-set. Diagnostic only — used at oracle
+    /// failure to locate the fork.
+    async fn durable_writes(&self, object: &str) -> Vec<(String, i64)> {
+        let (image, _seq) = match crate::objlog::fold_committed(self.store.as_ref(), object).await {
+            Ok(v) => v,
+            Err(e) => return vec![("<fold-error>".to_string(), 0), (format!("{e}"), 0)],
+        };
+        let path = std::env::temp_dir().join(format!("dst-durable-{object}.db"));
+        if std::fs::write(&path, &image).is_err() {
+            return vec![("<write-error>".to_string(), 0)];
+        }
+        let Ok(conn) = rusqlite::Connection::open(&path) else {
+            return vec![("<open-error>".to_string(), 0)];
+        };
+        let mut out = Vec::new();
+        if let Ok(mut stmt) = conn.prepare("SELECT k, amt FROM writes ORDER BY rowid") {
+            if let Ok(rows) = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))) {
+                for row in rows.flatten() {
+                    out.push(row);
+                }
+            }
+        }
+        out
+    }
+
     async fn read_ledger(&self, object: &str) -> Vec<(String, i64)> {
         self.read(object, "SELECT k, amt FROM writes ORDER BY rowid")
             .await
@@ -1865,21 +1891,45 @@ trace tail:
         }
 
         // Per-key atomicity: pair up debits and credits across accounts.
-        let transfers = self.model.transfers.lock().unwrap();
-        for t in transfers.iter() {
-            let debit = ledger[&t.from].iter().find(|(k, _)| k == &t.key);
-            let credit = ledger[&t.to].iter().find(|(k, _)| k == &t.key);
-            match (debit, credit) {
-                (None, None) => {}
-                (Some((_, d)), Some((_, c))) if *d == -*c => {}
-                other => panic!(
-                    "ATOMICITY violated {when}: transfer {} (acked={}, optimistic={}) is torn:                      debit={:?} credit={:?}.\ntrace tail:\n{}",
-                    t.key, t.acked, t.optimistic, other.0, other.1,
-                    self.trace.dump_tail()
-                ),
+        // Collect the torn one (if any) first; then dump the DURABLE fold of
+        // both accounts before panicking, to tell a stale READ (durable has
+        // the write, a node cache lost it) apart from write-ERASURE (durable
+        // itself lost it — a stale snapshot shipped over a committed entry).
+        let torn = {
+            let transfers = self.model.transfers.lock().unwrap();
+            transfers.iter().find_map(|t| {
+                let debit = ledger[&t.from].iter().find(|(k, _)| k == &t.key).cloned();
+                let credit = ledger[&t.to].iter().find(|(k, _)| k == &t.key).cloned();
+                match (&debit, &credit) {
+                    (None, None) => None,
+                    (Some((_, d)), Some((_, c))) if *d == -*c => None,
+                    _ => Some((t.from.clone(), t.to.clone(), t.key.clone(), t.acked, t.optimistic, debit, credit)),
+                }
+            })
+        };
+        if let Some((from, to, key, acked, optimistic, debit, credit)) = torn {
+            let df = self.durable_writes(&from).await;
+            let dt = self.durable_writes(&to).await;
+            let dd = df.iter().find(|(k, _)| k == &key);
+            let dc = dt.iter().find(|(k, _)| k == &key);
+            let mut dumps = String::new();
+            for i in self.live_indices() {
+                if let Some(n) = self.node(i) {
+                    dumps.push_str(&n.debug_dump().await);
+                }
             }
+            let seq_from = crate::objlog::committed_seq(self.store.as_ref(), &from).await.unwrap_or(u64::MAX);
+            let seq_to = crate::objlog::committed_seq(self.store.as_ref(), &to).await.unwrap_or(u64::MAX);
+            eprintln!("DURABLE committed_seq: {from}={seq_from} {to}={seq_to}\nnodes:\n{dumps}");
+            panic!(
+                "ATOMICITY violated {when}: transfer {key} (acked={acked}, optimistic={optimistic}) is torn: \
+                 read debit={debit:?} credit={credit:?}\n\
+                 DURABLE {from}: writes={df:?} -> key {key} = {dd:?}\n\
+                 DURABLE {to}: writes={dt:?} -> key {key} = {dc:?}\n\
+                 (durable-has-write => stale READ; durable-missing => write ERASURE)\ntrace tail:\n{}",
+                self.trace.dump_tail()
+            );
         }
-        drop(transfers);
 
         let expected = self.cfg.accounts as i64 * self.cfg.initial_balance;
         assert_eq!(

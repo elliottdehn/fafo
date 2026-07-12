@@ -609,6 +609,16 @@ impl Worker {
                         self.pending_txns.len()
                     ));
                 }
+                // Owned objects with their rebase seq — to spot a node
+                // serving a stale cache (log_seq behind the durable prefix).
+                for id in self.objects.keys() {
+                    out.push_str(&format!(
+                        "  w{} owns {id}: log_seq={:?} dirty={}\n",
+                        self.id,
+                        self.log_seq.get(id),
+                        self.dirty.contains_key(id),
+                    ));
+                }
                 let _ = resp.send(out);
             }
             WorkerMsg::Stats { resp } => {
@@ -1431,20 +1441,40 @@ impl Worker {
     /// committed prefix IN PLACE (no revert, so no churn) and re-run the
     /// poll; return the response if it now fires. Caller guarantees the
     /// object is not unshipped (so no local writes are lost).
+    /// If a CLEAN object's live conn is behind the durable committed prefix
+    /// (a peer committed to its log while we weren't writing it — the
+    /// pause-fork orphan case), re-fold it IN PLACE so the next read sees
+    /// the committed truth. No revert, no churn. A dirty object is left
+    /// alone: it has local writes the write path rebases. Returns true if it
+    /// actually advanced. This is what keeps a stale owner from serving a
+    /// read that is behind an orphaned-but-committed write.
+    async fn refresh_if_stale(&mut self, object: &str) -> bool {
+        if self.unshipped(object) {
+            return false;
+        }
+        let Ok((image, seq)) = crate::objlog::fold_committed(self.node.store.as_ref(), object).await
+        else {
+            return false;
+        };
+        if seq <= self.log_seq.get(object).copied().unwrap_or(0) {
+            return false; // already current
+        }
+        if materialize(&mut self.objects, object, &self.live_dir, &image).is_ok() {
+            self.log_seq.insert(object.to_string(), seq);
+            return true;
+        }
+        false
+    }
+
     async fn refresh_stale_poll(
         &mut self,
         object: &str,
         po: &PollOpts,
         op: &Op,
     ) -> Option<TxnResponse> {
-        let (image, seq) = crate::objlog::fold_committed(self.node.store.as_ref(), object)
-            .await
-            .ok()?;
-        if seq <= self.log_seq.get(object).copied().unwrap_or(0) {
+        if !self.refresh_if_stale(object).await {
             return None; // our live conn is already current
         }
-        materialize(&mut self.objects, object, &self.live_dir, &image).ok()?;
-        self.log_seq.insert(object.to_string(), seq);
         let obj = self.objects.get(object)?;
         let result = run_op(&obj.conn, &op.sql, &op.params).ok()?;
         let results = vec![result];
@@ -1738,6 +1768,19 @@ impl Worker {
             });
         }
 
+        // Before a read is served, make sure a CLEAN participant's live conn
+        // reflects the durable committed prefix. Under the pause fork an
+        // orphaned peer can commit to an object's log while this (surviving)
+        // owner holds a stale cache and never writes it again; only the write
+        // path rebases, so a plain read would otherwise serve state behind an
+        // already-committed write (a torn transfer at quiescence). Re-fold in
+        // place first. Writes skip this — their rebase guard handles it.
+        if p.read_only && std::env::var_os("FAFO_LOG_PRIMARY").is_some() {
+            let participants = p.participants.clone();
+            for object in &participants {
+                self.refresh_if_stale(object).await;
+            }
+        }
         // Apply locally; durability is the boat's job.
         match self
             .apply(&p.participants, &p.ops, p.read_only, p.cap.as_ref())
