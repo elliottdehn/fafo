@@ -44,6 +44,7 @@ pub mod store;
 pub mod r2;
 pub mod object;
 pub mod delta;
+pub mod objlog;
 
 // Policy: capability tokens and container resource budgets.
 pub mod grants;

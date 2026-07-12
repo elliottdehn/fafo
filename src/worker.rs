@@ -2107,6 +2107,47 @@ async fn ship_task(
                 }
                 if node.store.put(&key, bytes).await.is_err() {
                     unpromoted.push(item.object.clone());
+                } else if std::env::var_os("FAFO_LOG_WRITE").is_some() {
+                    // STEP 1 (transitional, OFF by default): mirror this
+                    // promotion into the log-structured layout, keyed by a
+                    // per-object commit sequence. NOTHING reads it yet — step
+                    // 2 switches the read path — so it is best-effort and can
+                    // never affect the commit that already landed. Gated
+                    // because the extra store ops add real latency (they are
+                    // an ADDITION here; steps 2-4 make the log the primary
+                    // store and REMOVE the base/delta writes). In the
+                    // supported fork-free model each object has one writer, so
+                    // the sequence advances cleanly; a fork's colliding seqs
+                    // are harmless while the log is unread (step 3 fences).
+                    let is_snapshot = matches!(item.payload, ShipPayload::Snapshot { .. });
+                    let seq = crate::objlog::read_seq(node.store.as_ref(), &item.object).await + 1;
+                    let entry = crate::objlog::entry_from_ship(is_snapshot, bytes);
+                    let _ = node
+                        .store
+                        .put(&crate::objlog::log_key(&item.object, seq), &entry)
+                        .await;
+                    let _ = node
+                        .store
+                        .put(&crate::objlog::seq_key(&item.object), &seq.to_be_bytes())
+                        .await;
+                    // Optional validation: the folded log must byte-match the
+                    // image we just promoted. Small objects (the conservation-
+                    // critical ones) always ship snapshots, so this checks
+                    // them exactly. Off unless FAFO_LOG_CHECK is set.
+                    if is_snapshot && std::env::var_os("FAFO_LOG_CHECK").is_some() {
+                        if let Ok(folded) =
+                            crate::objlog::fold_log(node.store.as_ref(), &item.object, Vec::new())
+                                .await
+                            && folded.as_slice() != bytes.as_slice()
+                        {
+                            eprintln!(
+                                "LOG MISMATCH {} seq{seq}: folded {} != image {} bytes",
+                                item.object,
+                                folded.len(),
+                                bytes.len()
+                            );
+                        }
+                    }
                 }
             }
             if !unpromoted.is_empty() && std::env::var_os("FAFO_DST_LOG").is_some() {
