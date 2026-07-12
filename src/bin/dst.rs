@@ -150,8 +150,16 @@ fn mine(
         std::fs::write(config_path, serde_json::to_string_pretty(&cfg).unwrap()).unwrap();
     }
 
+    // A legitimate run — even the slowest fork-serialized one under skew+pause
+    // — finishes in a few seconds of wall clock (virtual time auto-advances
+    // through the sleeps). A run still alive after this long is not slow, it is
+    // HUNG: some producer never signalled done and the oracles are correctly
+    // waiting it out forever. A hang is a bug, so we kill and report it rather
+    // than let it silently occupy a job slot — the backstop that keeps
+    // "a crash is a bug" airtight even for non-crashing deadlocks.
+    const MINE_WALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
     let mut seeder = Rng::new(cfg.seed);
-    let mut running: Vec<(u64, std::process::Child)> = Vec::new();
+    let mut running: Vec<(u64, std::time::Instant, std::process::Child)> = Vec::new();
     let (mut launched, mut clean, mut bugs) = (0u64, 0u64, 0u64);
     let mode_label = if fuzz { "config-fuzzing" } else { config_path };
     println!("mining with {jobs} jobs ({mode_label}); a crash is a bug, a bug is $100");
@@ -173,7 +181,7 @@ fn mine(
                 .stderr(std::process::Stdio::piped())
                 .spawn()
                 .expect("spawn miner");
-            running.push((seed, child));
+            running.push((seed, std::time::Instant::now(), child));
             launched += 1;
         }
         if running.is_empty() {
@@ -181,20 +189,40 @@ fn mine(
         }
         // Reap whoever finished; sleep briefly if nobody has.
         let mut still = Vec::new();
-        for (seed, mut child) in running {
+        for (seed, started, mut child) in running {
+            // The repro MUST carry the same fault flags the child ran under
+            // (--pause, --clock-chaos, ...): without them the seed derives a
+            // different envelope and won't reproduce. extra_flags already holds
+            // exactly what was forwarded (including --fuzz).
+            let flags = extra_flags.join(" ");
+            let repro = if fuzz {
+                format!("dst run --seed {seed} {flags}")
+            } else {
+                format!("dst run --seed {seed} --config {config_path} {flags}")
+            };
             match child.try_wait().expect("try_wait") {
-                None => still.push((seed, child)),
+                None if started.elapsed() > MINE_WALL_TIMEOUT => {
+                    // Hung: never terminated. Kill, report as a bug.
+                    let _ = child.kill();
+                    bugs += 1;
+                    let out = child.wait_with_output().expect("hang output");
+                    let log = format!("crashes/seed-{seed}.log");
+                    let mut f = std::fs::File::create(&log).expect("crash log");
+                    writeln!(
+                        f,
+                        "seed: {seed}\nreproduce: {repro}\nHUNG: still running after {MINE_WALL_TIMEOUT:?} wall-clock (no termination)\n"
+                    )
+                    .unwrap();
+                    f.write_all(&out.stderr).unwrap();
+                    println!("BUG: seed {seed} HUNG -> {log}");
+                }
+                None => still.push((seed, started, child)),
                 Some(status) if status.success() => clean += 1,
                 Some(_) => {
                     bugs += 1;
                     let out = child.wait_with_output().expect("crash output");
                     let log = format!("crashes/seed-{seed}.log");
                     let mut f = std::fs::File::create(&log).expect("crash log");
-                    let repro = if fuzz {
-                        format!("dst run --seed {seed} --fuzz")
-                    } else {
-                        format!("dst run --seed {seed} --config {config_path}")
-                    };
                     writeln!(f, "seed: {seed}\nreproduce: {repro}\n").unwrap();
                     f.write_all(&out.stderr).unwrap();
                     println!("BUG: seed {seed} crashed -> {log}");

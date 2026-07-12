@@ -1022,21 +1022,30 @@ impl World {
 
     /// The documented cursor loop, against a cluster on fire: poll the
     /// owning node, advance by rowid, re-poll on every error.
-    async fn subscribe_all(self: &Arc<Self>) -> Vec<String> {
+    async fn subscribe_all(
+        self: &Arc<Self>,
+        publisher_done: Arc<AtomicBool>,
+    ) -> Vec<String> {
         let mut received = Vec::new();
         let mut cursor = 0i64;
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(600);
+        // Progress-relative: wait out the publisher (bounded), then a bounded
+        // drain to the durable tail.
+        let mut drain_deadline: Option<tokio::time::Instant> = None;
         loop {
-            let want: usize = {
-                let p = self.model.publishes.lock().unwrap();
-                p.iter().filter(|(_, acked)| *acked).count()
-            };
-            if received.len() >= want && want == self.cfg.channel_msgs {
-                break;
+            if publisher_done.load(Ordering::SeqCst) && drain_deadline.is_none() {
+                drain_deadline = Some(tokio::time::Instant::now() + LIVENESS_DRAIN);
             }
-            if tokio::time::Instant::now() > deadline {
+            if drain_deadline.is_some_and(|d| tokio::time::Instant::now() > d) {
+                let want = self
+                    .model
+                    .publishes
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|(_, acked)| *acked)
+                    .count();
                 panic!(
-                    "LIVENESS: subscriber stuck at {} of {want} acked messages.\ntrace tail:\n{}",
+                    "LIVENESS: subscriber stuck at {} of {want} acked messages (drain).\ntrace tail:\n{}",
                     received.len(),
                     self.trace.dump_tail()
                 );
@@ -1060,6 +1069,25 @@ impl World {
                     // Nothing new where we're parked; cancel and re-poll
                     // (the owner may have moved under us).
                     cluster::cancel_poll(&node, "chan", u64::MAX, cursor as u64);
+                    // Publishing ended and a direct read agrees we're at the
+                    // durable tail: done. We DRAIN rather than require every
+                    // publish to have ACKed — under the pause fault a publish
+                    // can be a LOST ACK (committed durably, client saw an
+                    // error, recorded acked=false), so want==channel_msgs would
+                    // hang forever on a message we already received. (The feed
+                    // consumers already exit this way; the subscriber was the
+                    // last oracle that didn't, turning every lost-ack publish
+                    // under skew+pause into a false liveness crash.)
+                    if publisher_done.load(Ordering::SeqCst) {
+                        let max = self
+                            .read("chan", "SELECT COALESCE(MAX(id), 0) AS m FROM msgs")
+                            .await[0]["m"]
+                            .as_i64()
+                            .expect("max id");
+                        if max <= cursor {
+                            break;
+                        }
+                    }
                 }
                 Ok(Ok(resp)) => {
                     for result in &resp.results {
@@ -1429,11 +1457,15 @@ trace tail:
         let mut transcript: Vec<(i64, String)> = Vec::new();
         let mut seen: Set<String> = Set::default();
         let mut cursor = 0i64;
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(600);
+        // Progress-relative: wait out slow producers, then a bounded drain.
+        let mut drain_deadline: Option<tokio::time::Instant> = None;
         loop {
-            if tokio::time::Instant::now() > deadline {
+            if producers_done.load(Ordering::SeqCst) && drain_deadline.is_none() {
+                drain_deadline = Some(tokio::time::Instant::now() + LIVENESS_DRAIN);
+            }
+            if drain_deadline.is_some_and(|d| tokio::time::Instant::now() > d) {
                 panic!(
-                    "LIVENESS: consumer(durable={durable}) of {object} stuck at cursor {cursor}.
+                    "LIVENESS: consumer(durable={durable}) of {object} stuck at cursor {cursor} (drain).
 trace tail:
 {}",
                     self.trace.dump_tail()
@@ -1520,11 +1552,15 @@ trace tail:
         let sql = "SELECT COUNT(*) AS n, COALESCE(MAX(id), 0) AS m FROM msgs";
         let mut baseline = String::new();
         let mut fires = 0u64;
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(600);
+        // Progress-relative: wait out slow producers, then a bounded drain.
+        let mut drain_deadline: Option<tokio::time::Instant> = None;
         loop {
-            if tokio::time::Instant::now() > deadline {
+            if producers_done.load(Ordering::SeqCst) && drain_deadline.is_none() {
+                drain_deadline = Some(tokio::time::Instant::now() + LIVENESS_DRAIN);
+            }
+            if drain_deadline.is_some_and(|d| tokio::time::Instant::now() > d) {
                 panic!(
-                    "LIVENESS: change watcher of {object} stuck after {fires} fires.
+                    "LIVENESS: change watcher of {object} stuck after {fires} fires (drain).
 trace tail:
 {}",
                     self.trace.dump_tail()
@@ -1938,6 +1974,16 @@ trace tail:
     }
 }
 
+/// Bounded window a consumer/watcher/subscriber gets to drain to the durable
+/// tail AFTER production ends. Production itself is unbounded on purpose — a
+/// SLOW producer under skew+pause (many retries serializing a fork) is not a
+/// bug and must not trip a liveness crash, so the oracles wait for it however
+/// long it takes. Only once producers stop does an inability to read the
+/// committed tail become a genuine stuck. A producer that truly HANGS never
+/// signals done: the run then never terminates and the mine wall-timeout
+/// reports it. This makes "a crash is a bug" hold under skew+pause.
+const LIVENESS_DRAIN: Duration = Duration::from_secs(600);
+
 fn account_name(i: usize) -> String {
     format!("acct-{i}")
 }
@@ -2054,8 +2100,10 @@ pub async fn run(world: Arc<World>) -> RunReport {
     }
     let w = world.clone();
     let publisher = tokio::spawn(async move { w.publish_all().await });
+    let publisher_done = Arc::new(AtomicBool::new(false));
     let w = world.clone();
-    let subscriber = tokio::spawn(async move { w.subscribe_all().await });
+    let pd = publisher_done.clone();
+    let subscriber = tokio::spawn(async move { w.subscribe_all(pd).await });
     if world.cfg.crashes >= 2 {
         sleep(Duration::from_millis(700)).await;
         let live = world.live_indices();
@@ -2077,6 +2125,7 @@ pub async fn run(world: Arc<World>) -> RunReport {
         t.await.expect("phase 2 workload");
     }
     publisher.await.expect("publisher");
+    publisher_done.store(true, Ordering::SeqCst);
     let received = subscriber.await.expect("subscriber");
 
     // Producers are done; feeds can now drain and their consumers exit.
