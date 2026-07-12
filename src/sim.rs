@@ -1059,7 +1059,17 @@ impl World {
                 "chan".into(),
                 "SELECT id, k FROM msgs WHERE id > ?1 ORDER BY id LIMIT 10".into(),
                 vec![json!(cursor)],
-                false,
+                // DURABLE. The oracle requires exactly-once delivery of every
+                // acked (committed) publish. Only a durable reader can promise
+                // that: a non-durable poll sees UNCOMMITTED rows that later roll
+                // back, and because AUTOINCREMENT ids are not reused after a
+                // rollback the cursor advances past an id a committed message
+                // will later occupy — so the subscriber skips it forever (under
+                // the pause fault: read uncommitted msg-1 at id 2, it aborts,
+                // committed msg-5 takes id 2, subscriber never re-reads it). A
+                // durable poll only ever sees the committed prefix, whose ids
+                // are stable and contiguous, so the cursor never skips.
+                true,
                 None,
                 u64::MAX, // sim subscriber's connection id space
                 cursor as u64,
