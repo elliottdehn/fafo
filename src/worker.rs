@@ -2044,6 +2044,39 @@ async fn ship_task(
         err = Some("node is fenced; commit refused".into());
     }
 
+    // STEP 2 (FAFO_LOG_PRIMARY): prewrite each participant's log entry — the
+    // durable payload — fenced by create-if-absent, in sorted object order,
+    // BEFORE the commit record. The record's write is the atomic commit
+    // switch that flips all these entries to committed at once; a fork that
+    // stole one of our seqs fails a create here, so we abort before
+    // committing and never tear the txn. (protosim validated this.)
+    if err.is_none() && std::env::var_os("FAFO_LOG_PRIMARY").is_some() {
+        let mut sorted: Vec<&ShipItem> = items.iter().collect();
+        sorted.sort_by(|a, b| a.object.cmp(&b.object));
+        for item in sorted {
+            let is_snap = matches!(item.payload, ShipPayload::Snapshot { .. });
+            let entry = crate::objlog::entry_from_ship(&staging_id, is_snap, item.bytes());
+            match crate::objlog::prewrite(
+                node.store.as_ref(),
+                &item.object,
+                &staging_id,
+                &entry,
+            )
+            .await
+            {
+                Ok(Some(_)) => {}
+                Ok(None) => {
+                    err = Some(format!("log seq for {} superseded", item.object));
+                    break;
+                }
+                Err(e) => {
+                    err = Some(e.to_string());
+                    break;
+                }
+            }
+        }
+    }
+
     if err.is_none() {
         let inline_items = if inline {
             items
@@ -2089,8 +2122,16 @@ async fn ship_task(
                 let _ = resp.send(Ok(response));
             }
 
+            // Under FAFO_LOG_PRIMARY the log entries prewritten above ARE the
+            // durable state and the commit record must SURVIVE as the commit
+            // proof reads check — so skip base/delta promotion, its GC, and
+            // the record deletion entirely.
+            let log_primary = std::env::var_os("FAFO_LOG_PRIMARY").is_some();
             let mut unpromoted: Vec<String> = Vec::new();
             for item in &items {
+                if log_primary {
+                    break;
+                }
                 let (key, bytes) = match &item.payload {
                     ShipPayload::Snapshot { bytes, .. } => (object_key(&item.object), bytes),
                     ShipPayload::Delta { counter, bytes } => {
@@ -2121,7 +2162,7 @@ async fn ship_task(
                     // are harmless while the log is unread (step 3 fences).
                     let is_snapshot = matches!(item.payload, ShipPayload::Snapshot { .. });
                     let seq = crate::objlog::read_seq(node.store.as_ref(), &item.object).await + 1;
-                    let entry = crate::objlog::entry_from_ship(is_snapshot, bytes);
+                    let entry = crate::objlog::entry_from_ship(&staging_id, is_snapshot, bytes);
                     let _ = node
                         .store
                         .put(&crate::objlog::log_key(&item.object, seq), &entry)
@@ -2130,13 +2171,13 @@ async fn ship_task(
                         .store
                         .put(&crate::objlog::seq_key(&item.object), &seq.to_be_bytes())
                         .await;
-                    // Optional validation: the folded log must byte-match the
-                    // image we just promoted. Small objects (the conservation-
-                    // critical ones) always ship snapshots, so this checks
-                    // them exactly. Off unless FAFO_LOG_CHECK is set.
+                    // Optional validation: the folded committed log must
+                    // byte-match the image we just promoted. Small objects
+                    // (the conservation-critical ones) always ship snapshots,
+                    // so this checks them exactly. Off unless FAFO_LOG_CHECK.
                     if is_snapshot && std::env::var_os("FAFO_LOG_CHECK").is_some() {
-                        if let Ok(folded) =
-                            crate::objlog::fold_log(node.store.as_ref(), &item.object, Vec::new())
+                        if let Ok((folded, _)) =
+                            crate::objlog::fold_committed(node.store.as_ref(), &item.object, Vec::new())
                                 .await
                             && folded.as_slice() != bytes.as_slice()
                         {
@@ -2153,7 +2194,7 @@ async fn ship_task(
             if !unpromoted.is_empty() && std::env::var_os("FAFO_DST_LOG").is_some() {
                 eprintln!("boat {staging_id} committed but unpromoted: {unpromoted:?}");
             }
-            if unpromoted.is_empty() {
+            if unpromoted.is_empty() && !log_primary {
                 if !inline {
                     for item in &items {
                         let _ = node.store.delete(&item.staging_key(&staging_id)).await;
@@ -2483,6 +2524,12 @@ async fn roll_forward(store: &dyn BlobStore, key: &str, record: &TxnRecord) -> a
 /// The txns/ prefix is empty in steady state, so this is one cheap LIST
 /// per cold activation.
 pub async fn recover_records_touching(store: &dyn BlobStore, object: &str) -> anyhow::Result<()> {
+    // Under FAFO_LOG_PRIMARY a committed record's log entries are already
+    // durable (prewritten before the record), and the record must survive as
+    // the commit proof, so there is nothing to roll forward here.
+    if std::env::var_os("FAFO_LOG_PRIMARY").is_some() {
+        return Ok(());
+    }
     for key in store.list("txns/").await? {
         let Some(bytes) = store.get(&key).await? else {
             continue;
@@ -2503,6 +2550,14 @@ pub async fn recover_records_touching(store: &dyn BlobStore, object: &str) -> an
 /// by transactions that never reached their commit point. Idempotent, so
 /// concurrent booting processes may both run it.
 pub async fn recover(store: &dyn BlobStore) -> anyhow::Result<()> {
+    // Under FAFO_LOG_PRIMARY the commit records ARE the durable commit proof
+    // (a committed record's log entries were prewritten before it), so there
+    // is nothing to roll forward and the records must NOT be deleted. Orphan
+    // prewrites from a crash mid-commit are cleared lazily by the next
+    // writer's prewrite. So boot recovery is a no-op.
+    if std::env::var_os("FAFO_LOG_PRIMARY").is_some() {
+        return Ok(());
+    }
     for key in store.list("txns/").await? {
         let Some(bytes) = store.get(&key).await? else {
             continue;

@@ -48,6 +48,19 @@ pub async fn fetch_image(
     id: &str,
     live_path: &Path,
 ) -> anyhow::Result<(Vec<u8>, u32)> {
+    // STEP 2 (FAFO_LOG_PRIMARY): the log is the source of truth — fold its
+    // committed prefix. The base/delta path below becomes a compaction cache
+    // only (step 4). The u32 (delta chain length) is meaningless here, so 0.
+    if std::env::var_os("FAFO_LOG_PRIMARY").is_some() {
+        let (image, _seq) = crate::objlog::fold_committed(store.as_ref(), id, Vec::new()).await?;
+        if std::env::var_os("FAFO_DST_LOG").is_some() {
+            eprintln!(
+                "activate {id}: log-fold {} bytes @seq {_seq}",
+                image.len()
+            );
+        }
+        return Ok((image, 0));
+    }
     let base_counter = store
         .get_range(&object_key(id), crate::delta::HEADER_CHANGE_COUNTER as u64, 4)
         .await?

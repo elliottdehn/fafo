@@ -27,52 +27,79 @@ pub fn seq_key(id: &str) -> String {
     format!("objects/{id}.SEQ")
 }
 
-/// The single atomic commit/abort decision for a txn — its presence-with-
-/// value is the whole truth (step 3 wires the fence; defined here so the
-/// key scheme lives in one place).
-pub fn outcome_key(txn: &str) -> String {
-    format!("txns/{txn}.O")
+/// Parse the seq out of a log key `objects/<id>.L.<seq>`.
+pub fn parse_log_seq(key: &str, id: &str) -> Option<u64> {
+    key.strip_prefix(&format!("objects/{id}.L."))?.parse().ok()
+}
+
+/// The commit record — its PRESENCE is the atomic commit decision. A log
+/// entry counts as committed iff its txn's record exists. (Same key as
+/// worker::txn_key; mirrored here so the layout lives in one place.)
+pub fn commit_key(txn: &str) -> String {
+    format!("txns/{txn}.json")
+}
+
+/// A log entry's txn is committed iff its commit record is present.
+pub async fn committed(store: &dyn BlobStore, txn: &str) -> bool {
+    store.get(&commit_key(txn)).await.ok().flatten().is_some()
 }
 
 /// A log entry's payload: a full snapshot (self-contained) or a page-delta
-/// against the previous seq's image. Wire format: one tag byte then bytes.
+/// against the previous seq's image.
 #[derive(Debug, Clone, PartialEq)]
 pub enum LogPayload {
     Snapshot(Vec<u8>),
     Delta(Vec<u8>), // exactly `delta::encode(&d)` bytes
 }
 
+/// One log entry: the txn that wrote it (so a reader can check the entry is
+/// committed) plus its payload. Wire: tag(1) | txn_len(2 BE) | txn | payload.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LogEntry {
+    pub txn: String,
+    pub payload: LogPayload,
+}
+
 const TAG_SNAPSHOT: u8 = 0;
 const TAG_DELTA: u8 = 1;
 
-pub fn encode_entry(p: &LogPayload) -> Vec<u8> {
+pub fn encode_entry(txn: &str, p: &LogPayload) -> Vec<u8> {
     let (tag, body): (u8, &[u8]) = match p {
         LogPayload::Snapshot(b) => (TAG_SNAPSHOT, b),
         LogPayload::Delta(b) => (TAG_DELTA, b),
     };
-    let mut out = Vec::with_capacity(1 + body.len());
+    let t = txn.as_bytes();
+    let mut out = Vec::with_capacity(3 + t.len() + body.len());
     out.push(tag);
+    out.extend_from_slice(&(t.len() as u16).to_be_bytes());
+    out.extend_from_slice(t);
     out.extend_from_slice(body);
     out
 }
 
-pub fn decode_entry(bytes: &[u8]) -> Option<LogPayload> {
-    match bytes.split_first() {
-        Some((&TAG_SNAPSHOT, rest)) => Some(LogPayload::Snapshot(rest.to_vec())),
-        Some((&TAG_DELTA, rest)) => Some(LogPayload::Delta(rest.to_vec())),
-        _ => None,
-    }
+pub fn decode_entry(bytes: &[u8]) -> Option<LogEntry> {
+    let (&tag, rest) = bytes.split_first()?;
+    let tlen = u16::from_be_bytes([*rest.first()?, *rest.get(1)?]) as usize;
+    let rest = rest.get(2..)?;
+    let txn = String::from_utf8(rest.get(..tlen)?.to_vec()).ok()?;
+    let body = rest.get(tlen..)?.to_vec();
+    let payload = match tag {
+        TAG_SNAPSHOT => LogPayload::Snapshot(body),
+        TAG_DELTA => LogPayload::Delta(body),
+        _ => return None,
+    };
+    Some(LogEntry { txn, payload })
 }
 
-/// Encode the payload a boat just promoted as a log entry, reusing the exact
-/// bytes it already produced (snapshot image or encoded delta).
-pub fn entry_from_ship(is_snapshot: bool, bytes: &[u8]) -> Vec<u8> {
+/// Encode a log entry from the exact bytes a boat produced (snapshot image or
+/// encoded delta), stamped with the committing txn.
+pub fn entry_from_ship(txn: &str, is_snapshot: bool, bytes: &[u8]) -> Vec<u8> {
     let p = if is_snapshot {
         LogPayload::Snapshot(bytes.to_vec())
     } else {
         LogPayload::Delta(bytes.to_vec())
     };
-    encode_entry(&p)
+    encode_entry(txn, &p)
 }
 
 /// Fold a base image and an ordered run of log entries into the current
@@ -92,8 +119,65 @@ pub fn fold(base: Vec<u8>, entries: &[LogPayload]) -> anyhow::Result<Vec<u8>> {
     Ok(image)
 }
 
-/// The object's current durable sequence (0 if none). An 8-byte big-endian
-/// counter under `seq_key`.
+/// The highest committed seq of `id` — the contiguous committed prefix
+/// length — without folding payloads. The next write goes at this + 1.
+pub async fn committed_seq(store: &dyn BlobStore, id: &str) -> anyhow::Result<u64> {
+    let mut keys = store.list(&format!("objects/{id}.L.")).await?;
+    keys.sort();
+    let mut seq = 0u64;
+    for k in &keys {
+        let Some(this_seq) = parse_log_seq(k, id) else { continue };
+        let Some(b) = store.get(k).await? else { continue };
+        let Some(entry) = decode_entry(&b) else { break };
+        if !committed(store, &entry.txn).await {
+            break;
+        }
+        seq = this_seq;
+    }
+    Ok(seq)
+}
+
+/// Prewrite (or idempotently re-confirm) `txn`'s log entry for `id` at the
+/// next committed seq, fencing forks with create-if-absent. Returns the seq
+/// on success, or None if a live rival holds the slot (the caller aborts).
+/// In the supported single-writer model an occupied slot is always our own
+/// retry, a committed rival (advance), or a crashed orphan (clear + retake).
+pub async fn prewrite(
+    store: &dyn BlobStore,
+    id: &str,
+    txn: &str,
+    entry: &[u8],
+) -> anyhow::Result<Option<u64>> {
+    let mut seq = committed_seq(store, id).await? + 1;
+    for _ in 0..64 {
+        let key = log_key(id, seq);
+        if store.create(&key, entry).await? {
+            return Ok(Some(seq));
+        }
+        // Occupied — decide by the holder.
+        let Some(existing) = store.get(&key).await? else {
+            continue; // vanished (a resolver cleared it): retry same seq
+        };
+        let Some(held) = decode_entry(&existing) else {
+            return Ok(None);
+        };
+        if held.txn == txn {
+            return Ok(Some(seq)); // already ours (idempotent retry)
+        }
+        if committed(store, &held.txn).await {
+            seq += 1; // a committed rival owns this seq; take the next
+            continue;
+        }
+        // Uncommitted rival. In the single-writer model this is a crashed
+        // orphan — clear it and retake. (Under a fork this needs a TTL guard;
+        // that lands with the pause-fault resolution, step 3+.)
+        store.delete(&key).await?;
+    }
+    Ok(None)
+}
+
+/// The object's current durable sequence marker (0 if none). An 8-byte
+/// big-endian counter under `seq_key` (used only by the step-1 dual-write).
 pub async fn read_seq(store: &dyn BlobStore, id: &str) -> u64 {
     store
         .get(&seq_key(id))
@@ -105,26 +189,32 @@ pub async fn read_seq(store: &dyn BlobStore, id: &str) -> u64 {
         .unwrap_or(0)
 }
 
-/// Read the whole durable log for `id` and fold it over `base`, in seq order.
-/// This is the core of step 2's read path; used in step 1 only as an inert
-/// consistency cross-check (it ignores the commit-outcome gate that step 3
-/// adds, so it assumes every listed entry is committed).
-pub async fn fold_log(
+/// Read `id`'s durable log and fold the CONTIGUOUS COMMITTED PREFIX over
+/// `base` — the read path. Entries are listed in seq order; an entry counts
+/// only if its txn's commit record is present, and the fold stops at the
+/// first gap or uncommitted/pending entry (a page-delta at seq N is only
+/// valid applied on the image at seq N-1, so the prefix must be contiguous).
+/// Returns (image, highest committed seq).
+pub async fn fold_committed(
     store: &dyn BlobStore,
     id: &str,
     base: Vec<u8>,
-) -> anyhow::Result<Vec<u8>> {
+) -> anyhow::Result<(Vec<u8>, u64)> {
     let mut keys = store.list(&format!("objects/{id}.L.")).await?;
     keys.sort();
-    let mut entries = Vec::with_capacity(keys.len());
+    let mut payloads: Vec<LogPayload> = Vec::with_capacity(keys.len());
+    let mut seq = 0u64;
     for k in &keys {
-        if let Some(b) = store.get(k).await?
-            && let Some(p) = decode_entry(&b)
-        {
-            entries.push(p);
+        let Some(this_seq) = parse_log_seq(k, id) else { continue };
+        let Some(b) = store.get(k).await? else { continue };
+        let Some(entry) = decode_entry(&b) else { break };
+        if !committed(store, &entry.txn).await {
+            break; // pending/aborted: the committed prefix ends here
         }
+        payloads.push(entry.payload);
+        seq = this_seq;
     }
-    fold(base, &entries)
+    Ok((fold(base, &payloads)?, seq))
 }
 
 #[cfg(test)]
@@ -150,9 +240,15 @@ mod tests {
     #[test]
     fn entry_roundtrips_both_kinds() {
         let snap = LogPayload::Snapshot(vec![1, 2, 3]);
-        assert_eq!(decode_entry(&encode_entry(&snap)), Some(snap));
+        assert_eq!(
+            decode_entry(&encode_entry("b655-7", &snap)),
+            Some(LogEntry { txn: "b655-7".into(), payload: snap })
+        );
         let d = LogPayload::Delta(vec![9, 8, 7]);
-        assert_eq!(decode_entry(&encode_entry(&d)), Some(d));
+        assert_eq!(
+            decode_entry(&encode_entry("t2-c1-9", &d)),
+            Some(LogEntry { txn: "t2-c1-9".into(), payload: d })
+        );
         assert_eq!(decode_entry(&[]), None);
     }
 
