@@ -182,26 +182,37 @@ pub fn fold(base: Vec<u8>, entries: &[LogPayload]) -> anyhow::Result<Vec<u8>> {
 /// contiguous committed run of log entries above it — without folding
 /// payloads. The next write goes at this + 1.
 pub async fn committed_seq(store: &dyn BlobStore, id: &str) -> anyhow::Result<u64> {
-    let (_, base_seq) = read_base(store, id).await?;
-    let mut keys = store.list(&format!("objects/{id}.L.")).await?;
-    keys.sort();
-    let mut seq = base_seq;
-    for k in &keys {
-        let Some(this_seq) = parse_log_seq(k, id) else { continue };
-        if this_seq <= base_seq {
-            continue; // subsumed by the base
+    // Same base-vs-log read race as fold_committed: a compaction between the
+    // read_base and the log LIST would show a stale base with a false gap,
+    // returning too LOW a seq — the caller then prewrites at an already-
+    // subsumed seq and its write is lost. Re-read the base; retry if it moved.
+    for _ in 0..16 {
+        let (_, base_seq) = read_base(store, id).await?;
+        let mut keys = store.list(&format!("objects/{id}.L.")).await?;
+        keys.sort();
+        let mut seq = base_seq;
+        for k in &keys {
+            let Some(this_seq) = parse_log_seq(k, id) else { continue };
+            if this_seq <= base_seq {
+                continue; // subsumed by the base
+            }
+            if this_seq != seq + 1 {
+                break; // a gap: the committed prefix ends here
+            }
+            let Some(b) = store.get(k).await? else { break };
+            let Some(entry) = decode_entry(&b) else { break };
+            if !committed(store, &entry.txn).await {
+                break;
+            }
+            seq = this_seq;
         }
-        if this_seq != seq + 1 {
-            break; // a gap: the committed prefix ends here
+        let (_, base_seq_now) = read_base(store, id).await?;
+        if base_seq_now > seq {
+            continue;
         }
-        let Some(b) = store.get(k).await? else { break };
-        let Some(entry) = decode_entry(&b) else { break };
-        if !committed(store, &entry.txn).await {
-            break;
-        }
-        seq = this_seq;
+        return Ok(seq);
     }
-    Ok(seq)
+    anyhow::bail!("committed_seq for {id} kept racing compaction");
 }
 
 /// Prewrite (or idempotently re-confirm) `txn`'s log entry for `id` at the
@@ -309,32 +320,51 @@ pub async fn read_seq(store: &dyn BlobStore, id: &str) -> u64 {
 /// valid applied on the image at seq N-1, so the prefix must be contiguous).
 /// Returns (image, highest committed seq).
 pub async fn fold_committed(store: &dyn BlobStore, id: &str) -> anyhow::Result<(Vec<u8>, u64)> {
-    let (base, base_seq) = read_base(store, id).await?;
-    let mut keys = store.list(&format!("objects/{id}.L.")).await?;
-    keys.sort();
-    let mut payloads: Vec<LogPayload> = Vec::new();
-    let mut seq = base_seq;
-    for k in &keys {
-        let Some(this_seq) = parse_log_seq(k, id) else { continue };
-        if this_seq <= base_seq {
-            continue; // subsumed by the compacted base
+    // Retry across a concurrent compaction. We read the base, then LIST the
+    // logs; if a compaction advances the base and deletes the folded tail
+    // BETWEEN those two reads, we'd see a stale base with logs starting above
+    // it — a FALSE gap that returns the stale (lower) base, missing the entries
+    // the compaction folded away. A node that then trusts that low seq
+    // prewrites at an already-subsumed seq and its write is silently ignored by
+    // every later fold (a two-writer fork; torn transfer / conservation, only
+    // visible after the deadline fix let the run complete). Re-read the base
+    // after folding: if it moved past where we stopped, our view straddled the
+    // compaction — fold again off the fresh base.
+    for _ in 0..16 {
+        let (base, base_seq) = read_base(store, id).await?;
+        let mut keys = store.list(&format!("objects/{id}.L.")).await?;
+        keys.sort();
+        let mut payloads: Vec<LogPayload> = Vec::new();
+        let mut seq = base_seq;
+        for k in &keys {
+            let Some(this_seq) = parse_log_seq(k, id) else { continue };
+            if this_seq <= base_seq {
+                continue; // subsumed by the compacted base
+            }
+            if this_seq != seq + 1 {
+                break; // a gap: the committed prefix ends here
+            }
+            let Some(b) = store.get(k).await? else {
+                // Deleted under us by a concurrent compaction: retry with the
+                // fresh base rather than folding across a hole.
+                break;
+            };
+            let Some(entry) = decode_entry(&b) else { break };
+            if !committed(store, &entry.txn).await {
+                break; // pending/aborted: the committed prefix ends here
+            }
+            payloads.push(entry.payload);
+            seq = this_seq;
         }
-        if this_seq != seq + 1 {
-            break; // a gap: the committed prefix ends here
+        // Did a compaction advance the base past where we stopped folding? Then
+        // our (base, logs) pair straddled it and `seq` is stale — retry.
+        let (_, base_seq_now) = read_base(store, id).await?;
+        if base_seq_now > seq {
+            continue;
         }
-        let Some(b) = store.get(k).await? else {
-            // Deleted under us by a concurrent compaction: fail so the caller
-            // re-reads the fresh base rather than folding across a hole.
-            anyhow::bail!("log entry {k} vanished mid-fold (compaction race); retry");
-        };
-        let Some(entry) = decode_entry(&b) else { break };
-        if !committed(store, &entry.txn).await {
-            break; // pending/aborted: the committed prefix ends here
-        }
-        payloads.push(entry.payload);
-        seq = this_seq;
+        return Ok((fold(base, &payloads)?, seq));
     }
-    Ok((fold(base, &payloads)?, seq))
+    anyhow::bail!("fold_committed for {id} kept racing compaction");
 }
 
 /// Compaction: fold the committed prefix into a fresh base at its seq, then
