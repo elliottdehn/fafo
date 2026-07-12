@@ -595,7 +595,12 @@ pub async fn handle_rpc(node: &Node, req: crate::rpc::Request) -> crate::rpc::Re
             object,
             taker,
         } => {
-            let tx = crate::cluster::local_sender(node, worker);
+            // ensure_local_sender, not local_sender: if we durably hold this
+            // worker's block lease but forgot it across a reboot, re-adopt and
+            // host it rather than dead-ending the taker (an orphaned object,
+            // the --pause liveness residual). Safe — it only adopts a lease
+            // that is already ours at its held epoch.
+            let tx = crate::cluster::ensure_local_sender(node, worker).await;
             match tx {
                 Some(tx) => {
                     let (rtx, rrx) = oneshot::channel();

@@ -379,19 +379,17 @@ pub async fn compact(store: &dyn BlobStore, id: &str, keep: u64) -> anyhow::Resu
     if seq < base_seq + keep {
         return Ok(()); // tail too short to bother
     }
-    // 1. Publish the new base at the committed seq.
-    store.put(&base_seq_key(id, seq), &image).await?;
-    // 2. Trim: log entries at or below it, and any older base.
-    for k in store.list(&format!("objects/{id}.L.")).await? {
-        if parse_log_seq(&k, id).is_some_and(|s| s <= seq) {
-            store.delete(&k).await?;
-        }
-    }
-    for k in store.list(&format!("objects/{id}.B.")).await? {
-        if parse_base_seq(&k, id).is_some_and(|s| s < seq) {
-            store.delete(&k).await?;
-        }
-    }
+    // ADDITIVE ONLY — publish a base, never trim. A destructive trim (delete
+    // the folded tail / old bases) kept racing concurrent folds under the pause
+    // fault, dropping committed writes. Never deleting means nothing committed
+    // can vanish, and the base still bounds `fetch_image`'s fold. create, not
+    // put, so a base at a seq is immutable. (Reclaiming the now-redundant tail
+    // is a separate, at-rest GC task.) NOTE: a subtle base+delta reconstruction
+    // fork remains under heavy --pause churn — the last ~1% the mine finds; the
+    // fold-across-a-base disagreeing with the raw-log truth after a handoff. It
+    // needs a proven-equivalent base (snapshot-only, or a lease-held fold);
+    // documented in bugs.md.
+    let _ = store.create(&base_seq_key(id, seq), &image).await?;
     Ok(())
 }
 

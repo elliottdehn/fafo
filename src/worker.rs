@@ -2534,7 +2534,10 @@ async fn take_task(
             eprintln!("take {object} txn{txn} by w{my_worker} attempt {attempt} -> w{owner}");
         }
         let outcome = {
-            let local_tx = crate::cluster::local_sender(&node, owner);
+            // ensure_local_sender: re-adopt a block whose lease is durably ours
+            // if we forgot it across a reboot (cures the abandoned-self-lease
+            // orphan). Safe — only adopts our own held lease at its epoch.
+            let local_tx = crate::cluster::ensure_local_sender(&node, owner).await;
             if let Some(tx) = local_tx {
                 let (rtx, rrx) = oneshot::channel();
                 if tx

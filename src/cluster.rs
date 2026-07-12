@@ -1361,6 +1361,45 @@ pub async fn resolve_addr(node: &Node, worker: usize) -> Option<String> {
     Some(lease.addr)
 }
 
+/// Local sender for `worker`, re-adopting its block on-demand if we DURABLY
+/// hold that block's lease but forgot it in memory. A reboot claims a fresh
+/// Auto slice and can abandon a block whose lease still names US: peers see the
+/// holder (us) alive and never reclaim, we don't host it either, so every take
+/// there dead-ends NotMine{None} and the object is orphaned for the rest of the
+/// run (a taker hangs on it; oracle read fails — the --pause liveness residual).
+/// We re-adopt at the HELD epoch — no new lease, no epoch bump, no reclaim — so
+/// it can never race a straggler or fork: the lease is provably ours already,
+/// nobody superseded it (a higher epoch under a different address would show
+/// here), and activation folds the committed log fresh. Pure amnesia cure.
+pub async fn ensure_local_sender(
+    node: &Node,
+    worker: usize,
+) -> Option<mpsc::UnboundedSender<WorkerMsg>> {
+    if let Some(tx) = local_sender(node, worker) {
+        return Some(tx);
+    }
+    let block = {
+        let routing = node.routing.read().unwrap();
+        block_of(worker, routing.logical, routing.blocks)
+    };
+    if node.epochs.read().unwrap().contains_key(&block) {
+        return None; // we host the block but not this worker for another reason
+    }
+    if let Ok(Some(lease)) = latest_lease(node.store.as_ref(), block).await
+        && lease.addr == node.advertise
+        && !lease.released
+    {
+        node.epochs.write().unwrap().insert(block, lease.epoch);
+        node.routing
+            .write()
+            .unwrap()
+            .addrs
+            .insert(block, node.advertise.clone());
+        return local_sender(node, worker);
+    }
+    None
+}
+
 /// Validate and route a transaction: pick the plurality owner as target,
 /// dispatch to it locally or proxy to the node holding its lease.
 pub async fn submit(
