@@ -394,13 +394,21 @@ Reading the signs:
 ## Developing fafo itself
 
 ```sh
-cargo test                       # full suite: atomicity, serializability,
-                                 # cross-node RPC, crash recovery, SigV4
+cargo test                       # full suite (146 tests): atomicity,
+                                 # serializability, cross-node RPC, crash
+                                 # recovery, SigV4
 cargo llvm-cov --lib             # line coverage (held at ~98.5%; the rest
                                  # is defensive arms and benign races)
 ./cluster.sh                     # 4 processes -> kill -9 -> resume as 2
 cargo run --release --bin anneal # watch placement learning converge
 ```
+
+The real correctness gate is not `cargo test` — it's the bug mine below.
+`cargo test` proves the happy paths and the specific regressions; the mine is
+what proves the system holds under crashes, partitions, clock skew, failing
+storage, and zombie-writer takeovers, all at once, across thousands of seeds.
+Any change to the commit path, ownership, leases, or recovery is not "done"
+until the mine is green on it.
 
 Layout: `src/worker.rs` (serial executor + commit protocol + admission),
 `src/cluster.rs` (topology, leases, routing, checkpoints), `src/store.rs` +
@@ -418,3 +426,79 @@ Rules of the codebase:
 - Ordering invariant: transactions acquire participants in sorted object
   order, and all admission is per-object FIFO. Violating either reintroduces
   deadlocks.
+
+## The bug mine: a crash is a bug, a bug is $100
+
+fafo is verified by deterministic simulation testing (`src/bin/dst.rs`): the
+whole cluster on one thread, on virtual time, with seeded fault injection and
+oracles that check conservation of money, transfer atomicity, cross-object
+liveness, subscriber delivery, and last-will firing after every phase. **A
+crash is a bug. A bug is $100.** Every crash replays bit-for-bit from its
+seed, so a find is a repro, not a rumor.
+
+**Your job, if you are here to earn: make it crash.**
+
+```sh
+cargo build --release --bin dst
+
+# ALWAYS check disk first. The mine writes scratch to $TMPDIR; a full disk
+# makes subprocesses block, reported as "HUNG" — which is NOT a bug.
+df -h "$TMPDIR"
+
+# Mine forever, all cores, every fault on at once:
+FAFO_LOG_PRIMARY=1 ./target/release/dst mine --fuzz --pause
+```
+
+- **`FAFO_LOG_PRIMARY=1` is required.** It selects the log-structured commit
+  engine — the one that is actually clean. Without it you are mining the
+  legacy path, kept only as the flag-off determinism baseline.
+- **`--fuzz`** derives the whole cluster shape from each seed: node count,
+  storage-failure rate (up to ~53%), per-node clock skew, fence TTLs.
+- **`--pause`** forces two pause-adversary faults per run: isolate a live
+  node, let a peer steal its lease, let it rejoin and try to keep writing —
+  the zombie writer fencing exists to stop.
+- **`--jobs N`** caps parallelism (default: core count). **`--seconds S`**
+  bounds the run (omit for endless). **`--seed BASE`** fixes where the seed
+  stream starts.
+
+**When it finds one.** The crash is confirmed by a re-run, then logged to
+`crashes/seed-N.log` with the exact repro command (fault flags included).
+Reproduce it, bit-for-bit:
+
+```sh
+FAFO_LOG_PRIMARY=1 ./target/release/dst run --seed <N> --fuzz --pause
+```
+
+`dst check --seed <N>` runs a seed twice and diffs the trace hash — use it to
+prove a fix is deterministic, and to prove a suspected bug is a real fault and
+not nondeterminism in the harness itself.
+
+**What is NOT a bug (do not claim the bounty for these):**
+- A `HUNG` report when `$TMPDIR` is full. That is disk, not fafo. Clear it and
+  re-run: `find "$TMPDIR" -maxdepth 1 -name 'dst-*' -delete`.
+- A crash that only reproduces with `FAFO_LOG_PRIMARY` unset. The legacy
+  engine is not the shipped one.
+- A run that is merely slow. A fork serialized safely is legitimately slower
+  than one that clobbers; the harness uses a progress-relative deadline, so
+  slow-but-progressing is fine. Only a genuine hang (killed at the wall-clock
+  timeout) or an oracle panic counts.
+
+**The rules of a claim.** Every bug ever found is written up in `bugs.md` — 51
+numbered entries, each with what the oracle saw, the root cause, the fix, and
+a nastiness score. As of this writing the mine is at **zero crashes across
+both `--fuzz` and `--pause`, thousands of seeds each**, so the bounty is for
+genuinely new ground: a fresh seed that breaks an invariant. A fix earns the
+$100 only if it:
+
+1. makes the failing seed clean, and survives a fresh mine sweep;
+2. adds the bug to `bugs.md` in the house format (oracle → root → fix, ELI5,
+   nastiness);
+3. keeps all 146 `cargo test`s green;
+4. does not change the flag-off determinism trace — `dst check --seed 1` must
+   stay `640 events, trace e85a7163e4ebb313` — and keeps flag-on runs
+   deterministic (`dst check` passes on the seeds you touched).
+
+That last rule is the tripwire: many "fixes" that silence one seed do so by
+perturbing timing or shifting the fault RNG, which just relocates the crash to
+a different seed. A fix that changes the flag-off trace has changed base
+behavior and is guilty until proven innocent.
