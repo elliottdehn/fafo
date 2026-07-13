@@ -2336,15 +2336,27 @@ fn ledger_keys(bytes: &[u8], scratch: &std::path::Path) -> Option<Set<String>> {
 /// durable committed fold already has — i.e. shipping it would erase a
 /// committed write. Best-effort: reads that fail => false (don't block ships
 /// on transient store faults). Only meaningful for `writes`-ledger objects.
-async fn snapshot_regresses(store: &dyn BlobStore, object: &str, snapshot: &[u8]) -> bool {
+async fn snapshot_regresses(
+    store: &dyn BlobStore,
+    object: &str,
+    snapshot: &[u8],
+    uniq: &str,
+) -> bool {
     let Ok((durable, _)) = crate::objlog::fold_committed(store, object).await else {
         return false;
     };
+    // Scratch paths MUST be unique per process AND per boat: parallel `dst`
+    // miner subprocesses share /tmp, and two nodes in one process can ship the
+    // same forked object at once — a shared name would clobber the comparison
+    // and make the (correctness-affecting) rebase decision non-deterministic.
     let dir = std::env::temp_dir();
-    let Some(dkeys) = ledger_keys(&durable, &dir.join(format!("dst-fence-dur-{object}.db"))) else {
+    let pid = std::process::id();
+    let Some(dkeys) = ledger_keys(&durable, &dir.join(format!("dst-fence-{pid}-{uniq}-dur.db")))
+    else {
         return false; // not a ledger object, or unreadable
     };
-    let Some(skeys) = ledger_keys(snapshot, &dir.join(format!("dst-fence-snap-{object}.db"))) else {
+    let Some(skeys) = ledger_keys(snapshot, &dir.join(format!("dst-fence-{pid}-{uniq}-snap.db")))
+    else {
         return false;
     };
     dkeys.iter().any(|k| !skeys.contains(k))
@@ -2441,7 +2453,13 @@ async fn ship_task(
             // re-fold off the committed truth, then re-run. Guards the DIRTY /
             // single-node revert-race erasure the clean-write refold can't.
             if is_snap
-                && snapshot_regresses(node.store.as_ref(), &item.object, item.bytes()).await
+                && snapshot_regresses(
+                    node.store.as_ref(),
+                    &item.object,
+                    item.bytes(),
+                    &format!("{staging_id}-{}", item.object),
+                )
+                .await
             {
                 rebased = Some(item.object.clone());
                 err = Some(format!("snapshot for {} would erase a committed write", item.object));

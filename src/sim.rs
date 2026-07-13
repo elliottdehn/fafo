@@ -1876,7 +1876,7 @@ trace tail:
             Ok(v) => v,
             Err(e) => return vec![("<fold-error>".to_string(), 0), (format!("{e}"), 0)],
         };
-        let path = std::env::temp_dir().join(format!("dst-durable-{object}.db"));
+        let path = std::env::temp_dir().join(format!("dst-durable-{}-{object}.db", std::process::id()));
         if std::fs::write(&path, &image).is_err() {
             return vec![("<write-error>".to_string(), 0)];
         }
@@ -1899,7 +1899,7 @@ trace tail:
     /// the fold fails or the query returns nothing.
     async fn durable_scalar(&self, object: &str, sql: &str) -> Option<i64> {
         let (image, _seq) = crate::objlog::fold_committed(self.store.as_ref(), object).await.ok()?;
-        let path = std::env::temp_dir().join(format!("dst-durscalar-{object}.db"));
+        let path = std::env::temp_dir().join(format!("dst-durscalar-{}-{object}.db", std::process::id()));
         std::fs::write(&path, &image).ok()?;
         let conn = rusqlite::Connection::open(&path).ok()?;
         conn.query_row(sql, [], |r| r.get::<_, i64>(0)).ok()
