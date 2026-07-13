@@ -2325,11 +2325,17 @@ impl ShipItem {
 /// read. Diagnostic-grade: any failure yields None so a transient fault never
 /// blocks a ship.
 fn ledger_keys(bytes: &[u8], scratch: &std::path::Path) -> Option<Set<String>> {
-    std::fs::write(scratch, bytes).ok()?;
-    let conn = rusqlite::Connection::open(scratch).ok()?;
-    let mut stmt = conn.prepare("SELECT k FROM writes").ok()?;
-    let rows = stmt.query_map([], |r| r.get::<_, String>(0)).ok()?;
-    Some(rows.flatten().collect())
+    // The mine ships MILLIONS of boats — the scratch file MUST be deleted every
+    // call or it fills the disk (each ship uses a fresh, boot-unique name).
+    let keys = (|| {
+        std::fs::write(scratch, bytes).ok()?;
+        let conn = rusqlite::Connection::open(scratch).ok()?;
+        let mut stmt = conn.prepare("SELECT k FROM writes").ok()?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0)).ok()?;
+        Some(rows.flatten().collect::<Set<String>>())
+    })();
+    let _ = std::fs::remove_file(scratch);
+    keys
 }
 
 /// True if `snapshot` (a full image about to ship) is MISSING a write key the
@@ -3031,6 +3037,9 @@ pub async fn durable_read(
         std::fs::write(&path, &image).map_err(|e| ApiError::internal(e.to_string()))?;
         let conn =
             rusqlite::Connection::open(&path).map_err(|e| ApiError::internal(e.to_string()))?;
+        // Unlink now: the open handle keeps it readable, but nothing is left on
+        // disk after the conn closes — the fold path must not leak scratch.
+        let _ = std::fs::remove_file(&path);
         conns.insert(id.clone(), conn);
     }
     let mut results = Vec::with_capacity(ops.len());
