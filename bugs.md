@@ -22,6 +22,16 @@ loses its lease to a takeover and rejoins) — then flushed out the fencing
 trio, bugs 25–27. All of these survived the example suite; none survived the
 dice.
 
+Bugs 25–27 also exposed a limit the single-key fencing primitives could only
+approximate, documented below as *"the bug that isn't fixed yet."* That
+prediction was then paid off: a **log-structured commit** (behind
+`FAFO_LOG_PRIMARY`) turned the pause adversary from a documented boundary into
+a solvable problem, and mining under it — `dst mine --fuzz --pause`, every
+crash a bug — drove the whole system from ~13% of seeds crashing to **zero in
+both modes.** That campaign is bugs **28–50**, in its own section after the
+"not fixed yet" note (kept intact, because the honest record of the boundary
+is the reason the fix exists).
+
 Format: what the oracle saw → what was actually wrong → the fix — plus an
 ELI5 and a nastiness score (severity × subtlety × blast radius; 10 means
 "silently forks customer data and no test on earth was going to catch it").
@@ -393,6 +403,302 @@ that "fixing" it keeps introducing — and to reach for the log-structured
 commit only if speculative reclaim ever becomes a feature worth its cost.
 
 > ELI5: If a band member is stranded off-stage and never replaced, their songs stop — but our roadies keep trying to have someone *else* grab that member's guitar mid-song, and it keeps ending with two people playing the same part out of sync, which is worse. We've now tried nine kinds of roadie. So we wrote down "wait for the venue to send a real replacement" (which it always does) and proved the band is flawless when nobody freelances the swap. **Nastiness: 5/10 (bounded availability, no data risk in the supported model).**
+
+## The log-structured commit: the genuine fix — mined to zero
+
+The section above ended with a prediction: the only thing that safely closes
+speculative reclaim is a **log-structured commit** — every promotion path
+(ship, recovery, compaction) funnelled through one fenced, ordered, idempotent
+apply, so a committed record lands exactly once and no path can clobber. That
+protocol got built (behind `FAFO_LOG_PRIMARY`, de-risked first in a standalone
+model — `src/bin/protosim.rs` — that held conservation and ack-consistency over
+20k seeds of permanent fork + crash where a naive base-overwrite control tears
+99% of the time). Durable state became a per-object append-only log of
+committed snapshots: `objects/<id>.L.<seq>` entries, a compacted base
+`objects/<id>.B.<seq>`, and a single create-if-absent outcome key
+`txns/<id>.O` as the atomic commit switch. Activation *folds the committed
+prefix*; the fold is the truth.
+
+That unlocked the adversary the old model could only document. With clobbering
+replaced by fenced serialization, `dst mine --fuzz --pause` — **two forced
+pause faults, per-node clock skew, and up to ~53% failing-storage, every crash
+a bug** — became an honest bug-finder. It went from ~13% of seeds crashing to
+**zero, across both `--fuzz` and `--pause`, thousands of seeds each.** The
+bugs it took to get there fall in five acts. (Two of them, 28 and 50, are
+"bugs in the mirror" — the mine lying to itself — and are the reason the rest
+could be trusted.)
+
+### Act I — sharpening the mine (a crash must *mean* a bug)
+
+**28. The deadline that hid the crimes.** The liveness oracle killed a run on
+an **absolute** 600 s-virtual deadline. But a fork *serialized safely* by the
+log is legitimately slow (many `acked=false` retries), and those slow-but-fine
+seeds hit the deadline **before the pre-shutdown safety oracles ran** — so the
+harness was crashing on liveness and never checking conservation. An early
+"safety 0" reading was measured through that blind spot. Fix: a
+**progress-relative** deadline (no cap while producers make progress; a bounded
+drain after) plus a per-seed wall-clock timeout so a true hang is still caught.
+The moment it landed, real forks the deadline had been masking became visible.
+
+> ELI5: The exam had a time limit, and slow-but-correct students got thrown out before their papers were graded — so we "never saw a wrong answer." We stopped the clock while a pencil is still moving. Suddenly we could see the mistakes. **Nastiness: 7/10 (a test bug that manufactures false confidence — the worst kind).**
+
+**29. The will that fired but couldn't be seen.** A subscriber oracle demanded
+`want == channel_msgs` — every publish ACKed. But a pause-fault **lost ack**
+(the write committed durably; the client only saw the error) leaves
+`want < channel_msgs` forever even though every message is present. Fix: drain
+to the durable tail and accept give-ups, exactly as the transfer oracles do.
+
+> ELI5: You mailed all the letters, but one delivery receipt got lost, so the ledger insisted a letter was missing that had actually arrived. Count what's in the mailbox, not the receipts. **Nastiness: 6/10 (false liveness failure).**
+
+**30. The subscriber that read ghosts.** A non-durable poll saw rows from a
+transaction that then **rolled back**, and SQLite **reused the autoincrement
+id** the ghost had taken — so the next real message got an id the subscriber
+had already marked seen, and was skipped. Fix: subscribers poll **durable**
+(committed) state; exactly-once delivery cannot be built on reads that can
+un-happen.
+
+> ELI5: You crossed a name off the guest list because you saw them walk in — but they turned around and left, and the next guest got handed the same numbered badge, so you thought they'd already come. Only cross off people who actually stayed. **Nastiness: 7/10 (silently dropped a committed message).**
+
+### Act II — integrating a log that *serializes* forks instead of clobbering
+
+**31. The live file that lied about the log.** The deepest integration bug: a
+worker's live SQLite file can drift from the committed log. Under a fork it
+would ship a full snapshot at `seq S+1` built from a live file that had **never
+seen a rival's committed `seq S`** — silently overwriting it at a fresh seq.
+(`protosim` never hit this: its workers re-read committed state on every write;
+real SQLite carries a warm file.) Fix: **rebase-on-divergence** — the worker
+tracks `log_seq` (the committed seq its live file reflects), a ship carries its
+`expected_seq`, and the prewrite aborts when the durable `committed_seq` has
+moved past it, reverting and re-folding off the fresh prefix. Cut the clobber
+from 6 seeds to 1.
+
+> ELI5: You typed your edit onto a printout, not the shared doc — and someone else's saved change never made it onto your paper, so when you finally uploaded, you erased them. Now you re-download before saving, and if the shared copy moved, you retype on top of *theirs*. **Nastiness: 9/10 (silent cross-node fork).**
+
+**32. The poll served from a stale desk.** A feed watcher's poll ran on a
+worker whose live conn was behind the log — a *peer* had committed with no
+local write to trigger the write-only rebase, so the poll never fired though
+every write was durable. Fix: read-side rebase — re-fold the committed prefix
+**in place** for a clean object when a durable poll won't fire, plus a periodic
+recheck of parked polls for objects a peer advanced. (A first, revert-based
+attempt regressed safety through churn; folding in place does not.)
+
+> ELI5: The clerk kept answering "no mail yet" from yesterday's pile because nobody told them a new bag had arrived. Now they glance at the current bag before answering. **Nastiness: 6/10 (feed liveness).**
+
+**33. The leapfrog that never converged.** Two nodes ping-pong committed seqs
+on the same hot accounts (rapid migration under the pause fork). The log makes
+them serialize *safely* — no clobber — but ~2× slower, and ownership never
+settles, so the transfer phase can outrun the feed watchers' deadline. Fix:
+**relinquish on rebase** — a worker that loses a prewrite `durable_claim`s the
+object and, if a ≥-generation peer owns it, drops it and routes future txns to
+the winner. Rebases per seed: 191 → 2.
+
+> ELI5: Two people kept grabbing the same doorknob and letting go so the other could try, forever. Now the one who loses the grab just steps aside and lets the winner through. **Nastiness: 6/10 (liveness under contention).**
+
+### Act III — boot, orphans, and redistribution
+
+**34. The orphan dead-end.** After crash + reboot, a block's durable lease
+still named the node's **own address** (a crash skips the graceful release),
+but the fresh incarnation holds nothing — so peers saw the holder "alive" and
+never reclaimed, and the node didn't host it either. Every take there
+dead-ended `NotMine{None}`; the object was unreadable for the rest of the run.
+The fix was the *opposite* of reclaiming (six reclaim variants all forked):
+**boot with nothing** — on boot, release every unreleased lease still naming
+us. They become claimable and redistribute through the proven-safe claim path;
+we never resurrect stale ownership.
+
+> ELI5: A shop's sign still said "OPEN, run by Alice" after Alice quit and a new Alice arrived with no keys — so customers waited at a locked door forever. New Alice now takes the old sign down on day one, and the block gets properly re-let. **Nastiness: 7/10 (permanent orphan; objects unreadable).**
+
+**35. The reused outcome key.** The commit switch is keyed by `staging_id =
+node-tag + ship-seq`, and the tag was `addr-hash + boot-epoch` — which
+**repeated across reboots**. Two genuinely different transactions from two
+incarnations could hash to the same outcome key: one's commit flipped the
+other's entries to "committed," tearing it. Fix: a unique **boot nonce** minted
+from the durable store's `version()` of a per-node boot key.
+
+> ELI5: Two different contracts got filed under the same case number because the numbering reset when the office rebooted — so signing one "approved" the other. Now every boot draws a fresh, never-repeated number. **Nastiness: 9/10 (silent torn transaction).**
+
+**36. The quota-starved orphan.** Boot-claim caps how many blocks a node grabs
+(load balancing). But that quota was capping **orphaned** blocks too — blocks
+with a dead holder's lease that *must* be absorbed for their objects to be
+reachable. A block neither survivor's quota reached stayed orphaned, and a
+multi-object txn gathering an account there hung forever. Fix: orphaned
+(existing-lease) blocks **bypass** the quota; only the fresh pool is balanced.
+
+> ELI5: Movers had a "max 10 boxes each" rule and applied it even to boxes left behind by the tenant who moved out — so some boxes sat in the empty apartment forever. The rule now only limits *new* boxes; abandoned ones always get carried out. **Nastiness: 7/10 (gather deadlock).**
+
+**37. The fence-free reclaim.** Reclaiming a **released** lease skipped the
+fencing-TTL wait, on the theory that a graceful release means the predecessor
+is done. But boot-release (34) tombstones a *crashed* predecessor, whose
+in-flight boat may still be settling — reclaiming it fence-free raced that
+straggler into a two-writer fork. Fix: wait out the fence TTL before the first
+write on **every** reclaim, released or not.
+
+> ELI5: You assumed a "checked-out" hotel room was empty and walked in — but the last guest left in a hurry and a bag was still on its way down. Now you wait the full checkout window before touching anything, even for rooms marked vacant. **Nastiness: 8/10 (cross-writer fork).**
+
+### Act IV — compaction and the fold
+
+**38. The superseded compactor.** Compaction rewrites an object's log into a
+fresh base. A worker that had *already been fenced* could still run a
+compaction and rewrite the log out from under the true owner. Fix: gate
+compaction behind the same lease verification as a commit — a superseded owner
+compacts nothing.
+
+> ELI5: A fired editor still had the keys and kept "tidying" the master manuscript. Now tidying requires a badge that gets revoked when you're let go. **Nastiness: 8/10.**
+
+**39. The base-vs-log read race.** `fold_committed` / `committed_seq` read the
+base, then listed the log entries above it. A compaction landing **between**
+those two reads shows a stale (low) base with entries starting *above* it — a
+false gap — so the fold stops early and returns too low a seq. A node that
+trusts it prewrites at an already-subsumed seq, and its write is silently
+ignored by every later fold: a two-writer fork, invisible until the deadline
+fix (28) let runs finish. Fix: re-read the base *after* folding; if it moved
+past where we stopped, our view straddled a compaction — fold again.
+
+> ELI5: You checked the table of contents, then the chapters, but the book was re-indexed in between — so you concluded chapter 5 was missing and wrote a *new* chapter 5 on top of the real one. Now you re-check the contents after reading; if it changed, you start over. **Nastiness: 9/10 (silent dropped write).**
+
+**40. The destructive trim.** Compaction originally deleted the log tail it had
+folded into the base. A concurrent fold that straddled the delete lost the
+committed writes in the deleted range. Fix: compaction is **additive** — it
+publishes a new immutable base with create-if-absent and **never trims**.
+Nothing committed can vanish; the base only *shortcuts* the fold. (Reclaiming
+the now-redundant tail is a separate at-rest GC problem, not a hot-path one.)
+
+> ELI5: The archivist made a summary and then shredded the originals — and anyone mid-read lost the pages being shredded. Now the summary is added alongside; the originals are never destroyed on the live path. **Nastiness: 8/10.**
+
+**41. The abandoned self-lease.** A reboot claims a *fresh* quota slice and can
+abandon a block whose durable lease still names us at a held epoch — peers see
+us alive and never reclaim, we don't host it, orphan. Fix: `ensure_local_sender`
+re-adopts a block whose lease is **durably ours** at its held epoch on demand
+(no new lease, no epoch bump, no reclaim — provably safe), curing the amnesia.
+
+> ELI5: You still legally owned a storage unit but forgot you had it, and the front desk wouldn't re-rent it because your name was on the lease. Now, when someone asks for it, you check the lease, see it's yours, and just open it. **Nastiness: 6/10 (orphan liveness).**
+
+### Act V — the two-writer stale-snapshot forks, and the last mile to zero
+
+These are the residual the earlier notes called "the last ~1%": a stale full
+snapshot committing at a fresh seq **over** a committed write. Each is a
+different way the rebase guard (31) got bypassed.
+
+**42. The committed-rival step-over.** When our target seq was held by a rival
+that had actually **committed** under us — its lock looked *pending* because a
+store-fault-timed outcome read missed the commit — the prewrite stepped to the
+next seq and shipped our stale snapshot on top, dropping the rival's write. Fix:
+a committed rival (whether the outcome reads committed *or* our abort-race loses
+to it) means **rebase**, never step over.
+
+> ELI5: The seat looked empty because the ticket scanner glitched, so you sat in the next one and ignored the person already there. Now, if anyone might be seated, you re-check and move to a truly free row. **Nastiness: 9/10 (silent fork).**
+
+**43. The stale re-acquire cache.** Re-acquiring a migrated object seeded
+`log_seq` to the fresh `committed_seq` but kept a **stale cached live file**
+from a prior tenure — so the next ship built a snapshot on old bytes yet
+believed it was current. Fix: on re-acquire, purge the cache and re-baseline
+**only for a clean object** (its next access re-folds); a *dirty* object is
+left alone so its unshipped writes rebase instead of shipping a lie.
+
+> ELI5: You got the apartment back and updated the address label, but the fridge still had last tenant's food — and you served it as fresh. Now, on move-in, you empty the fridge (if you brought nothing of your own) and restock from the store. **Nastiness: 9/10 (silent fork).**
+
+**44. The stale-owner read.** A worker owned an account at a `log_seq` behind
+the durable prefix — an orphan had committed past it — and, with no local write
+to trigger a rebase, **served a read behind a committed write** at quiescence.
+The durable truth was correct the whole time; only the read was stale. Fix:
+before serving a read, re-fold a clean participant whose `log_seq` trails the
+committed prefix (generalizing the durable-poll refresh of 32 to plain reads).
+
+> ELI5: The teller quoted your balance from an old ledger page because no new deposit had crossed *their* desk — even though the deposit was safely in the vault. Now they flip to the current page before reading it out. **Nastiness: 8/10 (stale read of committed data).**
+
+**45. The reconstruction erasure.** The genuine "base reconstruction" fork the
+old notes feared. A write on a **dirty** object — or a **single-node
+revert/fold-race** under heavy fault — captured a live file missing a committed
+write, and shipped a full snapshot that erased it at a fresh seq. The seq-based
+rebase guard couldn't see it: `log_seq` read *current* while the conn lagged.
+Two-part fix, because `log_seq` is exactly what lies. (a) Before a write lands
+on a clean participant, rebuild its base from the durable fold
+**unconditionally** — not gated on `log_seq` (scoped to data objects; folding
+before every write to the hot `_wills` singleton multiplied its fault surface).
+(b) A **content fence at ship**: before prewriting a snapshot, compare its
+`writes` ledger to the durable committed fold; if it's missing a key the log
+has already committed, it would erase that write — rebase instead. Content-level,
+so it catches every variant the seq guard misses.
+
+> ELI5: You copied the ledger to a fresh page but skipped a committed line, then filed your page as the new master — deleting that line. Now, before filing, you diff your page against the vault copy; if the vault has a line you don't, you copy it down first. **Nastiness: 10/10 (silently forks customer money; the deepest fork in the ledger).**
+
+**46. The phantom-claim deadlock.** A worker's own multi-object gather wanted
+an object whose durable claim was `Transit`/`Owned` to **itself** — but `admit`
+refused the self-adopt because `self.transit` recorded a *higher* generation
+from a release whose checkpoint had **never durably landed** (a ghost). The take
+chased to us, admit refused every pass, and the gather wedged forever. Fix: when
+durable authoritatively names us at *exactly* this generation and we hold the
+object in neither `owned` nor a real durable claim, that higher gen is a
+phantom — drop it and adopt. Guarded hard so a genuinely-spent renunciation
+(durable moved on to a real owner) is still refused.
+
+> ELI5: You refused to pick up your own package because your notebook said "you already forwarded this to yourself at a later date" — a note you'd scribbled but never actually mailed. When the post office confirms it's yours *right now*, you tear up the phantom note and take it. **Nastiness: 7/10 (gather deadlock).**
+
+**47. The self-orphaned lock.** A boat that durably prewrote its entries then
+**failed before its commit switch** (a store fault on the outcome create) left
+them **pending**. Its own next ship collided with those pending locks at the
+same seq — a fresh lock says "don't steal" — and rebased, reverted, retried
+into the same wall until they aged out. Under churn + fault the reclaim window
+often never came, so a hot object (`_wills`) livelocked. Fix: on boat failure,
+roll back the boat's **own** prewritten entries — guarded two ways so it can
+never erase a real commit (delete only an entry still ours, and only after
+checking the outcome didn't actually land).
+
+> ELI5: You reserved a table, the payment machine died, and you left the "reserved" card on it — then couldn't sit down because *your own* card said the table was taken. Now, if the payment fails, you pick your card back up. **Nastiness: 7/10 (hot-object livelock).**
+
+**48. The will that couldn't claim.** The last-will sweep gated *firing* an
+orphaned will on a claim UPDATE to the single hot `_wills` object landing
+durably. Under crash/reboot churn + faults that claim thrashed and never
+landed — so a genuinely dead-node will **never fired at all**, defeating the
+very guarantee the harness was built for (bug 22). But the claim is only an
+optimization to cut *redundant* fires: fires are idempotent by contract (the
+DST arms `INSERT OR IGNORE`). Fix: skip a will only when the claim **provably**
+went to another sweeper (`rows_affected == 0`); if it merely couldn't land, fire
+anyway. At-least-once, which is the real guarantee.
+
+> ELI5: The lifeguards agreed only one of them blows the whistle, and to decide who, they had to sign a shared clipboard first — but the clipboard was underwater, so *nobody* ever blew the whistle while someone drowned. Now, if you can't reach the clipboard, you blow the whistle anyway; two whistles never hurt. **Nastiness: 8/10 (the flagship feature silently failing under load).**
+
+**49. The read that hung on a dead owner.** A read of a committed object stuck
+in `Transit` to a worker on a **crashed, un-reclaimed** node routed to the dead
+owner and retried forever. But under the log, committed state is *always*
+available. Fix: `submit_routed` serves a **read-only** txn straight from the
+durable fold (`durable_read`) when the routed owner can't — no live node, or any
+owner error. Linearizable (the fold is exactly the committed prefix; a
+pessimistic write's log entry precedes its outcome, so it's included), and never
+in-flight state. Writes are never rerouted this way: they need their one owner.
+
+> ELI5: You asked the one clerk who owned a file, but they'd gone home sick and nobody took their desk — so you stood at an empty counter forever. Since the file is also in the public archive, we now just read it from the archive when the clerk's out. (But you still can't *change* it without a clerk.) **Nastiness: 6/10 (read availability).**
+
+**50. The scratch file that collided.** The content fence (45b) wrote each
+comparison into an SQLite scratch file named per-object — and the mine runs
+**parallel subprocesses sharing `/tmp`**, plus two nodes in one process can
+ship the same forked object at once. They clobbered each other's scratch bytes,
+making the fence's (correctness-affecting) rebase decision **non-deterministic**
+— surfacing as a false-positive crash on a seed that was clean on every direct
+run. Fix: key the scratch on process id + `staging_id` + object, so no two
+comparisons ever share a file.
+
+> ELI5: Two chefs checking recipes were both scribbling on the same shared notepad, so each read the other's notes and cooked the wrong dish at random. Give every chef their own notepad. **Nastiness: 7/10 (a tooling bug that fakes a product bug — a mirror crack, like 28).**
+
+### Where the line moved
+
+The earlier section drew the honest line at *"clean in the supported model;
+the residual lives in one deliberately-unbuilt feature."* The log-structured
+commit **erased that line.** With the fence protecting every write, the
+orphaned-block liveness that had looked like a protocol boundary turned out to
+be two ordinary operations — a will fire and a committed read — that simply
+**didn't degrade gracefully** when their routing hint pointed at a dead node.
+Neither needed ownership to *converge*; each had a safe, idempotent fallback
+(fire the idempotent will anyway; read the committed value from the log).
+Making the operation robust beat trying to converge ownership — and two
+tempting "convergence" fixes were built and **rejected** on the way (pinning
+`_wills` routing, which didn't converge the lease split; and fencing phantom
+lease holds in the guard, which false-fired on a store-list blip and broke a
+test). Final state: `dst mine --fuzz` and `dst mine --pause` at **zero
+crashes**, every historically-failing seed clean, safety zero in both modes,
+the flag-off world byte-identical, and the flag-on world deterministic. The
+system is no longer clean *in its model* — it is clean *under the adversary
+the model was built to break it with*.
 
 ## Before the dice: what the example suite caught
 
