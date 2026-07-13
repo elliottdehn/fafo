@@ -41,6 +41,37 @@ pub fn parse_base_seq(key: &str, id: &str) -> Option<u64> {
     key.strip_prefix(&format!("objects/{id}.B."))?.parse().ok()
 }
 
+/// Diagnostic: dump the raw log structure for an object — every base and
+/// every log entry with its seq, txn, and committed state — so a fold that
+/// stops at a gap can be told apart from a genuinely-missing write.
+pub async fn dump_log(store: &dyn BlobStore, id: &str) -> String {
+    let mut out = format!("log[{id}]:");
+    let mut bases: Vec<u64> = store
+        .list(&format!("objects/{id}.B."))
+        .await
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|k| parse_base_seq(k, id))
+        .collect();
+    bases.sort();
+    out.push_str(&format!(" bases={bases:?} entries=["));
+    let mut keys = store.list(&format!("objects/{id}.L.")).await.unwrap_or_default();
+    keys.sort();
+    for k in &keys {
+        let Some(seq) = parse_log_seq(k, id) else { continue };
+        let (txn, state) = match store.get(k).await.ok().flatten().and_then(|b| decode_entry(&b)) {
+            Some(e) => {
+                let c = if committed(store, &e.txn).await { "C" } else { "?" };
+                (e.txn, c)
+            }
+            None => ("<gone>".to_string(), "-"),
+        };
+        out.push_str(&format!("{seq}:{txn}:{state} "));
+    }
+    out.push(']');
+    out
+}
+
 /// The highest compacted base (image, seq), or (empty, 0) if none — the
 /// starting point for a fold.
 pub async fn read_base(store: &dyn BlobStore, id: &str) -> anyhow::Result<(Vec<u8>, u64)> {

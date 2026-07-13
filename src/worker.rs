@@ -1496,6 +1496,25 @@ impl Worker {
         false
     }
 
+    /// Rebuild a CLEAN object's live conn from the durable committed fold
+    /// UNCONDITIONALLY (ignoring log_seq, which is precisely the value that
+    /// can lie about the conn after a handoff). Guarantees a write builds on
+    /// the committed truth, so its snapshot cannot erase a peer's committed
+    /// entry at a fresh seq. A dirty object is left alone — its unshipped
+    /// writes rebase at ship time.
+    async fn refold_clean_base(&mut self, object: &str) {
+        if self.unshipped(object) || !self.objects.contains_key(object) {
+            return;
+        }
+        let Ok((image, seq)) = crate::objlog::fold_committed(self.node.store.as_ref(), object).await
+        else {
+            return;
+        };
+        if materialize(&mut self.objects, object, &self.live_dir, &image).is_ok() {
+            self.log_seq.insert(object.to_string(), seq);
+        }
+    }
+
     async fn refresh_stale_poll(
         &mut self,
         object: &str,
@@ -1805,10 +1824,27 @@ impl Worker {
         // path rebases, so a plain read would otherwise serve state behind an
         // already-committed write (a torn transfer at quiescence). Re-fold in
         // place first. Writes skip this — their rebase guard handles it.
-        if p.read_only && std::env::var_os("FAFO_LOG_PRIMARY").is_some() {
+        if std::env::var_os("FAFO_LOG_PRIMARY").is_some() {
             let participants = p.participants.clone();
             for object in &participants {
-                self.refresh_if_stale(object).await;
+                if p.read_only {
+                    // A read only needs to catch up to the committed prefix
+                    // when it has fallen behind — cheap, conditional.
+                    self.refresh_if_stale(object).await;
+                } else {
+                    // A WRITE must build on the committed truth. log_seq can
+                    // read current while the live conn is actually stale (a
+                    // reconstruction fork after a handoff under --pause: the
+                    // conn reflects an older seq than log_seq claims), and the
+                    // write then snapshots that stale base OVER a committed
+                    // peer write at a fresh seq — erasing it (escrow-capital /
+                    // torn transfer, the documented last residual). Since
+                    // log_seq is exactly what lies, rebuild a CLEAN
+                    // participant's base from the durable fold UNCONDITIONALLY
+                    // before the write lands. Dirty participants carry local
+                    // writes and are left to the ship-time rebase guard.
+                    self.refold_clean_base(object).await;
+                }
             }
         }
         // Apply locally; durability is the boat's job.

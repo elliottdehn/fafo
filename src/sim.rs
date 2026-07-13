@@ -1758,6 +1758,25 @@ trace tail:
             }
         }
         let expected = 2 * self.cfg.initial_balance;
+        if party_balance + held != expected {
+            // Dump DURABLE truth: if the durable balances/settlements sum to
+            // `expected`, this is a STALE READ (a node cache behind the log);
+            // if durable itself is off, a real escrow fork.
+            let mut dbg = String::new();
+            for e in 0..2usize {
+                let o = format!("esc-party-{e}");
+                let db = self.durable_scalar(&o, "SELECT balance FROM account").await;
+                let dw = self.durable_writes(&o).await;
+                dbg.push_str(&format!("  DURABLE {o}: balance={db:?} writes={dw:?}\n"));
+                dbg.push_str(&format!("    {}\n", crate::objlog::dump_log(self.store.as_ref(), &o).await));
+            }
+            for r in escrows.iter().filter(|r| r.open_acked) {
+                let o = format!("escrow-{}", r.key);
+                let ds = self.durable_scalar(&o, "SELECT COUNT(*) FROM settlements").await;
+                dbg.push_str(&format!("  DURABLE {o}: amount={} settled={ds:?}\n", r.amount));
+            }
+            eprintln!("ESCROW CAPITAL durable dump:\n{dbg}");
+        }
         assert_eq!(
             party_balance + held, expected,
             "ESCROW CAPITAL violated {when}: parties {party_balance} + held {held} != {expected}.
@@ -1864,6 +1883,17 @@ trace tail:
             }
         }
         out
+    }
+
+    /// Fold an object straight from the durable store and run a scalar query
+    /// (first column of first row as i64). Diagnostic only. Returns None if
+    /// the fold fails or the query returns nothing.
+    async fn durable_scalar(&self, object: &str, sql: &str) -> Option<i64> {
+        let (image, _seq) = crate::objlog::fold_committed(self.store.as_ref(), object).await.ok()?;
+        let path = std::env::temp_dir().join(format!("dst-durscalar-{object}.db"));
+        std::fs::write(&path, &image).ok()?;
+        let conn = rusqlite::Connection::open(&path).ok()?;
+        conn.query_row(sql, [], |r| r.get::<_, i64>(0)).ok()
     }
 
     async fn read_ledger(&self, object: &str) -> Vec<(String, i64)> {
