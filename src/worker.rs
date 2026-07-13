@@ -1503,6 +1503,14 @@ impl Worker {
     /// entry at a fresh seq. A dirty object is left alone — its unshipped
     /// writes rebase at ship time.
     async fn refold_clean_base(&mut self, object: &str) {
+        // System metadata objects (_wills, _worker, ...) are not subject to
+        // the cross-node data-erasure fork this guards against, and adding a
+        // durable fold before every write to a hot system object multiplies
+        // its store-fault surface (a single-node 53%-fault will-sweep could
+        // then never land its claim). Skip them.
+        if object.starts_with('_') {
+            return;
+        }
         if self.unshipped(object) || !self.objects.contains_key(object) {
             return;
         }
