@@ -859,10 +859,19 @@ impl World {
             }];
             let fut = cluster::submit(&node, vec![object.to_string()], ops, true, false);
             match timeout(Duration::from_millis(self.cfg.op_timeout_ms), fut).await {
-                Err(_) => panic!(
-                    "LIVENESS: read of {object} hung.\ntrace tail:\n{}",
-                    self.trace.dump_tail()
-                ),
+                Err(_) => {
+                    let claim = cluster::durable_claim(self.store.as_ref(), object).await;
+                    let mut dumps = String::new();
+                    for i in self.live_indices() {
+                        if let Some(n) = self.node(i) {
+                            dumps.push_str(&n.debug_dump().await);
+                        }
+                    }
+                    panic!(
+                        "LIVENESS: read of {object} hung. durable_claim={claim:?}\nnodes:\n{dumps}trace tail:\n{}",
+                        self.trace.dump_tail()
+                    )
+                }
                 Ok(Ok(mut resp)) => match resp.results.pop() {
                     Some(crate::cluster::OpResult::Rows { rows }) => return rows,
                     _ => panic!("read of {object} returned no rows result"),

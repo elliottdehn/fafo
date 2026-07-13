@@ -1302,7 +1302,7 @@ impl Worker {
                 && !self.owned.contains_key(object)
                 && matches!(
                     crate::cluster::durable_claim(self.node.store.as_ref(), object).await,
-                    crate::cluster::Claim::Transit(w, g)
+                    crate::cluster::Claim::Transit(w, g) | crate::cluster::Claim::Owned(w, g)
                         if w == self.id && g == tm.generation
                 );
             if !reconcile {
