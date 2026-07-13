@@ -2320,6 +2320,36 @@ impl ShipItem {
 /// page deltas for large ones), write ONE commit record covering the whole
 /// batch — the commit point — then promote. Recovery replays promotion from
 /// the staged blobs, so a crash mid-promote is rolled forward.
+/// The committed write-keys of a `writes(k,...)` ledger inside a SQLite image,
+/// or None if the image has no such table (not a ledger object) or can't be
+/// read. Diagnostic-grade: any failure yields None so a transient fault never
+/// blocks a ship.
+fn ledger_keys(bytes: &[u8], scratch: &std::path::Path) -> Option<Set<String>> {
+    std::fs::write(scratch, bytes).ok()?;
+    let conn = rusqlite::Connection::open(scratch).ok()?;
+    let mut stmt = conn.prepare("SELECT k FROM writes").ok()?;
+    let rows = stmt.query_map([], |r| r.get::<_, String>(0)).ok()?;
+    Some(rows.flatten().collect())
+}
+
+/// True if `snapshot` (a full image about to ship) is MISSING a write key the
+/// durable committed fold already has — i.e. shipping it would erase a
+/// committed write. Best-effort: reads that fail => false (don't block ships
+/// on transient store faults). Only meaningful for `writes`-ledger objects.
+async fn snapshot_regresses(store: &dyn BlobStore, object: &str, snapshot: &[u8]) -> bool {
+    let Ok((durable, _)) = crate::objlog::fold_committed(store, object).await else {
+        return false;
+    };
+    let dir = std::env::temp_dir();
+    let Some(dkeys) = ledger_keys(&durable, &dir.join(format!("dst-fence-dur-{object}.db"))) else {
+        return false; // not a ledger object, or unreadable
+    };
+    let Some(skeys) = ledger_keys(snapshot, &dir.join(format!("dst-fence-snap-{object}.db"))) else {
+        return false;
+    };
+    dkeys.iter().any(|k| !skeys.contains(k))
+}
+
 async fn ship_task(
     node: Node,
     reply: mpsc::UnboundedSender<WorkerMsg>,
@@ -2401,6 +2431,22 @@ async fn ship_task(
         sorted.sort_by(|a, b| a.object.cmp(&b.object));
         for item in sorted {
             let is_snap = matches!(item.payload, ShipPayload::Snapshot { .. });
+            // Content fence against the reconstruction fork: a full snapshot
+            // must never REGRESS the durable committed ledger. If the live
+            // file this boat captured is missing a write the durable log has
+            // already committed (a stale base the seq-based rebase guard
+            // couldn't see, because log_seq read current while the conn did
+            // not), shipping it would erase that committed write at a fresh
+            // seq. Treat it exactly like a lost prewrite: rebase — revert and
+            // re-fold off the committed truth, then re-run. Guards the DIRTY /
+            // single-node revert-race erasure the clean-write refold can't.
+            if is_snap
+                && snapshot_regresses(node.store.as_ref(), &item.object, item.bytes()).await
+            {
+                rebased = Some(item.object.clone());
+                err = Some(format!("snapshot for {} would erase a committed write", item.object));
+                break;
+            }
             let entry = crate::objlog::entry_from_ship(&staging_id, born, is_snap, item.bytes());
             match crate::objlog::prewrite(
                 node.store.as_ref(),
