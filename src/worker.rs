@@ -1284,13 +1284,43 @@ impl Worker {
         if let Some(cur) = known
             && tm.generation <= cur
         {
+            // Phantom-transit reconciliation. `cur` can come from a
+            // release WE recorded in self.transit whose checkpoint never
+            // durably landed (a store fault swallowed it, or a later
+            // checkpoint overwrote it). If durable STILL names us as the
+            // transit destination at exactly this generation — and we do
+            // not actually hold the object (self.owned) — then our higher
+            // `cur` is a ghost: our own txn's take chases this durable
+            // Transit(self) forever and admit refuses it every pass, so the
+            // multi-object gather deadlocks (LIVENESS, simulator --pause).
+            // Durable is authoritative; drop the phantom and adopt at the
+            // generation of record. Guarded hard: only when durable is
+            // EXACTLY Transit(self, tm.generation) and we hold nothing, so a
+            // genuinely spent renunciation (durable moved on to a real
+            // owner) is still refused — one renunciation, one spend.
+            let reconcile = std::env::var_os("FAFO_LOG_PRIMARY").is_some()
+                && !self.owned.contains_key(object)
+                && matches!(
+                    crate::cluster::durable_claim(self.node.store.as_ref(), object).await,
+                    crate::cluster::Claim::Transit(w, g)
+                        if w == self.id && g == tm.generation
+                );
+            if !reconcile {
+                if std::env::var_os("FAFO_DST_LOG").is_some() {
+                    eprintln!(
+                        "w{}: refusing stale deed for {object} (gen {} <= known {cur})",
+                        self.id, tm.generation
+                    );
+                }
+                return false;
+            }
+            self.transit.remove(object);
             if std::env::var_os("FAFO_DST_LOG").is_some() {
                 eprintln!(
-                    "w{}: refusing stale deed for {object} (gen {} <= known {cur})",
+                    "w{}: reconciled phantom transit for {object}; adopting durable gen {}",
                     self.id, tm.generation
                 );
             }
-            return false;
         }
         let now = self.now();
         let mut meta = Meta {

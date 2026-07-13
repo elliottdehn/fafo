@@ -812,8 +812,17 @@ impl World {
                             dumps.push_str(&n.debug_dump().await);
                         }
                     }
+                    // For each object in the hung txn, dump the DURABLE claim
+                    // and whether the named owner is a LIVE node — a take that
+                    // hangs on a block owned by a dead node is the orphan-
+                    // reclaim gap, and this line names it directly.
+                    let mut claims = String::new();
+                    for o in &objects {
+                        let claim = cluster::durable_claim(self.store.as_ref(), o).await;
+                        claims.push_str(&format!("  {o}: {claim:?}\n"));
+                    }
                     panic!(
-                        "LIVENESS: {what} hung for {}ms virtual — deadlock.\nworkers:\n{dumps}\ntrace tail:\n{}",
+                        "LIVENESS: {what} hung for {}ms virtual — deadlock.\nworkers:\n{dumps}durable claims:\n{claims}trace tail:\n{}",
                         self.cfg.op_timeout_ms,
                         self.trace.dump_tail()
                     )
