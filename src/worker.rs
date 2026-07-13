@@ -2433,6 +2433,10 @@ async fn ship_task(
     // stole one of our seqs fails a create here, so we abort before
     // committing and never tear the txn. (protosim validated this.)
     let mut rebased: Option<String> = None;
+    // Entries we durably prewrote (object, seq): if the boat then fails before
+    // its commit switch, we roll these back so our own next ship isn't blocked
+    // by our orphaned pending locks (a hot-object livelock under store faults).
+    let mut prewritten: Vec<(String, u64)> = Vec::new();
     if err.is_none() && std::env::var_os("FAFO_LOG_PRIMARY").is_some() {
         let born = node.node_clock.now().as_millis() as u64;
         // A live worker commits well within fence_ttl; only a lock older than
@@ -2477,7 +2481,7 @@ async fn ship_task(
             )
             .await
             {
-                Ok(Some(_)) => {}
+                Ok(Some(seq)) => prewritten.push((item.object.clone(), seq)),
                 Ok(None) => {
                     // A peer committed to this object at our seq: we are a
                     // fork loser. Remember it so the worker can reconcile
@@ -2642,6 +2646,16 @@ async fn ship_task(
             });
         }
         Some(e) => {
+            // Roll back our own prewritten-but-uncommitted entries. The commit
+            // switch never flipped (we are in the err path, and commit is the
+            // last step), so these are pending locks only we hold — leaving
+            // them makes our OWN next ship collide at the same seq and rebase
+            // until they age out (a hot-object livelock under store faults,
+            // e.g. _wills failing to fire a will). delete_if_txn is safe: it
+            // only removes an entry still ours.
+            for (id, seq) in &prewritten {
+                let _ = crate::objlog::clear_entry(node.store.as_ref(), id, *seq, &staging_id).await;
+            }
             if !inline {
                 for item in &items {
                     let _ = node.store.delete(&item.staging_key(&staging_id)).await;

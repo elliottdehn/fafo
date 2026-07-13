@@ -328,6 +328,25 @@ pub async fn prewrite(
     Ok(None)
 }
 
+/// Roll back a prewritten-but-uncommitted entry this txn placed at `seq`:
+/// a boat that prewrote entries and then failed BEFORE its commit switch
+/// must not leave them pending in the log, or its OWN next ship collides
+/// with them (a fresh lock says "don't steal") and rebases forever until
+/// they age out — a livelock on a hot object under store faults. delete_if_txn
+/// makes this safe: it only removes an entry STILL ours (a reclaimer that
+/// took the freed slot is untouched), and a committed entry is never cleared
+/// because commit is the last step (no err path runs after it).
+pub async fn clear_entry(store: &dyn BlobStore, id: &str, seq: u64, txn: &str) -> anyhow::Result<()> {
+    // Never roll back an entry whose txn actually COMMITTED. A commit_txn that
+    // returned an error may still have landed its outcome (a lost ack under
+    // store faults / on real object stores), and deleting a committed entry
+    // would erase the txn. Only clear a genuinely-uncommitted lock.
+    if committed(store, txn).await {
+        return Ok(());
+    }
+    delete_if_txn(store, &log_key(id, seq), txn).await
+}
+
 /// Delete a log entry only if it still belongs to `txn` — never erase a
 /// reclaimer's entry that took the freed slot (the tid-safe rollback
 /// protosim needed).

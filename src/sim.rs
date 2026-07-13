@@ -2036,16 +2036,31 @@ trace tail:
         // before declaring one lost (the wait itself is virtually free).
         let expected: Set<String> =
             self.model.wills.lock().unwrap().iter().map(|w| w.key.clone()).collect();
-        let will_deadline =
-            tokio::time::Instant::now() + Duration::from_millis(self.cfg.will_ttl_ms * 6);
+        // Progress-relative grace, not a fixed cap. A crash-orphaned will
+        // fires on the sweeper's schedule, and under store faults each fire is
+        // a durable write that may take many retried sweeps to land — a fixed
+        // will_ttl*6 window cuts that fault-induced tail and reads a
+        // still-firing will as lost (single-node high-fault fuzz). Instead
+        // keep waiting as long as the graveyard is still GROWING (wills are
+        // landing); give up only after a full grace window of NO progress.
+        // A baseline where every will already fired breaks on the first check,
+        // so this is inert there.
+        let grace = Duration::from_millis(self.cfg.will_ttl_ms * 6);
+        let mut deadline = tokio::time::Instant::now() + grace;
+        let mut last_seen = 0usize;
         let graveyard = loop {
             let rows = self.read("graveyard", "SELECT k FROM g").await;
             let graveyard: Set<String> =
                 rows.iter().map(|r| r["k"].as_str().expect("k").to_string()).collect();
-            if expected.iter().all(|k| graveyard.contains(k))
-                || tokio::time::Instant::now() > will_deadline
-            {
+            if expected.iter().all(|k| graveyard.contains(k)) {
                 break graveyard;
+            }
+            if graveyard.len() > last_seen {
+                last_seen = graveyard.len(); // progress: a will just fired
+                deadline = tokio::time::Instant::now() + grace;
+            }
+            if tokio::time::Instant::now() > deadline {
+                break graveyard; // no fire for a whole grace window: truly stuck
             }
             sleep(Duration::from_millis(self.cfg.will_ttl_ms / 2)).await;
         };
