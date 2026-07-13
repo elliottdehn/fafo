@@ -3008,6 +3008,48 @@ pub async fn recover(store: &dyn BlobStore) -> anyhow::Result<()> {
 
 // ------------------------------------------------------------- op helpers
 
+/// Serve a READ-ONLY txn straight from the durable committed log, bypassing
+/// the (unreachable) cached owner. Under FAFO_LOG_PRIMARY the log IS the
+/// truth, so a read of a committed object is always available even when its
+/// routing hint points at a crashed/orphaned node — the availability fix for
+/// "read of X kept failing" when X sits in Transit to a dead worker. Reads
+/// only: a write still needs its single owner to serialize it.
+pub async fn durable_read(
+    node: &Node,
+    ids: &[String],
+    ops: &[Op],
+) -> Result<TxnResponse, ApiError> {
+    let tmp = std::env::temp_dir();
+    let pid = std::process::id();
+    let mut conns: Map<String, rusqlite::Connection> = Map::default();
+    for id in ids {
+        let (image, _) = crate::objlog::fold_committed(node.store.as_ref(), id)
+            .await
+            .map_err(|e| ApiError::internal(e.to_string()))?;
+        // Unique per process AND object: parallel miners share /tmp.
+        let path = tmp.join(format!("dst-dread-{pid}-{id}.db"));
+        std::fs::write(&path, &image).map_err(|e| ApiError::internal(e.to_string()))?;
+        let conn =
+            rusqlite::Connection::open(&path).map_err(|e| ApiError::internal(e.to_string()))?;
+        conns.insert(id.clone(), conn);
+    }
+    let mut results = Vec::with_capacity(ops.len());
+    for op in ops {
+        let conn = conns
+            .get(&op.object)
+            .ok_or_else(|| ApiError::bad_request("durable read: unknown object"))?;
+        let stmt = conn
+            .prepare(&op.sql)
+            .map_err(|e| ApiError::bad_request(e.to_string()))?;
+        if !stmt.readonly() {
+            return Err(ApiError::bad_request("durable fallback serves read-only queries only"));
+        }
+        drop(stmt);
+        results.push(run_op(conn, &op.sql, &op.params).map_err(ApiError::bad_request)?);
+    }
+    Ok(TxnResponse { txn_id: "durable-read".to_string(), results, hash: None })
+}
+
 fn run_op(conn: &rusqlite::Connection, sql: &str, params: &[Value]) -> Result<OpResult, String> {
     let mut stmt = conn.prepare(sql).map_err(|e| e.to_string())?;
     let params = json_params(params)?;

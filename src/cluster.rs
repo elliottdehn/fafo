@@ -1503,12 +1503,21 @@ pub async fn submit_routed(
     } else {
         let cached = node.routing.read().unwrap().addr_of_worker(target);
         let addr = match cached {
-            Some(addr) => addr,
-            None => resolve_addr(node, target).await.ok_or_else(|| {
-                ApiError::internal(format!("no live node holds logical worker {target}"))
-            })?,
+            Some(addr) => Some(addr),
+            None => resolve_addr(node, target).await,
         };
-        match crate::rpc::forward_txn(
+        // No live node hosts the target worker (a crashed/orphaned node still
+        // owns the object in the durable ledger). A READ only needs committed
+        // state, which the log holds, so serve it durably instead of failing.
+        let Some(addr) = addr else {
+            if read_only && std::env::var_os("FAFO_LOG_PRIMARY").is_some() {
+                return crate::worker::durable_read(node, &ids, &ops).await;
+            }
+            return Err(ApiError::internal(format!(
+                "no live node holds logical worker {target}"
+            )));
+        };
+        let outcome = match crate::rpc::forward_txn(
             node,
             &addr,
             cap.as_deref().cloned(),
@@ -1527,8 +1536,8 @@ pub async fn submit_routed(
                         node,
                         &fresh,
                         cap.as_deref().cloned(),
-                        ids,
-                        ops,
+                        ids.clone(),
+                        ops.clone(),
                         read_only,
                         optimistic,
                     )
@@ -1536,6 +1545,18 @@ pub async fn submit_routed(
                 }
                 _ => Err(e),
             },
+            other => other,
+        };
+        // A READ only needs COMMITTED state, and under log-primary the durable
+        // log holds it. If the routed owner couldn't serve it — unreachable
+        // (crashed node still in the routing hint), or bouncing because the
+        // object sits in Transit to a dead worker no node reclaims — serve it
+        // straight from the log instead of hanging. Writes are never rerouted
+        // this way: they need their single owner to serialize them.
+        match outcome {
+            Err(_) if read_only && std::env::var_os("FAFO_LOG_PRIMARY").is_some() => {
+                crate::worker::durable_read(node, &ids, &ops).await
+            }
             other => other,
         }
     }

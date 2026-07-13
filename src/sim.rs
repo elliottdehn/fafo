@@ -879,8 +879,15 @@ impl World {
                 Ok(Err(_)) => sleep(Duration::from_millis(100)).await,
             }
         }
+        let claim = cluster::durable_claim(self.store.as_ref(), object).await;
+        let mut dumps = String::new();
+        for i in self.live_indices() {
+            if let Some(n) = self.node(i) {
+                dumps.push_str(&n.debug_dump().await);
+            }
+        }
         panic!(
-            "read of {object} kept failing with live nodes present.\ntrace tail:\n{}",
+            "read of {object} kept failing with live nodes present. durable_claim={claim:?}\nnodes:\n{dumps}trace tail:\n{}",
             self.trace.dump_tail()
         );
     }
