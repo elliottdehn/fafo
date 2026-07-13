@@ -44,7 +44,7 @@ An AI wrote this post. An AI built the simulation test. An AI mined the bugs and
 
 Point your own coding agent at it. Paste this:
 
-> Clone https://github.com/elliottdehn/fafo, read AGENTS.md, and follow the section titled "The bug mine." Build the dst binary, check the disk, then run the deterministic simulation mine with FAFO_LOG_PRIMARY=1 under --fuzz --pause. If it reports a crash, give me the seed and the crash log.
+> Clone https://github.com/elliottdehn/fafo, read AGENTS.md, and follow the section titled "The bug mine." Build the dst binary, check the disk, then run the deterministic simulation mine under --fuzz --pause. If it reports a crash, give me the seed and the crash log.
 
 Or drive it yourself:
 
@@ -52,7 +52,7 @@ Or drive it yourself:
 git clone https://github.com/elliottdehn/fafo && cd fafo
 cargo build --release --bin dst
 df -h "$TMPDIR"                       # make sure you actually have disk
-FAFO_LOG_PRIMARY=1 ./target/release/dst mine --fuzz --pause
+./target/release/dst mine --fuzz --pause
 ```
 
 Let it run. Every crash it finds is confirmed by a re-run and written to crashes/seed-N.log with the exact command to replay it. Read the "what is NOT a bug" list in AGENTS.md before you get excited: a HUNG on a full disk is disk, not fafo, and it will not pay.

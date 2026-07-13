@@ -1510,7 +1510,7 @@ pub async fn submit_routed(
         // owns the object in the durable ledger). A READ only needs committed
         // state, which the log holds, so serve it durably instead of failing.
         let Some(addr) = addr else {
-            if read_only && std::env::var_os("FAFO_LOG_PRIMARY").is_some() {
+            if read_only && crate::log_primary() {
                 return crate::worker::durable_read(node, &ids, &ops).await;
             }
             return Err(ApiError::internal(format!(
@@ -1554,7 +1554,7 @@ pub async fn submit_routed(
         // straight from the log instead of hanging. Writes are never rerouted
         // this way: they need their single owner to serialize them.
         match outcome {
-            Err(_) if read_only && std::env::var_os("FAFO_LOG_PRIMARY").is_some() => {
+            Err(_) if read_only && crate::log_primary() => {
                 crate::worker::durable_read(node, &ids, &ops).await
             }
             other => other,

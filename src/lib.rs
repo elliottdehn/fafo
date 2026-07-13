@@ -23,6 +23,34 @@ pub fn paranoia() -> bool {
     PARANOIA.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// The commit engine. The log-structured commit (per-object append-only log
+/// of committed snapshots, single create-if-absent outcome key) is the
+/// DEFAULT and the only engine the DST certifies clean under fault. The legacy
+/// per-object-base path (page-delta shipping, base promotion, roll-forward)
+/// is retained ONLY as a fallback and the flag-off determinism baseline, and
+/// is opted into with `FAFO_LEGACY_COMMIT`.
+///
+/// Test split: the unit suite (146 tests) was written against the legacy
+/// base/delta machinery and is that engine's regression coverage; the log
+/// engine's coverage is the DST, which runs a fresh subprocess per seed under
+/// injected faults, far past what a unit test reaches. So `cargo test` drives
+/// the legacy engine by default (opt a test into the log engine with
+/// FAFO_LOG_PRIMARY=1). Every non-test build — the node, the `dst` mine —
+/// defaults to the log engine.
+pub fn log_primary() -> bool {
+    if std::env::var_os("FAFO_LEGACY_COMMIT").is_some() {
+        return false;
+    }
+    #[cfg(test)]
+    {
+        std::env::var_os("FAFO_LOG_PRIMARY").is_some()
+    }
+    #[cfg(not(test))]
+    {
+        true
+    }
+}
+
 /// A sage assert: free in production, fatal under simulation.
 macro_rules! fafo_assert {
     ($cond:expr, $($msg:tt)+) => {

@@ -338,6 +338,15 @@ npx wrangler deploy          # builds ../Dockerfile, pushes, creates the app
 
 Non-negotiables learned in production:
 
+- **Do not switch commit engines under existing data.** The default is now the
+  log-structured engine (`objects/<id>.L.<seq>` / `.B.<seq>` / `txns/<id>.O`);
+  the legacy engine (`objects/<id>` / `.d.<counter>` / `txns/<id>.json`) is a
+  different durable layout with no auto-migration between them. A fresh deploy
+  is fine. But a deployment that already holds **legacy-format** state must
+  either migrate it, wipe it, or stay pinned to legacy by setting
+  `FAFO_LEGACY_COMMIT=1` on the app — otherwise the new engine boots, finds no
+  keys it recognizes, and the data is invisible (not deleted, just unread).
+
 - **Pin the container region** (`containers[].constraints.regions`) to the
   same region as your R2 bucket and your users. The beta scheduler
   otherwise places instances anywhere on Earth — we measured half a fleet
@@ -446,12 +455,13 @@ cargo build --release --bin dst
 df -h "$TMPDIR"
 
 # Mine forever, all cores, every fault on at once:
-FAFO_LOG_PRIMARY=1 ./target/release/dst mine --fuzz --pause
+./target/release/dst mine --fuzz --pause
 ```
 
-- **`FAFO_LOG_PRIMARY=1` is required.** It selects the log-structured commit
-  engine — the one that is actually clean. Without it you are mining the
-  legacy path, kept only as the flag-off determinism baseline.
+- **The log-structured commit engine is the default** — the one that is
+  actually clean, and the one you are mining. The legacy per-object-base path
+  survives only as a fallback and determinism baseline, reachable with
+  `FAFO_LEGACY_COMMIT=1`; a crash reachable only that way does not count.
 - **`--fuzz`** derives the whole cluster shape from each seed: node count,
   storage-failure rate (up to ~53%), per-node clock skew, fence TTLs.
 - **`--pause`** forces two pause-adversary faults per run: isolate a live
@@ -466,7 +476,7 @@ FAFO_LOG_PRIMARY=1 ./target/release/dst mine --fuzz --pause
 Reproduce it, bit-for-bit:
 
 ```sh
-FAFO_LOG_PRIMARY=1 ./target/release/dst run --seed <N> --fuzz --pause
+./target/release/dst run --seed <N> --fuzz --pause
 ```
 
 `dst check --seed <N>` runs a seed twice and diffs the trace hash — use it to
@@ -476,8 +486,8 @@ not nondeterminism in the harness itself.
 **What is NOT a bug (do not claim the bounty for these):**
 - A `HUNG` report when `$TMPDIR` is full. That is disk, not fafo. Clear it and
   re-run: `find "$TMPDIR" -maxdepth 1 -name 'dst-*' -delete`.
-- A crash that only reproduces with `FAFO_LOG_PRIMARY` unset. The legacy
-  engine is not the shipped one.
+- A crash that only reproduces under `FAFO_LEGACY_COMMIT=1`. The legacy
+  engine is the fallback, not the shipped default.
 - A run that is merely slow. A fork serialized safely is legitimately slower
   than one that clobbers; the harness uses a progress-relative deadline, so
   slow-but-progressing is fine. Only a genuine hang (killed at the wall-clock
@@ -494,11 +504,12 @@ $100 only if it:
 2. adds the bug to `bugs.md` in the house format (oracle → root → fix, ELI5,
    nastiness);
 3. keeps all 146 `cargo test`s green;
-4. does not change the flag-off determinism trace — `dst check --seed 1` must
-   stay `640 events, trace e85a7163e4ebb313` — and keeps flag-on runs
-   deterministic (`dst check` passes on the seeds you touched).
+4. keeps both engines deterministic and unshifted: `dst check --seed 1` must
+   stay `640 events, trace 943bb99f205b474b` (the default log engine), and
+   `FAFO_LEGACY_COMMIT=1 dst check --seed 1` must stay
+   `640 events, trace e85a7163e4ebb313` (the untouched legacy baseline).
 
 That last rule is the tripwire: many "fixes" that silence one seed do so by
 perturbing timing or shifting the fault RNG, which just relocates the crash to
-a different seed. A fix that changes the flag-off trace has changed base
+a different seed. A fix that moves either determinism trace has changed base
 behavior and is guilty until proven innocent.

@@ -51,7 +51,7 @@ pub async fn fetch_image(
     // STEP 2 (FAFO_LOG_PRIMARY): the log is the source of truth — fold its
     // committed prefix. The base/delta path below becomes a compaction cache
     // only (step 4). The u32 (delta chain length) is meaningless here, so 0.
-    if std::env::var_os("FAFO_LOG_PRIMARY").is_some() {
+    if crate::log_primary() {
         let (image, seq) = crate::objlog::fold_committed(store.as_ref(), id).await?;
         if std::env::var_os("FAFO_DST_LOG").is_some() {
             eprintln!("activate {id}: log-fold {} bytes @seq {seq}", image.len());

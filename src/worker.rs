@@ -278,7 +278,7 @@ pub fn spawn(node: Node, id: usize, live_dir: PathBuf) -> anyhow::Result<mpsc::U
     // polls: a peer can commit to an object we serve polls for with no local
     // write to trigger a re-check, so without this a long-poll on a stale
     // live conn would hang until it times out.
-    if std::env::var_os("FAFO_LOG_PRIMARY").is_some() {
+    if crate::log_primary() {
         let ptx = tx.clone();
         let pnode = node.clone();
         node.spawn_tracked(async move {
@@ -807,7 +807,7 @@ impl Worker {
         // full snapshot composes trivially in any order. Compaction bounds
         // the log, so the cost is write size, not fold cost. (Deltas can come
         // back once the manifest is proven to track the committed seq.)
-        if std::env::var_os("FAFO_LOG_PRIMARY").is_some() {
+        if crate::log_primary() {
             return ShipPayload::Snapshot {
                 gc_deltas: false,
                 bytes,
@@ -897,7 +897,7 @@ impl Worker {
             self.node.stats.ships.fetch_add(1, Ordering::Relaxed);
             // Log-primary: the boat committed one entry per object at
             // expected_seq+1, so our live file now reflects that seq.
-            if std::env::var_os("FAFO_LOG_PRIMARY").is_some() {
+            if crate::log_primary() {
                 for id in &objects {
                     if let Some(s) = self.log_seq.get_mut(id) {
                         *s += 1;
@@ -1193,7 +1193,7 @@ impl Worker {
         if let Some(p) = self.parked.get_mut(&txn) {
             p.activating = false;
         }
-        let log_primary = std::env::var_os("FAFO_LOG_PRIMARY").is_some();
+        let log_primary = crate::log_primary();
         let outcome = result.and_then(|(image, chain_total)| {
             if self.owns(&object) && !self.objects.contains_key(&object) {
                 materialize(&mut self.objects, &object, &self.live_dir, &image)
@@ -1298,7 +1298,7 @@ impl Worker {
             // EXACTLY Transit(self, tm.generation) and we hold nothing, so a
             // genuinely spent renunciation (durable moved on to a real
             // owner) is still refused — one renunciation, one spend.
-            let reconcile = std::env::var_os("FAFO_LOG_PRIMARY").is_some()
+            let reconcile = crate::log_primary()
                 && !self.owned.contains_key(object)
                 && matches!(
                     crate::cluster::durable_claim(self.node.store.as_ref(), object).await,
@@ -1368,7 +1368,7 @@ impl Worker {
         // residual). Purge the cache so the next access re-activates off the
         // committed fold; seed log_seq so the first ship still rebases if a
         // peer raced us in the meantime.
-        if std::env::var_os("FAFO_LOG_PRIMARY").is_some() && !self.dirty.contains_key(object) {
+        if crate::log_primary() && !self.dirty.contains_key(object) {
             // CLEAN re-acquire only. Drop any cache from a prior tenure (a peer
             // may have committed while we were away) and re-baseline log_seq to
             // the committed seq, so the next access re-folds and the first ship
@@ -1832,7 +1832,7 @@ impl Worker {
         // path rebases, so a plain read would otherwise serve state behind an
         // already-committed write (a torn transfer at quiescence). Re-fold in
         // place first. Writes skip this — their rebase guard handles it.
-        if std::env::var_os("FAFO_LOG_PRIMARY").is_some() {
+        if crate::log_primary() {
             let participants = p.participants.clone();
             for object in &participants {
                 if p.read_only {
@@ -1899,7 +1899,7 @@ impl Worker {
                                 // re-fold it IN PLACE — no revert, no churn —
                                 // then re-run the poll against the fresh state.
                                 let refreshed = if po.durable
-                                    && std::env::var_os("FAFO_LOG_PRIMARY").is_some()
+                                    && crate::log_primary()
                                     && !self.unshipped(&object)
                                 {
                                     self.refresh_stale_poll(&object, &po, &p.ops[0]).await
@@ -2443,7 +2443,7 @@ async fn ship_task(
     // its commit switch, we roll these back so our own next ship isn't blocked
     // by our orphaned pending locks (a hot-object livelock under store faults).
     let mut prewritten: Vec<(String, u64)> = Vec::new();
-    if err.is_none() && std::env::var_os("FAFO_LOG_PRIMARY").is_some() {
+    if err.is_none() && crate::log_primary() {
         let born = node.node_clock.now().as_millis() as u64;
         // A live worker commits well within fence_ttl; only a lock older than
         // that (with skew slack) is a dead orphan a peer may reclaim.
@@ -2524,7 +2524,7 @@ async fn ship_task(
         } else {
             Vec::new()
         };
-        if std::env::var_os("FAFO_LOG_PRIMARY").is_some() {
+        if crate::log_primary() {
             // The atomic commit switch: create the outcome key. If a resolver
             // aborted us while we were slow/paused, this loses and we must not
             // ack — the prewritten entries stay pending and get reclaimed.
@@ -2565,7 +2565,7 @@ async fn ship_task(
             // durable state and the commit record must SURVIVE as the commit
             // proof reads check — so skip base/delta promotion, its GC, and
             // the record deletion entirely.
-            let log_primary = std::env::var_os("FAFO_LOG_PRIMARY").is_some();
+            let log_primary = crate::log_primary();
             let mut unpromoted: Vec<String> = Vec::new();
             for item in &items {
                 if log_primary {
@@ -2963,7 +2963,7 @@ pub async fn recover_records_touching(store: &dyn BlobStore, object: &str) -> an
     // Under FAFO_LOG_PRIMARY a committed record's log entries are already
     // durable (prewritten before the record), and the record must survive as
     // the commit proof, so there is nothing to roll forward here.
-    if std::env::var_os("FAFO_LOG_PRIMARY").is_some() {
+    if crate::log_primary() {
         return Ok(());
     }
     for key in store.list("txns/").await? {
@@ -2991,7 +2991,7 @@ pub async fn recover(store: &dyn BlobStore) -> anyhow::Result<()> {
     // is nothing to roll forward and the records must NOT be deleted. Orphan
     // prewrites from a crash mid-commit are cleared lazily by the next
     // writer's prewrite. So boot recovery is a no-op.
-    if std::env::var_os("FAFO_LOG_PRIMARY").is_some() {
+    if crate::log_primary() {
         return Ok(());
     }
     for key in store.list("txns/").await? {
