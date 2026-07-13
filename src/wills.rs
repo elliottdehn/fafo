@@ -150,7 +150,15 @@ pub async fn sweep(node: &Node, now_ms: u64, claim_ttl_ms: u64) {
             continue;
         };
 
-        // Claim: exactly one sweeper wins the CAS-like conditional update.
+        // Claim: exactly one sweeper wins the CAS-like conditional update —
+        // an OPTIMIZATION to cut redundant fires, NOT a correctness gate.
+        // Fires are idempotent by contract (the will's ops must survive
+        // replay), so at-least-once is the guarantee. Under crash/reboot churn
+        // + store faults the _wills object thrashes and this claim keeps
+        // failing to land; gating the fire on it then LOSES an orphaned will
+        // forever (a hard liveness bug the mine catches). So: skip only when
+        // the claim provably went to someone else (rows_affected == 0 — they
+        // will fire it); if it merely couldn't land (store error), fire anyway.
         let claim = submit_system(
             node,
             vec![WILLS_OBJECT.to_string()],
@@ -162,8 +170,8 @@ pub async fn sweep(node: &Node, now_ms: u64, claim_ttl_ms: u64) {
             false,
         )
         .await;
-        if !claim.map(|r| rows_affected(&r) == 1).unwrap_or(false) {
-            continue; // someone else is firing it, or it was disarmed
+        if matches!(&claim, Ok(r) if rows_affected(r) == 0) {
+            continue; // another sweeper claimed it (or it was disarmed): they fire
         }
 
         let Ok(will) = serde_json::from_str::<DurableWill>(payload) else {
