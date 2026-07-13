@@ -28,7 +28,7 @@ prediction was then paid off: a **log-structured commit** (behind
 `FAFO_LOG_PRIMARY`) turned the pause adversary from a documented boundary into
 a solvable problem, and mining under it — `dst mine --fuzz --pause`, every
 crash a bug — drove the whole system from ~13% of seeds crashing to **zero in
-both modes.** That campaign is bugs **28–50**, in its own section after the
+both modes.** That campaign is bugs **28–51**, in its own section after the
 "not fixed yet" note (kept intact, because the honest record of the boundary
 is the reason the fix exists).
 
@@ -699,6 +699,24 @@ crashes**, every historically-failing seed clean, safety zero in both modes,
 the flag-off world byte-identical, and the flag-on world deterministic. The
 system is no longer clean *in its model* — it is clean *under the adversary
 the model was built to break it with*.
+
+### Coda — the first thing the zero-crash miner found was itself
+
+**51. The mine that ate the disk.** The content fence (45b) and the durable-read
+fallback (49) each write a small SQLite scratch file to `$TMPDIR` to open a
+folded image — with boot-unique names so parallel miner subprocesses never
+collide (that was 50) — and neither **deleted** it. Harmless for a bounded
+sweep; fatal for the *endless* mine those very fixes had just made trustworthy:
+millions of ships, two files each, until the temp dir filled the disk
+(`StorageFull`), which the harness then mis-reported as a fafo **crash** — a
+$100 "bug" that was really out-of-space. So the very first thing the
+zero-in-both-modes miner turned up, run for real, was a defect in its own
+tooling. Fix: `ledger_keys` removes its scratch every call; `durable_read`
+unlinks each file the instant it opens it (the handle keeps it readable). A 25 s
+mine into a fresh temp dir now leaves **zero** files (was ~2 per ship); no
+behaviour change, flag-off trace still `e85a7163`.
+
+> ELI5: The fraud inspectors we installed each kept a photocopy of every receipt they checked, in a back room nobody ever emptied. After a few million receipts the back room — then the whole building — was packed floor to ceiling, and the "building full" alarm went off, which we misread as "fraud detected." Now each inspector shreds their copy the moment they're done. **Nastiness: 6/10 (a tooling leak that impersonates a product bug and only bites at scale — a mirror crack, like 28 and 50).**
 
 ## Before the dice: what the example suite caught
 
